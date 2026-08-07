@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cognitive Coder is NOT published to PyPI (§1.2). This file exists anyway,
+# and has to be valid, because `pip install -e .` from a clone is what both
+# installers do internally and what a contributor runs. The absence of an
+# upload is not an excuse for an invalid manifest.
+#
+# Two rules here are load-bearing:
+#   * requires-python is a FLOOR with no cap (M47). The code targets 3.11
+#     features; an embedded library does not get to dictate its host's
+#     interpreter, and LoLLMs or a contributor on 3.13 must be able to
+#     install it. CI runs 3.11 on Windows and Linux, and the README says so.
+#   * ZERO required runtime dependencies (M48). Everything is an extra. A
+#     stdlib-only core is what lets this drop into a Qt desktop app and a
+#     FastAPI server without an argument about versions, and CI fails the
+#     build if a non-stdlib module is imported at module level in the core.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cognitive-coder"
+description = "A host-agnostic engine that lets a language model write, build, test and fix real code — offline, on small models."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Bill", email = "photogbill@users.noreply.github.com" }]
+keywords = ["llm", "code-generation", "offline", "local-models", "agent"]
+dynamic = ["version"]
+dependencies = []                       # deliberately empty — see M48
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Code Generators",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+# Each extra buys exactly one capability, and its absence degrades rather
+# than crashes (C7). The installer's summary names what each missing one
+# costs, in one line, so nobody has to guess.
+llamacpp    = ["llama-cpp-python>=0.3.0"]
+treesitter  = ["tree-sitter>=0.21", "tree-sitter-languages>=1.10"]
+anthropic   = ["anthropic>=0.40"]
+google      = ["google-genai>=0.3"]
+mistral     = ["mistralai>=1.2"]
+openai      = ["openai>=1.50"]
+openrouter  = []                        # OpenAI-compatible; no SDK needed
+tokenizers  = ["mistral-common>=1.5"]   # exact counts live in the HOST (M14)
+dev         = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
+all         = ["cognitive-coder[llamacpp,treesitter,anthropic,google,mistral,openai,tokenizers,dev]"]
+
+[project.scripts]
+ccoder = "cognitive_coder.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/photogbill/cognitive-coder"
+Source   = "https://github.com/photogbill/cognitive-coder"
+
+[tool.setuptools]
+# `adapters/` is deliberately OUTSIDE the package (§3.1). ATK's adapter
+# imports PySide6; keeping it out of cognitive_coder/ is what enforces C1
+# mechanically rather than by good intentions.
+packages = ["cognitive_coder", "cognitive_coder.codemap",
+            "cognitive_coder.providers"]
+
+[tool.setuptools.dynamic]
+version = { attr = "cognitive_coder.version.__version__" }
+
+[tool.ruff]
+line-length = 79                        # the ATK house style; keeps diffs narrow
+target-version = "py311"
+exclude = [".venv", ".python", ".tools", "adapters/atk/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+ignore = [
+    "E501",     # long lines are caught by review, not by a linter tantrum
+    "B008",     # function call in default arg — deliberate for Port defaults
+    "SIM105",   # contextlib.suppress is not clearer than try/except: pass here
+    "SIM102",   # a nested `if` that documents two separate conditions reads
+                # better than one `and` — see loop.py's forward-progress check
+]
+
+[tool.ruff.lint.isort]
+# Keep the wrapped, parenthesised import style the whole tree uses. Without
+# this, the magic trailing comma explodes every grouped import to one name
+# per line, which at a 79-column limit turns a four-line import into
+# fourteen and makes every future diff noisier than the change it carries.
+split-on-trailing-comma = false
+force-sort-within-sections = true
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Toolchain-conditional tests skip with a printed note rather than failing on
+# a machine that lacks Rust (§9). -ra surfaces those notes.
+addopts = "-ra --strict-markers"
+markers = [
+    "toolchain: needs a compiler or interpreter that may not be installed",
+    "slow: takes more than a second",
+]
+
+[tool.coverage.run]
+source = ["cognitive_coder"]
+branch = true
+
+[tool.coverage.report]
+# ≥85% on the core; the parsers and the loop should be near 100% because
+# they are where wrongness hides (§9).
+fail_under = 85
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

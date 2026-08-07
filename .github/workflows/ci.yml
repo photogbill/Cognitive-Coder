@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI runs on Windows AND Linux, on Python 3.11 only (§10.2a, M47).
+#
+# Windows matters and is not a courtesy: one host of this engine is
+# Windows-first, and path handling is where cross-platform code dies. A suite
+# that is green on Linux alone proves half of what it looks like it proves.
+#
+# The five checks that guard the architecture are named explicitly below
+# rather than buried in "run pytest", because each of them guards something
+# that would still WORK if it broke and would only be discovered months later
+# by the second host.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]      # a floor, not a cap — the README says so
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the core (zero required runtime dependencies)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check cognitive_coder tests examples
+
+      - name: C1 — the core imports no GUI and no host
+        run: pytest tests/test_contract.py::test_core_imports_no_gui_and_no_host -q
+
+      - name: M48 — the core is stdlib-only at module level
+        run: pytest tests/test_contract.py::test_core_has_no_module_level_third_party_imports -q
+
+      - name: M50 — vendored use works with no install
+        run: pytest "tests/test_contract.py::test_vendored_use_works_without_install" "tests/test_contract.py::test_import_has_no_side_effects" -q
+
+      - name: C3 — the no-network test
+        run: pytest tests/test_no_network.py -q
+
+      - name: M52 — prompt prefixes are byte-identical
+        run: pytest tests/test_prefix_stability.py -q
+
+      - name: M53 — the Appendix E golden trace
+        run: pytest tests/test_golden_trace.py -q
+
+      - name: The full suite
+        run: pytest -q --cov=cognitive_coder --cov-report=term-missing
+
+      - name: Port conformance against our own Null implementations
+        run: python tests/port_conformance.py
+
+      - name: The embedding example runs
+        run: python examples/tiny_host.py
+
+      # §7.1: the ATK adapter's tests follow ATK's style, not this project's
+      # — a plain script with a PASS/FAIL count. Run as a script for that
+      # reason, and because the migration must be proven safe against a
+      # throwaway copy before anyone points it at a real checkout.
+      - name: ATK migration — the old call surface still works
+        run: python adapters/atk/test_migration.py
+
+      - name: ccoder doctor
+        run: ccoder doctor
+
+  installer:
+    name: installer · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # §10.1 rule 3: running it twice is safe and is how a user recovers
+      # from a partial install. Rule 7: the exit code is meaningful.
+      - name: A clean clone installs non-interactively
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmd //c install.bat
+          else
+            chmod +x install.sh && ./install.sh
+          fi
+
+      - name: And is idempotent
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmd //c install.bat
+          else
+            ./install.sh
+          fi
