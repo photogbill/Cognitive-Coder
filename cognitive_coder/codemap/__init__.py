@@ -178,6 +178,17 @@ class CodeMap:
         import_heads |= {str(i).lstrip(".").rsplit(".", 1)[-1]
                          for i in imported}
 
+        # Names BOUND in this file — locals, parameters, loop variables — as
+        # opposed to symbols it exports. `screen.fill(...)` where `screen` came
+        # from `pygame.display.set_mode()` is an attribute on a runtime object,
+        # and no static check can say whether `.fill` exists on it. Reporting
+        # it as "a name this project does not define" is both untrue and
+        # noisy: it fired on nearly every generated file, in the same sentence
+        # as the genuinely missing names, which is how `TrackSegment` and
+        # `render_road` went unnoticed until they became ImportErrors.
+        bound = (parse_python.bound_names(text) if lang_id == "python"
+                 else set())
+
         out: list[str] = []
         builtins = _BUILTINS.get(lang_id, set())
         for _src, name, _kind in unresolved:
@@ -190,6 +201,9 @@ class CodeMap:
                 continue
             if head in local or head in builtins:
                 continue      # a method on something defined here
+            if "." in raw and head in bound:
+                continue      # attribute on a local object — unknowable, and
+                              # not a claim this check is entitled to make
             if self.store.resolves(raw) or self.store.resolves(short):
                 continue
             if raw not in out:

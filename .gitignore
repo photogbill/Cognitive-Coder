@@ -1,0 +1,44 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Test, coverage and lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Environments and builds
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Written by the install scripts to prove the target is writable, then left
+# behind. Harmless, but it is not source.
+.writetest
+
+# Screenshots and scratch notes kept beside the repo while working
+*.png
+*.jpg
+*.jpeg
+
+# Cognitive Coder's own working directories, when the tool is run on itself
+.cc_journal/
+.cc_snapshots/
+
+# Editor and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# The drafted commit message, staged for `git commit -F`
+.git-commit-message.txt

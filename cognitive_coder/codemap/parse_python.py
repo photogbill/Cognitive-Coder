@@ -196,6 +196,111 @@ def _module_name(path: str) -> str:
     return p.strip("/").replace("/", ".") or "<module>"
 
 
+def bound_names(text: str) -> set[str]:
+    """Every name BOUND anywhere in this file: locals, params, loop vars.
+
+    Distinct from the symbol table, which holds only functions and classes —
+    the things another module can import. This is the wider set of names that
+    exist at run time inside the file, and it answers a question the symbol
+    table cannot: *is ``screen`` in ``screen.fill(...)`` a real object?*
+
+    WHY IT WAS NEEDED, 2026-08-07
+    -----------------------------
+    ``unresolved_in`` reports names the project does not define, and it was
+    treating the head of every dotted call as such a name. Since a local
+    variable is not a symbol, the result was a warning on nearly every
+    generated file::
+
+        src/main.py refers to names this project does not define:
+        screen.fill, draw_track, clock.tick, clock.get_time
+
+    Of those four, one was real. ``screen`` was ``pygame.display.set_mode()``
+    three lines above; ``clock`` was ``pygame.time.Clock()``. A static
+    checker cannot know what those objects are, and it was never going to —
+    so it should not be claiming they are undefined.
+
+    The cost was not the noise itself but what the noise concealed. In the
+    same runs, ``CarState``, ``generate_track``, ``render_road`` and
+    ``TrackSegment`` were flagged in the same sentences, in the same format,
+    and were all genuinely missing — each one became an ImportError minutes
+    later. The signal was there the whole time, filed alongside the chaff.
+
+    A check that cries wolf is a check somebody turns off, which the docstring
+    of ``unresolved_in`` already said. This is that principle applied to the
+    case it was missing.
+
+    Walrus targets, ``with ... as``, ``except ... as``, comprehension
+    variables, and both ordinary and starred assignment are all bindings and
+    all included. Attribute and subscript targets are not — ``self.x = 1``
+    binds nothing new called ``x``.
+
+    IMPORTS ARE DELIBERATELY EXCLUDED, and the reason is a regression this
+    caused on its first outing. ``from utils import parse_config`` does bind
+    ``parse_config``, so an earlier version of this function reported it — and
+    ``unresolved_in`` then fell silent about a symbol pulled from a module
+    that does not exist, which is one of the most valuable things it catches.
+
+    Imports are already tracked separately and more precisely, because
+    "the module resolves" and "the symbol resolves" are different questions.
+    Folding them in here answers the second with the first. So this function
+    means specifically: *names bound by executable statements in this file* —
+    the set you need in order to recognise ``screen.fill`` as an attribute on
+    a real local object, and nothing wider.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+
+    out: set[str] = set()
+
+    def bind(target: ast.AST) -> None:
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                out.add(node.id)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            for tgt in (node.targets if isinstance(node, ast.Assign)
+                        else [node.target]):
+                bind(tgt)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            bind(node.target)
+        elif isinstance(node, ast.NamedExpr):
+            bind(node.target)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    bind(item.optional_vars)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                out.add(node.name)
+        elif isinstance(node, comprehension_types):
+            bind(node.target)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.add(node.name)
+            args = node.args
+            for a in (list(args.posonlyargs) + list(args.args)
+                      + list(args.kwonlyargs)):
+                out.add(a.arg)
+            if args.vararg:
+                out.add(args.vararg.arg)
+            if args.kwarg:
+                out.add(args.kwarg.arg)
+        elif isinstance(node, ast.ClassDef):
+            out.add(node.name)
+        elif isinstance(node, ast.Lambda):
+            for a in (list(node.args.posonlyargs) + list(node.args.args)
+                      + list(node.args.kwonlyargs)):
+                out.add(a.arg)
+        elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
+            out.update(node.names)
+    return out
+
+
+comprehension_types = (ast.comprehension,)
+
+
 def imports_of(text: str) -> list[str]:
     """Just the imports — used to DERIVE the dependency order (§4.2).
 

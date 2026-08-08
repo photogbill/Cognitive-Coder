@@ -10,11 +10,104 @@ is a major version.
 
 ## [Unreleased]
 
-Nothing outstanding from the build specification. The next work is empirical
-rather than structural: the journal now records enough (context size, timings,
-first-attempt success rate) to answer G.9's tuning question with a query
-instead of an argument, and that answer needs a few real sessions on the
-target machine before anything is changed on the strength of it.
+### Fixed — four faults found by the first real workload
+
+The same pseudo-3D racing specification was built twice on 2026-08-07, with
+Devstral-24B and with Ministral-24B, and both projects and console logs were
+kept. Reading the logs and then *running the generated code* turned up four
+separate faults. All four are the same shape: the engine was reporting
+honestly and the report was still misleading, because the thing being reported
+was three steps downstream of the thing that was wrong.
+
+Regression tests for all four are in `tests/test_planning_regressions.py`,
+written against the actual plans and filenames from those two runs.
+
+- **The build order was never derived.** `Planner.derive_order` reads imports
+  off disk, and ran only after `skeleton()` — but `stub_for` writes a stub's
+  imports from `depends_on`, which `derive_order` is what populates. Empty in,
+  empty out: it returned the model's proposed order untouched, on every
+  project, since it was written. It failed silently for the best possible
+  reason, in that a function returning *an* order looks like it worked.
+
+  The cost was visible in the two runs. One model proposed
+  `math3d → physics → track → render → main` and produced three usable files;
+  the other proposed `main → math3d → …`, spent three attempts failing to
+  import a class from a module not yet written, and gave up. The difference
+  was luck, and this function was the mechanism meant to remove it.
+
+  Ordering now runs *before* the skeleton, seeded by the one fact available
+  before any code exists — an entry point is imported by nothing — and is
+  re-derived from real imports after every completed file. Test files are
+  ordered after the module they cover. A plan that was already in dependency
+  order is left untouched.
+
+- **Test files named in the request were dropped from the plan.** The
+  specification had a section headed "Testing Requirements (Strict)" naming
+  `tests/test_math3d.py` and `tests/test_physics.py`. Both models proposed
+  five files, all under `src/`, no tests, and nothing checked. Every build
+  step then reported "the test command succeeded but ran ZERO tests" —
+  truthfully, about ten times, describing a symptom whose cause was in the
+  plan. With no tests, verification degraded to "the file imports", which is
+  how a physics module was committed green with an `update()` signature no
+  caller satisfied; the program died on its first frame.
+
+  Explicitly named test paths are now extracted from the request and added if
+  the plan omits them, as a visible caveat and a warning rather than a silent
+  correction. Only explicit paths: "please write tests" is a wish and is not
+  interpreted, and `src/latest_data.py` is not mistaken for a test file.
+
+- **`unresolved_in` cried wolf on almost every generated file.** It treated
+  the head of every dotted call as a name the project should define, so
+  `screen.fill` — where `screen` came from `pygame.display.set_mode()` two
+  lines above — was reported as undefined. The damage was concealment rather
+  than noise: those appeared in the same sentence, in the same format, as
+  `CarState`, `generate_track`, `render_road` and `TrackSegment`, every one of
+  which was genuinely missing and became an `ImportError` minutes later.
+
+  New `parse_python.bound_names` collects names bound by executable statements
+  — assignments, parameters, loop and comprehension targets, walrus, `with`
+  and `except` bindings — and dotted names whose head is one are no longer
+  reported. Imports are deliberately excluded from that set: they do bind
+  names, but counting them here silenced `unresolved_in` about a symbol
+  imported from a module that does not exist, which is among the most
+  valuable things it catches. That regression was caught by
+  `test_codemap.py::test_a_name_that_exists_nowhere_is_reported` within a
+  minute of the change.
+
+- **The Recommendation Document contradicted itself.** The reviewer is handed
+  the files that were *committed*, so when a build collapsed the failed files
+  were simply absent from what it read — the worse the run went, the less
+  there was to criticise. A program that crashed on startup was summarised as
+  "Nothing was found that should stop this being used", four lines above a
+  Verification line reading "3 of 5 file(s) built".
+
+  `recommendation_document` takes `unfinished` and leads with it, states that
+  the review covers only the files that built, and says plainly that the
+  absence of findings about a missing file is not evidence it is fine. The
+  all-clear sentence is now something only a completed build can earn.
+
+### Added
+
+- `.gitignore` — coverage data, `__pycache__`, tool caches and screenshots
+  were showing as tracked changes.
+
+### Still empirical rather than structural
+
+The journal records enough (context size, timings, first-attempt success rate)
+to answer G.9's tuning question with a query instead of an argument, and that
+answer needs a few real sessions on the target machine before anything is
+changed on the strength of it. The two runs above are the first two.
+
+One thing those runs exposed and this release does **not** fix: a module that
+imports a symbol from a sibling is still ordered by role, not by that import,
+because before it is written the fact exists nowhere — the stub imports
+nothing and the purpose line is prose. Matching purpose text against sibling
+module names was tried and rejected: it made a module described as "pure
+projection logic for track segments" depend on `track`, the exact reverse of
+the specification's requirement that it depend on nothing, and a heuristic
+that inverts a stated architectural constraint is worse than none. The repair
+is a skeleton whose stubs declare the symbols their module exports, so an
+importer can be checked before anything is generated. That is its own change.
 
 ## [0.9.0] — 2026-08-07
 

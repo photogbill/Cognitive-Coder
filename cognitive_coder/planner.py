@@ -96,11 +96,24 @@ class Planner:
                      or "the whole request in one file")]
 
         tasks = self._to_tasks(rows, layout)
+
+        #: THE REQUEST NAMED TEST FILES. THE PLAN MUST CONTAIN THEM.
+        #: See _required_tests for what this cost when it was missing.
+        tasks, added = self._ensure_required_tests(request, tasks, layout)
+
+        caveats: list[str] = []
+        if len(rows) > MAX_FILES:
+            caveats.append(f"the model proposed {len(rows)} files; only the "
+                           f"first {MAX_FILES} were kept")
+        if added:
+            caveats.append(
+                f"the request asked for {len(added)} test file(s) that the "
+                f"plan left out: {', '.join(added)} — they were added, "
+                f"because a build that skips the tests it was told to write "
+                f"cannot report whether it worked")
         plan = Plan(request=request, tasks=tuple(tasks),
                     layout_note=layout.get("note", ""),
-                    caveats=() if len(rows) <= MAX_FILES else (
-                        f"the model proposed {len(rows)} files; only the "
-                        f"first {MAX_FILES} were kept",))
+                    caveats=tuple(caveats))
         if self.journal is not None:
             self.journal.log("plan", request=request,
                              files=[t.path for t in tasks],
@@ -109,6 +122,73 @@ class Planner:
                        f"plan: {len(tasks)} file(s) proposed",
                        {"files": [t.path for t in tasks]})
         return plan
+
+    # ------------------------------------------------------------------
+    def _ensure_required_tests(self, request: str, tasks: list[Task],
+                               layout: dict) -> tuple[list[Task], list[str]]:
+        """Add test files the REQUEST named and the plan left out.
+
+        WHY THIS EXISTS, 2026-08-07
+        ---------------------------
+        A specification arrived with a section headed **"Testing Requirements
+        (Strict)"**. It named ``tests/test_math3d.py`` and
+        ``tests/test_physics.py``, and required that tests be written before
+        the module bodies.
+
+        Two models were given that specification. Both proposed five files,
+        all under ``src/``. Neither proposed a single test. Nothing noticed.
+
+        The consequence ran through the entire build. Every file reported::
+
+            the test command succeeded but ran ZERO tests — that is not
+            evidence the code works, only that nothing contradicted it
+
+        which was true, and was printed about ten times, and was describing a
+        symptom whose cause was three steps upstream. With no tests,
+        "verifying" degraded to "the file imports". Three files were committed
+        green. One of them defined ``update(self, dt, accel, brake, steer,
+        curve)`` while the caller passed four arguments; the program died on
+        its first frame. The test the specification asked for would have
+        caught it in under a second.
+
+        A planner is allowed to choose the shape of a solution. It is not
+        allowed to silently drop a requirement it was handed. So: paths that
+        look like test files are extracted from the request, and any the plan
+        omitted are added — as a CAVEAT, visible in the plan, not as a silent
+        correction.
+
+        Only EXPLICIT paths are honoured. "Please write tests" is a wish and
+        this does not try to interpret it; ``tests/test_math3d.py`` is an
+        instruction, and this holds the plan to it.
+        """
+        wanted = _required_tests(request)
+        if not wanted:
+            return tasks, []
+        have = {t.path.replace("\\", "/").lower() for t in tasks}
+        added: list[str] = []
+        out = list(tasks)
+        for path in wanted:
+            if path.lower() in have or len(out) >= MAX_FILES:
+                continue
+            lang_id = langs.id_for_path(path) or self.lang
+            out.append(Task(
+                id=f"t{len(out) + 1}", path=path,
+                purpose=f"tests required by the request for "
+                        f"{_stem(path).removeprefix('test_')}",
+                test_path="", persona="tester", lang=lang_id, atomic=False))
+            added.append(path)
+
+        #: Reported HERE, beside the decision, rather than by the caller.
+        #: A silent correction is still a correction the operator did not
+        #: ask for and cannot audit — and this particular omission is one
+        #: nobody noticed for a whole build, so it gets said out loud at the
+        #: moment it is detected.
+        if added:
+            self.host.emit("warning",
+                           f"the plan omitted {len(added)} test file(s) named "
+                           f"in the request — added: {', '.join(added)}",
+                           {"phase": "plan", "added_tests": added})
+        return out, added
 
     # ------------------------------------------------------------------
     def _to_tasks(self, rows: Sequence[tuple[str, str]],
@@ -377,9 +457,46 @@ class Planner:
         This is §4.2's compromise kept honestly: the DAG is useful, so it is
         computed — from what the files actually import, which is a fact,
         rather than from what the model asserted, which is a claim.
+
+        THE DEADLOCK THIS USED TO SIT IN, 2026-08-07
+        --------------------------------------------
+        The principle was right and the method could never work. The order is
+        derived by reading imports out of the files on disk. At the only point
+        this was called, those files were the SKELETON — and ``stub_for``
+        writes a stub's imports from ``task.depends_on``, which is populated
+        by this method. So:
+
+            plan()          -> every depends_on is empty
+            skeleton()      -> stubs written with NO imports, because of that
+            derive_order()  -> reads the stubs, finds no imports, learns
+                               nothing, and returns the model's order intact
+
+        It was a no-op on every project ever built, and silently: an ordering
+        function that returns *an* order looks like it worked.
+
+        Two real runs of the same racing-game spec showed exactly what that
+        costs. One model happened to propose math3d → physics → track →
+        render → main and produced three usable files. The other proposed
+        main → math3d → physics → render → track, spent three attempts
+        failing to import ``CarState`` from a module that had not been written
+        yet, gave up, and left two files that still do not import. The
+        difference was luck, and the mechanism meant to remove that luck was
+        this function.
+
+        THE FIX. Dependencies are learned from whatever real evidence exists,
+        and when there is none yet, from the one fact available before any
+        code is written: some files are entry points and cannot be imported
+        by their siblings. That is a naming and role convention, not a claim
+        by the model, and it is checkable. Ordering it last is right whenever
+        it applies and harmless when it does not.
+
+        Called before the skeleton, the role rule seeds the order. Stubs then
+        get real imports, and every later call refines the order from those —
+        facts replacing the heuristic as soon as facts exist.
         """
         by_module = {_module(t.path): t.id for t in plan.tasks}
         depends: dict[str, set] = {t.id: set() for t in plan.tasks}
+        learned = False
         for task in plan.tasks:
             try:
                 text = self.host.fs.read(task.path)
@@ -392,6 +509,24 @@ class Planner:
                 target = by_module.get(_module(str(name)))
                 if target and target != task.id:
                     depends[task.id].add(target)
+                    learned = True
+
+        #: Nothing on disk to learn from — the pre-skeleton call, or a set of
+        #: files that genuinely do not import one another. Fall back to role.
+        if not learned:
+            depends = self._role_order(plan)
+
+        #: A test depends on the module it covers, always. This holds no
+        #: matter which branch produced `depends`, and without it a test can
+        #: be scheduled before the thing it tests exists.
+        for task in plan.tasks:
+            if not _looks_like_test(task.path):
+                continue
+            stem = _stem(task.path)
+            covered = stem[5:] if stem.startswith("test_") else stem
+            for other in plan.tasks:
+                if other.id != task.id and _stem(other.path) == covered:
+                    depends[task.id].add(other.id)
 
         ordered = _topological(plan.tasks, depends)
         tasks = tuple(
@@ -403,6 +538,67 @@ class Planner:
             for t in ordered)
         return Plan(request=plan.request, tasks=tasks,
                     layout_note=plan.layout_note, caveats=plan.caveats)
+
+    def _role_order(self, plan: Plan) -> dict[str, set]:
+        """Ordering from role, for use before any code exists to read.
+
+        The only claim made here: **an entry point is imported by nothing.**
+        A module named ``main``/``app``/``cli``/``server``, or whose stated
+        purpose is to be the event loop or the initialisation, sits at the top
+        of the import graph. Everything else can precede it; it can precede
+        nothing.
+
+        That is weaker than reading real imports and it is meant to be. It is
+        a floor, replaced by fact the moment a single file has a body. What it
+        buys is that the *first* build is not a coin toss — which is precisely
+        what went wrong when a planner put ``main.py`` first and the run was
+        over before it started.
+
+        Deliberately NOT inferred: any ordering among non-entry-point files.
+        Guessing that ``physics`` precedes ``track`` from their names would be
+        the model's-word problem wearing a different hat, and the topological
+        sort is stable, so they keep the order they were proposed in.
+
+        WHAT THIS STILL CANNOT KNOW, stated plainly so nobody assumes it can.
+        In the run that prompted this, ``render`` imported ``TrackSegment``
+        from ``track`` and was scheduled first, so it failed. Nothing here
+        fixes that, because before ``render`` is written the fact does not
+        exist anywhere: the stub imports nothing, and the purpose line said
+        only "Pygame-specific rendering of projected track segments".
+
+        Matching that sentence against sibling module names was tried and
+        rejected. It would have made ``math3d`` — "pure projection logic for
+        track segments" — depend on ``track``, which is the exact opposite of
+        the specification's requirement that the projection module depend on
+        nothing. A heuristic that reverses a stated architectural constraint
+        is worse than no heuristic.
+
+        The real repair for that case is a richer skeleton — stubs that
+        declare the symbols their module is supposed to export, so an importer
+        can be checked against them before anything is generated. That is a
+        larger change and belongs in its own pass.
+        """
+        entry_names = {"main", "app", "cli", "__main__", "index", "run",
+                       "server", "start", "program", "game"}
+        entry_words = ("entry point", "event loop", "initialization",
+                       "initialisation", "main loop", "bootstrap",
+                       "game loop", "startup", "command line")
+
+        def is_entry(task: Task) -> bool:
+            if _looks_like_test(task.path):
+                return False
+            if _stem(task.path).lower() in entry_names:
+                return True
+            purpose = (task.purpose or "").lower()
+            return any(w in purpose for w in entry_words)
+
+        entries = [t.id for t in plan.tasks if is_entry(t)]
+        others = [t.id for t in plan.tasks if t.id not in entries]
+        #: Every entry point waits for every non-entry-point. Entry points do
+        #: not depend on each other — two of them are independent by
+        #: definition, and inventing an order between them would be a guess.
+        return {t.id: (set(others) if t.id in entries else set())
+                for t in plan.tasks}
 
     # ------------------------------------------------------------------
     # step 4: replan
@@ -429,12 +625,38 @@ class Planner:
                 revised.append(task.with_status("done"))
                 continue
             revised.append(task)
+
+        #: RE-ORDER WHAT IS LEFT, now that a real file exists to read.
+        #:
+        #: Before the first build the order rests on a role heuristic, which
+        #: is a floor rather than an answer. Every completed file replaces a
+        #: little of that guess with fact: its imports are now on disk and can
+        #: be parsed. Re-deriving here is what lets the plan discover, after
+        #: math3d is written, that render imports track and must follow it —
+        #: a relationship no amount of staring at filenames would reveal, and
+        #: the exact one that left two files unimportable in a real run.
+        #:
+        #: Done work is never re-ordered. It is finished, its position is
+        #: history, and moving it would make the journal a poor record of what
+        #: actually happened.
+        revised = self._reorder_pending(
+            Plan(request=plan.request, tasks=tuple(revised),
+                 layout_note=plan.layout_note, caveats=plan.caveats))
+
         if self.journal is not None:
             self.journal.log("plan", replan=True, reason=reason,
                              remaining=[t.path for t in revised
                                         if t.status == "pending"])
         return Plan(request=plan.request, tasks=tuple(revised),
                     layout_note=plan.layout_note, caveats=plan.caveats)
+
+    def _reorder_pending(self, plan: Plan) -> list[Task]:
+        """Re-sort only the pending tail, preserving finished work in place."""
+        ordered = self.derive_order(plan).tasks
+        settled = [t for t in plan.tasks if t.status != "pending"]
+        settled_ids = {t.id for t in settled}
+        pending = [t for t in ordered if t.id not in settled_ids]
+        return settled + pending
 
 
 # --------------------------------------------------------------------------
@@ -475,6 +697,39 @@ def _parse_file_list(text: str) -> list[tuple[str, str]]:
         seen.add(path)
         rows.append((path, purpose[:200]))
     return rows
+
+
+#: A path that is explicitly a test file. Anchored on the FILENAME beginning
+#: `test_`/`spec_` or ending `_test`/`_spec`/`.test`/`.spec`, so `tests/
+#: helpers.py` is not swept up and `src/latest_data.py` is not mistaken for
+#: one. Directory part optional: a request may say `test_math3d.py` alone.
+_TEST_PATH = re.compile(
+    r"(?<![\w/.\\])"
+    r"(?P<path>(?:[\w.-]+[/\\])*"
+    r"(?:(?:test|spec)_[\w-]+|[\w-]+(?:_(?:test|spec)|\.(?:test|spec)))"
+    r"\.\w{1,4})"
+    r"(?![\w])")
+
+
+def _required_tests(request: str) -> list[str]:
+    """Test files the request named outright, in the order they appeared.
+
+    Used by :meth:`Planner._ensure_required_tests`. Kept as a free function so
+    it can be tested against a real specification without constructing a host.
+
+    Conservative on purpose. It answers "did the operator name this file?",
+    not "should there be tests?" — the second question invites a planner to
+    invent work nobody asked for, and the first is the one that was being
+    ignored.
+    """
+    out: list[str] = []
+    for m in _TEST_PATH.finditer(request or ""):
+        path = m.group("path").replace("\\", "/").lstrip("./")
+        if not langs.id_for_path(path):
+            continue
+        if path not in out:
+            out.append(path)
+    return out
 
 
 def _plan_prompt(request: str, lang: str, layout: dict) -> str:

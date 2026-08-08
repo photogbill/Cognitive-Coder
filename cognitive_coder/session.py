@@ -161,6 +161,14 @@ class Session:
 
         self.plan = self.planner.plan(request, profile)
         if self.config.skeleton_first:
+            #: ORDER FIRST, THEN STUBS. This line is the whole fix for a
+            #: deadlock that made ordering a no-op on every project: the
+            #: stubs' imports are written from `depends_on`, so `depends_on`
+            #: has to exist before the stubs do. Ordering afterwards read
+            #: import-free stubs, learned nothing, and returned the model's
+            #: arbitrary order — which is how a run once began with main.py
+            #: and ended three failed attempts later.
+            self.plan = self.planner.derive_order(self.plan)
             result = self.planner.skeleton(self.plan)
             if not result["ok"]:
                 # An architecturally wrong skeleton is caught HERE, in
@@ -322,6 +330,10 @@ class Session:
                                              "intermediate")),
             build_summary=f"{len(done)} of {len(self.outcomes)} file(s) "
                           f"built and their tests ran",
+            #: The reviewer only ever sees committed files, so without this it
+            #: cannot tell a clean build from a collapsed one — and reports the
+            #: second as the first.
+            unfinished=[o.path for o in self.outcomes if not o.ok],
             caveats=sorted({c for o in done for c in o.caveats}))
         self.host.fs.write(self.config.recommendation_path, document)
         self.host.emit("status",

@@ -664,12 +664,17 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
                             files: Sequence[str] = (),
                             skill_level: str = "intermediate",
                             build_summary: str = "",
+                            unfinished: Sequence[str] = (),
                             caveats: Sequence[str] = ()) -> str:
     """The deliverable. Four sections, and the honesty line near the top.
 
     Pitched at `skill_level` because a deployment guide that assumes
     knowledge the reader does not have is a guide they cannot follow, and one
     that explains what they already know is one they stop reading.
+
+    ``unfinished`` is the list of files the build did NOT complete, and it
+    outranks everything else in the summary. See the executive-summary block
+    for what happened when it was not passed.
     """
     skill = skill_level if skill_level in personas.SKILL_LEVELS \
         else "intermediate"
@@ -692,8 +697,44 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
             ""]
 
     # -- 1. Executive Summary -------------------------------------------
+    #
+    # AN UNFINISHED BUILD OUTRANKS EVERY FINDING, 2026-08-07.
+    #
+    # This section used to consider only the review's own findings, and a
+    # reviewer is shown the files that were COMMITTED. When a build failed,
+    # the failed files were simply absent from what it read — so the worse the
+    # build went, the less there was to criticise, and a run that produced a
+    # program crashing on its first frame was summarised as:
+    #
+    #     Nothing was found that should stop this being used.
+    #
+    # Two of five files had not been written. `main.py` died immediately with
+    # a TypeError. Both facts were already in the document, four lines below,
+    # in the Verification line — and were contradicted by the sentence above
+    # them. A summary that disagrees with its own body teaches the reader to
+    # skip the summary.
+    #
+    # So the order is: what is missing, then what is wrong, then anything
+    # else. "Nothing should stop this" is a claim only a completed build has
+    # standing to make.
     lines += ["## Executive summary", ""]
     high = result.high
+    unfinished = [str(p) for p in unfinished]
+    if unfinished:
+        lines.append(
+            f"**This build did not finish. "
+            f"{len(unfinished)} file{'s' * (len(unfinished) != 1)} "
+            f"{'were' if len(unfinished) != 1 else 'was'} not completed:**")
+        lines.append("")
+        for path in unfinished:
+            lines.append(f"- `{path}`")
+        lines.append("")
+        lines.append(
+            "Everything below reviews only the files that WERE completed. "
+            "It is not an assessment of the program as a whole, and the "
+            "absence of findings about the missing files is not evidence "
+            "that they are fine.")
+        lines.append("")
     if high:
         lines.append(
             f"**{len(high)} thing{'s' * (len(high) != 1)} to deal with "
@@ -703,8 +744,11 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
             lines.append(f"- {f.title}"
                          + (f" — `{f.path}:{f.line}`" if f.line else ""))
         lines.append("")
-    else:
+    elif not unfinished:
         lines += ["Nothing was found that should stop this being used.", ""]
+    else:
+        lines += ["No blocking issue was found in the files that did build.",
+                  ""]
 
     lines.append(f"Overall: {result.summary()}.")
     if build_summary:
