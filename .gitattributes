@@ -1,0 +1,79 @@
+# ============================================================================
+#  Line endings, decided here rather than per machine.
+#
+#  THIS FILE EXISTS BECAUSE THE ALTERNATIVE COST THREE DAYS.
+#
+#  On 2026-08-07 every .bat file in this project was rewritten with LF-only
+#  line endings by an editor running on Linux. cmd.exe requires CRLF. It
+#  tolerates LF for plain sequential commands — which is why the installer
+#  appeared to run at all — but not for the three things the installer is
+#  built from:
+#
+#      call :label  and  goto :label     cmd seeks by byte offset and lands
+#                                        in the wrong place
+#      multi-line ( ... ) blocks         the parser loses the boundary
+#      subroutines after the main body   which is most of install.bat
+#
+#  So it executed as a stream of simple commands and skipped everything
+#  structural. No error, because nothing failed. The Python stage, the engine
+#  stage and the stage report never ran; two subsystems were never installed;
+#  two sidebar tabs never appeared. The file READ correctly and every test
+#  that inspected its text passed, because the defect lived in bytes nobody
+#  looks at.
+#
+#  Without this file, whether that happens again depends on each machine's
+#  `core.autocrlf` setting — which is to say, on luck. `eol=crlf` below makes
+#  git write CRLF into the working tree on every checkout, on every machine,
+#  regardless of local configuration. The rule is now enforced by the version
+#  control system rather than remembered by a person.
+#
+#  tests/test_installer.py checks the same property from the other side, so a
+#  file that arrives wrong is caught by the suite as well as prevented here.
+# ============================================================================
+
+# Normalise everything to LF inside the repository; the working tree is then
+# governed by the rules below.
+* text=auto
+
+# ---- MUST be CRLF in the working tree --------------------------------------
+# Windows shells parse by byte offset. This is not a style preference.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# ---- MUST be LF ------------------------------------------------------------
+# Python does not care, but a mixed repository produces diffs that are
+# entirely line endings, which buries the change that actually matters.
+*.py    text eol=lf
+*.pyi   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+
+# ---- never touched ---------------------------------------------------------
+# A "text" heuristic that guesses wrong on a binary corrupts it silently.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.wav   binary
+*.mp3   binary
+*.pdf   binary
+*.docx  binary
+*.xlsx  binary
+*.zip   binary
+*.exe   binary
+*.dll   binary
+*.gguf  binary
+*.bin   binary
+*.db    binary
+*.sqlite3 binary

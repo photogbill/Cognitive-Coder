@@ -613,10 +613,26 @@ class Planner:
             return any(w in purpose for w in entry_words)
 
         entries = [t.id for t in plan.tasks if is_entry(t)]
-        others = [t.id for t in plan.tasks if t.id not in entries]
-        #: Every entry point waits for every non-entry-point. Entry points do
-        #: not depend on each other — two of them are independent by
-        #: definition, and inventing an order between them would be a guess.
+        #: A TEST IS NOT A DEPENDENCY OF THE PROGRAM, and saying otherwise
+        #: cost a whole build.
+        #:
+        #: This first read "everything that is not an entry point", which
+        #: swept in the test files. Two things followed, both wrong:
+        #:
+        #:   * `stub_for` writes a stub's imports from `depends_on`, so
+        #:     `src/main.py` was scaffolded with `from tests.test_physics
+        #:     import *` — an entry point importing its own test suite,
+        #:     which is backwards and would ship that way;
+        #:   * when those tests failed, `main.py` had unmet dependencies
+        #:     forever. `next_ready()` never returned it, and the run ended
+        #:     at six of seven files with no explanation offered.
+        #:
+        #: A test consumes the module; the module does not consume the test.
+        #: The dependency runs one way and it is already expressed by the
+        #: test-follows-its-module rule in `derive_order`.
+        others = [t.id for t in plan.tasks
+                  if t.id not in entries and not _looks_like_test(
+                      next(x.path for x in plan.tasks if x.id == t.id))]
         return {t.id: (set(others) if t.id in entries else set())
                 for t in plan.tasks}
 

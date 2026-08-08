@@ -36,6 +36,8 @@ which is where that bargain is explained and enforced.
 
 from __future__ import annotations
 
+import builtins
+
 from collections.abc import Callable
 from typing import Any
 
@@ -474,12 +476,21 @@ class CodeMap:
 # `len()` and `println!` is reported as an invented API, which would make the
 # D4 check noise instead of signal.
 _BUILTINS: dict[str, set] = {
-    "python": set(dir(__builtins__) if isinstance(__builtins__, dict)
-                  else dir(__builtins__)) | {
-        "self", "super", "print", "len", "range", "open", "isinstance",
-        "int", "str", "float", "list", "dict", "set", "tuple", "bool",
-        "enumerate", "zip", "sorted", "sum", "min", "max", "abs", "any",
-        "all", "type", "repr", "format", "getattr", "setattr", "hasattr"},
+    #: `import builtins` — NOT `dir(__builtins__)`.
+    #:
+    #: The old line branched on whether `__builtins__` was a dict and then
+    #: called `dir()` on it either way, which is the same expression twice.
+    #: That matters: inside an imported module `__builtins__` IS a dict, so
+    #: `dir()` returned the dict's own methods — keys, values, items — and
+    #: 75 names instead of about 150. Missing from the list were `reversed`,
+    #: `round`, and every exception type, so each of those was reported as
+    #: "a name this project does not define" on any file that used one.
+    #:
+    #: Found by a real run flagging `reversed` in a renderer, after the
+    #: local-variable false positives had already been fixed. One remaining
+    #: wrong name in an otherwise clean report is worse than a noisy one,
+    #: because by then the report is being believed.
+    "python": set(dir(builtins)) | {"self", "super"},
     "c": {"printf", "malloc", "free", "memcpy", "strlen", "strcmp", "sizeof",
           "fopen", "fclose", "fprintf", "sprintf", "snprintf", "exit"},
     "cpp": {"printf", "std", "cout", "cerr", "endl", "sizeof", "make_unique",
