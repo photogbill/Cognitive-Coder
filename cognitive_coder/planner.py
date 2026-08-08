@@ -72,6 +72,19 @@ class Planner:
     lang: str = "python"
     src_dir: str = ""
     test_dir: str = ""
+    #: HOW MANY FILES ONE PLAN MAY CONTAIN.
+    #:
+    #: A cap is right — a model asked for "a web framework" will happily
+    #: propose sixty files and finish none of them — but 12 was a constant
+    #: nobody could reach, and on a large written specification it is the
+    #: binding limit long before tokens are. Twelve is a reasonable default
+    #: for a request typed in a sentence and an arbitrary one for a
+    #: four-section design document.
+    #:
+    #: Truncation is reported as a caveat and always was; what changes is
+    #: that the operator can now raise it instead of rewriting the request
+    #: to fit a number they were never told about.
+    max_files: int = MAX_FILES
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -102,9 +115,16 @@ class Planner:
         tasks, added = self._ensure_required_tests(request, tasks, layout)
 
         caveats: list[str] = []
-        if len(rows) > MAX_FILES:
+        if len(rows) > self.max_files:
             caveats.append(f"the model proposed {len(rows)} files; only the "
-                           f"first {MAX_FILES} were kept")
+                           f"first {self.max_files} were kept — raise the "
+                           f"plan file limit if the request really needs "
+                           f"that many")
+            self.host.emit("warning",
+                           f"the plan was truncated at {self.max_files} "
+                           f"files; {len(rows) - self.max_files} more were "
+                           f"proposed and dropped",
+                           {"phase": "plan", "proposed": len(rows)})
         if added:
             caveats.append(
                 f"the request asked for {len(added)} test file(s) that the "
@@ -168,7 +188,7 @@ class Planner:
         added: list[str] = []
         out = list(tasks)
         for path in wanted:
-            if path.lower() in have or len(out) >= MAX_FILES:
+            if path.lower() in have or len(out) >= self.max_files:
                 continue
             lang_id = langs.id_for_path(path) or self.lang
             out.append(Task(
@@ -194,7 +214,7 @@ class Planner:
     def _to_tasks(self, rows: Sequence[tuple[str, str]],
                   layout: dict) -> list[Task]:
         tasks: list[Task] = []
-        for i, (path, purpose) in enumerate(rows[:MAX_FILES]):
+        for i, (path, purpose) in enumerate(rows[:self.max_files]):
             path = self.validate_path(path, layout)
             lang_id = langs.id_for_path(path) or self.lang
             is_test = _looks_like_test(path)

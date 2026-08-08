@@ -131,7 +131,22 @@ class Completion:
     tokens_in: int = 0
     tokens_out: int = 0
     model: str = ""              # journaled per call (C8, §0.1)
-    prompt_ms: int = 0           # prompt-processing time; G.7.5, M55
+    prompt_ms: int = 0           # prompt-processing time ONLY; G.7.5, M55
+    #: Generation time, separately. Added because a provider conflated the
+    #: two and the conflation was invisible: `prompt_ms` carried the whole
+    #: call, so it tracked `tokens_out` rather than prompt size, and G.7.5's
+    #: prefix-cache check was reading a number that did not mean what its
+    #: name said. Across one real session the figure ranged 36 s to 120 s
+    #: while the prompt stayed near 1,500 tokens throughout, and `stats()`
+    #: reported that as "prompt processing is steady".
+    #:
+    #: Keeping them apart is what makes both usable: prefill answers "did the
+    #: prefix cache break?", decode answers "how fast is this model on this
+    #: machine?". One field cannot answer either.
+    #:
+    #: Optional and defaulted, so a provider that cannot separate them
+    #: reports 0 and nothing downstream changes.
+    decode_ms: int = 0
 
     def __post_init__(self) -> None:
         if self.finish_reason not in FINISH_REASONS:
@@ -532,6 +547,11 @@ class JournalEvent:
     tokens_in: int = 0
     tokens_out: int = 0
     prompt_ms: int = 0
+    #: Generation time, recorded beside prefill rather than folded into it.
+    #: Zero means the provider does not separate them — in which case
+    #: `prompt_ms` may be a whole-call time and `cache_health()` says so
+    #: instead of drawing a conclusion it has no basis for.
+    decode_ms: int = 0
     verify: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
 

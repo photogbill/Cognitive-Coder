@@ -10,6 +10,84 @@ is a major version.
 
 ## [Unreleased]
 
+### Fixed — `prompt_ms` was measuring the wrong thing
+
+`Completion` and `JournalEvent` gain `decode_ms`, and `prompt_ms` now means
+what M55 says it means: **prompt processing only**.
+
+A host adapter had been putting whole-call wall-time in `prompt_ms`. Across a
+real eleven-generation session the figure tracked `tokens_out` almost
+perfectly and `tokens_in` not at all — 423 tokens out took 36 s, 1,209 took
+114 s, while the prompt stayed near 1,500 tokens throughout. It was measuring
+decode. G.7.5's prefix-cache check then read that as *"prompt processing is
+steady … the prefix cache looks healthy"*, which was a confident statement
+about a number that did not mean what its name said.
+
+The two are separable for nothing when the provider streams: everything before
+the first token is prefill, everything after is decode.
+
+- `cache_health()` now **withholds the verdict** when `decode_ms` is absent,
+  saying the provider does not separate the two and nothing can be concluded,
+  rather than drawing a conclusion from a number it cannot interpret. A wrong
+  diagnosis is worse than a missing one, because it stops anyone looking.
+- `stats()` gains `tokens_per_s_median`, so decode speed is a recorded figure
+  rather than an impression. Milliseconds of decode mean nothing without the
+  token count beside them — 120 s is fast for 1,200 tokens and catastrophic
+  for 40.
+- Both fields default to 0, so a provider that cannot separate them keeps
+  working and simply gets the honest verdict.
+
+### Added — the plan size limit is reachable
+
+`SessionConfig.max_files` and `ccoder build --max-files N`, defaulting to the
+previous constant of 12.
+
+A cap is right: a model asked for "a web framework" will propose sixty files
+and finish none of them. But 12 was a module-level constant no host could
+reach, it suits a request typed in one sentence, and it is arbitrary for a
+four-section design document — which is precisely the case `--spec` exists to
+serve, so the two features had to arrive together or the second would be
+capped by the first. Truncation now emits a warning as well as a caveat, and
+says how many files were dropped.
+
+### Added — a build request can be a file
+
+`cc build --spec plan.md` reads the request from a `.md` or `.txt` file, and
+`--preview` plans and prints what would be built without generating anything.
+
+The CLI had always described the request as "what you want built, in a
+sentence", and that framing was wrong for the work this engine is good at. A
+sentence types fast and plans badly. Everything that decides whether a build
+goes well — which modules exist, what each owns, what must not import what,
+which tests must be written — is thinking done before the model is asked for
+anything, and it does not fit in a shell argument or a one-line text box. The
+specification that exposed the four fixes below was sixty lines in four
+numbered sections, and it was pasted into a field showing one line at a time.
+
+- `spec.py` — reads the file, strips YAML front matter, takes the document's
+  own first heading as its title, and reports what can be seen in it: the
+  source paths it names, the test files it requires, and its size in
+  approximate tokens. It does **not** interpret the specification; the text
+  goes through verbatim, because the planner and the persona prompts are
+  where meaning is extracted and a second answer to that question would only
+  disagree with the first. Path detection is deliberately strict — `Pseudo-3D`,
+  `16-bit` and `version 1.1` are prose, and a preview that lists imaginary
+  files reads as though the engine understood something it did not.
+
+- `Session.preview()` — plans and stops. Returns the build order, the context
+  cost, and `tests_required` beside `tests_planned`: the two numbers whose
+  disagreement went unnoticed for an entire build. Planning costs one small
+  completion; a build costs twenty minutes of a local model's time, and both
+  questions worth asking are answerable in between. It writes nothing, and a
+  test asserts that — a preview that scaffolds a project is a build with a
+  misleading name.
+
+- A file that cannot be used says why in a sentence rather than a traceback
+  (C6). This runs at the very start of a long operation, where a stack trace
+  for a mistyped filename costs the whole run. A specification larger than
+  most local models' context is flagged and never silently truncated: the
+  operator decides.
+
 ### Fixed — four faults found by the first real workload
 
 The same pseudo-3D racing specification was built twice on 2026-08-07, with

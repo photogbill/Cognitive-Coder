@@ -221,7 +221,81 @@ def doctor(argv: Sequence[str] | None = None) -> int:
 # build
 # --------------------------------------------------------------------------
 
+def _request_from(args: argparse.Namespace) -> tuple[str, object] | None:
+    """The build request, from --spec or from the positional argument.
+
+    Returns (text, Spec) or None after printing why it cannot continue. The
+    error goes to stderr as a sentence rather than a traceback (C6): this is
+    the first thing that happens in a long operation, and a stack trace here
+    costs the whole run for a mistyped filename.
+    """
+    from . import spec as spec_mod
+
+    if args.spec and args.request:
+        print("Pass a request or --spec, not both. They are two ways to say "
+              "the same thing and I cannot know which you meant.",
+              file=sys.stderr)
+        return None
+    if args.spec:
+        try:
+            loaded = spec_mod.load(args.spec)
+        except spec_mod.SpecError as exc:
+            print(f"Cannot read that specification: {exc}", file=sys.stderr)
+            return None
+        return loaded.text, loaded
+    if not args.request:
+        print("Nothing to build. Give a request in a sentence, or point at a "
+              "file with --spec plan.md.", file=sys.stderr)
+        return None
+    return args.request, spec_mod.from_text(args.request)
+
+
+def _print_preview(pv: dict) -> None:
+    """What the engine understood, before it is asked to write anything."""
+    print()
+    if pv["title"]:
+        print(f"  {pv['title']}")
+    print(f"  model: {pv['model'] or 'unknown'} · "
+          f"request ~{pv['approx_tokens']} tokens"
+          + (f" of {pv['context_tokens']} context"
+             if pv["context_tokens"] else ""))
+    print()
+    print(f"  Build order ({len(pv['files'])} file(s)):")
+    for i, path in enumerate(pv["files"], 1):
+        purpose = pv["purposes"].get(path, "")
+        print(f"    {i}. {path}"
+              + (f"  — {purpose[:60]}" if purpose else ""))
+
+    #: The two numbers whose disagreement went unnoticed for a whole build.
+    #: Printed together, always, including when they agree — a check you only
+    #: see when it fails is one you do not know is running.
+    req, planned = pv["tests_required"], pv["tests_planned"]
+    print()
+    print(f"  Tests: {len(req)} named in the request, "
+          f"{len(planned)} in the plan")
+    for path in planned:
+        print(f"    + {path}"
+              + ("  (added — the plan had left it out)"
+                 if path in req and any("left out" in c
+                                        for c in pv["caveats"]) else ""))
+    if pv["tests_missing"]:
+        print("    [!] named in the request but NOT planned: "
+              + ", ".join(pv["tests_missing"]))
+        print("        A build with no tests cannot report whether it worked.")
+    elif not req and not planned:
+        print("    none — nothing will verify the result beyond 'it imports'")
+
+    for note in pv["warnings"] + pv["caveats"]:
+        print(f"  note: {note}")
+    print()
+
+
 def build(args: argparse.Namespace) -> int:
+    got = _request_from(args)
+    if got is None:
+        return 2
+    request, _spec = got
+
     root = os.path.abspath(args.project or os.getcwd())
     events = ConsoleEvents(verbose=args.verbose)
     host = Host(
@@ -252,9 +326,19 @@ def build(args: argparse.Namespace) -> int:
         lang=args.lang, attempts=args.attempts,
         temperature=args.temperature, max_tokens=args.max_tokens,
         wall_clock_s=args.budget * 60 if args.budget else 0.0,
+        max_files=args.max_files,
         skeleton_first=not args.no_skeleton))
+    if args.preview:
+        try:
+            _print_preview(session.preview(request))
+        except CognitiveCoderError as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
+        print("  Nothing was written. Re-run without --preview to build.")
+        return 0
+
     try:
-        session.run(args.request)
+        session.run(request)
     except KeyboardInterrupt:
         session.cancel()
         print("\nStopping at the next safe point…", file=sys.stderr)
@@ -336,7 +420,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     b = sub.add_parser("build", parents=[common],
                        help="plan and build from a request")
-    b.add_argument("request", help="what you want built, in a sentence")
+    #: Optional, because --spec replaces it. A sentence types fast and plans
+    #: badly; anything worth twenty minutes of model time is worth writing in
+    #: an editor and keeping next to the code it produced.
+    b.add_argument("request", nargs="?", default="",
+                   help="what you want built, in a sentence "
+                        "(or use --spec for a file)")
+    b.add_argument("--spec", "-f", default="", metavar="FILE",
+                   help="read the build request from a .md or .txt file")
+    b.add_argument("--preview", action="store_true",
+                   help="plan and print what would be built, then stop "
+                        "without generating anything")
     b.add_argument("--lang", default="python")
     b.add_argument("--attempts", type=int, default=4)
     b.add_argument("--temperature", type=float, default=0.15)
@@ -344,6 +438,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     b.add_argument("--budget", type=float, default=0.0,
                    help="wall-clock ceiling in minutes; it stops cleanly and "
                         "leaves the session resumable")
+    b.add_argument("--max-files", dest="max_files", type=int, default=12,
+                   help="how many files one plan may contain (default 12); "
+                        "raise it for a large written specification")
     b.add_argument("--no-skeleton", action="store_true",
                    help="skip the compiling-skeleton step (not advised)")
     b.add_argument("--dry-run", action="store_true",

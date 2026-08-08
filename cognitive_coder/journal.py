@@ -120,7 +120,7 @@ class Journal:
         """Record one event. Unknown fields go into `data`."""
         known = {"task", "attempt", "provider", "model", "prompt_sha256",
                  "temperature", "seed", "tokens_in", "tokens_out",
-                 "prompt_ms", "verify"}
+                 "prompt_ms", "decode_ms", "verify"}
         head = {k: v for k, v in fields.items() if k in known}
         rest = {k: v for k, v in fields.items() if k not in known}
         return self.write(JournalEvent(
@@ -143,6 +143,11 @@ class Journal:
             temperature=temperature, seed=seed,
             tokens_in=completion.tokens_in, tokens_out=completion.tokens_out,
             prompt_ms=completion.prompt_ms,
+            #: Recorded beside prefill, never folded into it. Together with
+            #: `tokens_out` this makes decode speed a query rather than an
+            #: estimate — which is the difference between "the machine feels
+            #: slow" and "11.2 tokens per second, and here is last week's".
+            decode_ms=completion.decode_ms,
             verify=verify or {},
             finish_reason=completion.finish_reason, **extra)
 
@@ -178,6 +183,13 @@ class Journal:
         gens = [r for r in rows if r.get("event") == "generate"]
         prompt_times = [int(r.get("prompt_ms", 0)) for r in gens
                         if r.get("prompt_ms")]
+        #: Decode is reported separately, and its useful form is a RATE.
+        #: Milliseconds of decode mean nothing without the token count beside
+        #: them — 120 s is fast for 1,200 tokens and catastrophic for 40.
+        rates = [round(int(r.get("tokens_out", 0))
+                       / (int(r.get("decode_ms", 0)) / 1000), 1)
+                 for r in gens
+                 if int(r.get("decode_ms", 0)) > 0 and r.get("tokens_out")]
         first_try = sum(1 for r in gens if int(r.get("attempt", 1)) == 1
                         and (r.get("verify") or {}).get("test") == "ok")
         return {
@@ -194,6 +206,8 @@ class Journal:
             "prompt_ms_median": (sorted(prompt_times)[len(prompt_times) // 2]
                                  if prompt_times else 0),
             "prompt_ms_max": max(prompt_times) if prompt_times else 0,
+            "tokens_per_s_median": (sorted(rates)[len(rates) // 2]
+                                    if rates else 0.0),
             # Remote is decided by what `capabilities().is_remote` SAID at
             # the time, recorded per call — never inferred from a provider
             # name. A name-based guess gets this wrong in both directions:
@@ -218,16 +232,34 @@ class Journal:
         """
         s = self.stats()
         med, mx = s["prompt_ms_median"], s["prompt_ms_max"]
+        rate = s.get("tokens_per_s_median") or 0.0
+        speed = f" Generation ran at about {rate} tokens/s." if rate else ""
         if not med:
             return "no prompt timings recorded yet."
+
+        # A PROVIDER THAT CONFLATES PREFILL AND DECODE MUST NOT BE READ AS IF
+        # IT HAD NOT. When `decode_ms` is absent, `prompt_ms` may be the whole
+        # call — which is what one adapter reported for months. The figure
+        # then tracks output length rather than prompt size, and a verdict on
+        # the prefix cache drawn from it is not a weak claim, it is an
+        # unfounded one. Say what is missing instead of guessing.
+        if not rate and not any(int(r.get("decode_ms", 0)) > 0
+                                for r in self.events()
+                                if r.get("event") == "generate"):
+            return (f"prompt timings recorded, median {med} ms and worst "
+                    f"{mx} ms, but this provider does not separate prompt "
+                    f"processing from generation — so these may be whole-call "
+                    f"times and nothing can be concluded about the prefix "
+                    f"cache from them.")
+
         if mx > med * 10 and mx > 5000:
             return (f"prompt processing spiked to {mx} ms against a median of "
                     f"{med} ms — the cached prompt prefix was probably "
                     f"invalidated. Something varying (a timestamp, an id, a "
                     f"reordered block) may have got into the stable part of "
-                    f"the prompt.")
+                    f"the prompt.{speed}")
         return (f"prompt processing is steady: median {med} ms, worst "
-                f"{mx} ms — the prefix cache looks healthy.")
+                f"{mx} ms — the prefix cache looks healthy.{speed}")
 
     def summary(self) -> str:
         """The closing line of a session, in the shape of Appendix E."""

@@ -44,7 +44,7 @@ from .errors import BudgetExceeded, Cancelled, NoModelLoadedError
 from .journal import Journal
 from .loop import Loop, LoopConfig
 from .patcher import Patcher
-from .planner import Planner
+from .planner import Planner, _looks_like_test
 from .ports import Cancel, Host
 from .providers import RemoteGate
 from .redact import Budget
@@ -78,6 +78,10 @@ class SessionConfig:
     # wall-clock budget already covers that.
     max_remote_tokens: int = 0
     max_remote_spend: float = 0.0
+    #: Plan size ceiling. Twelve suits a request typed in a sentence and is
+    #: arbitrary for a four-section design document, which is the case the
+    #: --spec flag exists to serve.
+    max_files: int = 12
     conventions: str = ""
     model_system_prompt: str = ""        # the model's OWN shipped prompt
     journal_dir: str = ".cc_journal"
@@ -109,7 +113,8 @@ class Session:
             conventions=self.config.conventions)
         self.planner = Planner(host, codemap=self.codemap,
                                journal=self.journal, prompts=self.prompts,
-                               lang=self.config.lang)
+                               lang=self.config.lang,
+                               max_files=self.config.max_files)
         self.loop = Loop(
             host, codemap=self.codemap, patcher=self.patcher,
             journal=self.journal, prompts=self.prompts,
@@ -182,6 +187,65 @@ class Session:
                                {"phase": "skeleton"})
             self.plan = self.planner.derive_order(self.plan)
         return self.plan
+
+    def preview(self, request: str, profile: dict | None = None) -> dict:
+        """Plan, and stop. What would be built, before anything is built.
+
+        WHY THIS IS WORTH A ROUND TRIP
+        ------------------------------
+        Planning costs one small completion. A build costs twenty minutes of
+        a local model's time, and the two questions most worth asking are
+        both answerable after the first of those and before the second:
+
+          * **is this the right set of files, in the right order?**
+          * **does the plan actually cover what the request asked for?**
+
+        The second is not hypothetical. A specification arrived with a section
+        headed "Testing Requirements (Strict)" naming two test files; the
+        planner proposed five source files and no tests; and the run went to
+        completion reporting, truthfully and about ten times, that the test
+        command had run zero tests. Every fact needed to catch that existed
+        one completion in. Nobody was shown them together.
+
+        So this returns `tests_required` beside `tests_planned` — the two
+        numbers whose disagreement was invisible — along with the build order
+        and the context cost. `Planner._ensure_required_tests` now repairs
+        that particular gap automatically, and this exists so the operator can
+        still SEE it happen rather than trusting that it did.
+
+        Returns plain data, not a Plan, because the caller may be a GUI in
+        another thread and handing live objects across that boundary is how a
+        SQLite handle ends up on the wrong thread.
+        """
+        from . import spec as spec_mod
+
+        described = spec_mod.from_text(request)
+        self.plan = self.planner.plan(request, profile)
+        if self.config.skeleton_first:
+            self.plan = self.planner.derive_order(self.plan)
+
+        caps = self._capabilities(boundary="preview")
+        planned = [t.path for t in self.plan.tasks]
+        tests_planned = [p for p in planned if _looks_like_test(p)]
+        return {
+            "title": described.title,
+            "files": planned,
+            "purposes": {t.path: t.purpose for t in self.plan.tasks},
+            "tests_required": list(described.required_tests),
+            "tests_planned": tests_planned,
+            #: Named in the request and NOT in the plan. Should be empty now
+            #: that the planner repairs it; if it is ever non-empty the repair
+            #: has regressed, and the operator finds out here rather than in
+            #: an hour's worth of green output that proved nothing.
+            "tests_missing": [t for t in described.required_tests
+                              if t not in planned],
+            "files_named_in_request": list(described.mentioned_paths),
+            "caveats": list(self.plan.caveats),
+            "warnings": list(described.warnings),
+            "approx_tokens": described.approx_tokens,
+            "context_tokens": caps.context_tokens,
+            "model": caps.name,
+        }
 
     def step(self) -> TaskOutcome | None:
         """Do the next ready task. None when there is nothing left.

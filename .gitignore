@@ -42,3 +42,9 @@ Thumbs.db
 
 # The drafted commit message, staged for `git commit -F`
 .git-commit-message.txt
+
+# Session state written by MemoryStorage when the engine is run with the repo
+# as its project root — codemap SQLite and its journal. Test debris, not
+# source, and the default state directory is configurable per host.
+.s/
+.cc_state/
