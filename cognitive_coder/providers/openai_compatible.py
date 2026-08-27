@@ -47,7 +47,29 @@ from .base import (
 )
 
 DEFAULT_URL = "http://127.0.0.1:8080"
-DEFAULT_TIMEOUT = 900.0          # a 24B generating 800 tokens takes minutes
+
+#: NO CEILING ON GENERATION. `0` means wait as long as the model takes.
+#:
+#: Bill: *"if there are any time limits on generation they should be removed.
+#: I might at some point use a 70B GGUF Q4_K_M since I can CPU offload
+#: heavily, and accept the lengthy generations. The whole thing is that I
+#: don't want to lose final result quality for speed reasons."*
+#:
+#: This was 900s, which is a number that looks generous until you do the
+#: arithmetic for the machine it has to serve. A 70B Q4_K_M with most layers
+#: on the CPU decodes at roughly 1–2 tok/s. A 4096-token file is then 35 to 70
+#: minutes, and the old ceiling would have cut it off at fifteen — mid-file,
+#: with nothing to show for the wait.
+#:
+#: And a truncated generation is the worst possible outcome, not a middling
+#: one. It costs the wait AND the result, then hands the repair loop a file
+#: that stops mid-function: a syntax error no rewrite can fix, because the
+#: problem was never in the code. The attempts drain against it.
+#:
+#: A hung server is the thing a timeout is supposed to catch, and it still is
+#: — but that is what `/health` is for (see `reachable()`), and it does not
+#: require guessing how long an honest answer should take.
+DEFAULT_TIMEOUT = 0.0
 
 
 def is_local_url(url: str) -> bool:
@@ -96,6 +118,17 @@ class OpenAICompatible(ProviderBase):
         self.last_prompt_ms = 0
 
     # -- HTTP -------------------------------------------------------------
+    @staticmethod
+    def _patience(seconds: float | None) -> float | None:
+        """Seconds to wait, where 0 (or None) means "as long as it takes".
+
+        `urlopen` wants `None` for no limit. It must never be handed a literal
+        `0`, which is not "no timeout" but a NON-BLOCKING socket — every
+        request would fail instantly, and the failure would look like the
+        server being down rather than like a configuration mistake.
+        """
+        return seconds if seconds and seconds > 0 else None
+
     def _post(self, path: str, payload: dict, timeout: float | None = None
               ) -> dict:
         url = f"{self.base_url}{path}"
@@ -106,7 +139,8 @@ class OpenAICompatible(ProviderBase):
             req.add_header("Authorization", f"Bearer {self._key}")
         for k, v in self._headers.items():
             req.add_header(k, v)
-        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+        wait = self._patience(timeout if timeout else self.timeout)
+        with urllib.request.urlopen(req, timeout=wait) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
 
     def _get(self, path: str, timeout: float = 10.0) -> dict:
@@ -213,7 +247,8 @@ class OpenAICompatible(ProviderBase):
         if self._key:
             req.add_header("Authorization", f"Bearer {self._key}")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            with urllib.request.urlopen(
+                    req, timeout=self._patience(self.timeout)) as r:
                 for raw in r:
                     if cancel is not None and cancel.is_set():
                         return

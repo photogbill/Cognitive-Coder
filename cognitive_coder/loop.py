@@ -84,6 +84,7 @@ from .types import (
     RunResult,
     Task,
     TaskOutcome,
+    Timeouts,
 )
 
 DEFAULT_ATTEMPTS = 4
@@ -108,6 +109,9 @@ class LoopConfig:
     autofix: bool = True             # F1
     narrow_on_stagnation: bool = True   # F5
     wall_clock_s: float = 0.0        # 0 ⇒ no ceiling (F11 lives in Session)
+    #: Clocks on the generated PROGRAM's build/run/test. Nothing here bounds
+    #: generation — a model is given as long as it needs.
+    timeouts: Timeouts = field(default_factory=Timeouts)
 
 
 @dataclass
@@ -225,6 +229,7 @@ class Loop:
                            {"phase": "verify", "task": task.path,
                             "attempt": n})
                 result = self._verify(task, lang)
+                self._log_verify(task, n, result)
                 diags = tuple(result.diagnostics)
 
                 sig = _Signature(code=_sha(textio.canonical(
@@ -589,6 +594,7 @@ class Loop:
             self._read(task.path) or "", lang, fs=self.host.fs,
             ex=self.host.exec, stem=_stem(task.path), path=task.path,
             project_mode=self.config.project_mode, test_source=test_source,
+            timeouts=self.config.timeouts,
             skip_guard=True)      # already screened above; don't pay twice
 
     def _write(self, tx: Any, task: Task, code: str) -> bool:
@@ -623,6 +629,20 @@ class Loop:
                 self.journal.log("cancel", where=where)
             raise Cancelled(where)
 
+    def _log_verify(self, task: Task, n: int, result: Any) -> None:
+        """Every phase, its command and its output — verbatim.
+
+        The one thing the JSONL never kept. It recorded {"test": "ok"} and
+        threw away the two lines that mattered: "Ran 0 tests" and "OK".
+        """
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        try:
+            log.phases(task.path, n, result)
+        except Exception:                                # noqa: BLE001
+            pass          # a log must never fail a build
+
     def _journal_attempt(self, task: Task, n: int, completion: Completion,
                          request: str, verify: dict) -> None:
         if self.journal is None:
@@ -632,6 +652,24 @@ class Loop:
             remote = bool(caps.is_remote)
         except Exception:                                # noqa: BLE001
             remote = False
+        #: The readable log gets the same facts plus the thing the JSONL
+        #: deliberately does not keep: the code itself. The snapshots hold
+        #: every version, but reading a build means following the attempts
+        #: in order, and that is a different job from restoring one.
+        log = getattr(self, "log", None)
+        if log is not None:
+            try:
+                log.generation(
+                    task.path, n,
+                    temperature=self.config.temperature,
+                    seed=self.config.seed,
+                    tokens_in=completion.tokens_in,
+                    tokens_out=completion.tokens_out,
+                    prompt_ms=completion.prompt_ms,
+                    decode_ms=getattr(completion, "decode_ms", 0),
+                    text=completion.text)
+            except Exception:                            # noqa: BLE001
+                pass
         self.journal.generation(
             task=task.path, attempt=n,
             provider=getattr(self.host.llm, "name", "host"),

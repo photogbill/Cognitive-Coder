@@ -336,6 +336,8 @@ class Planner:
             if self.codemap is not None:
                 self.codemap.reindex_after_write(task.path)
 
+        self._make_packages(plan)
+
         ok, note = self.verify_skeleton(written)
         if self.journal is not None:
             self.journal.log("skeleton", files=written, ok=ok, note=note)
@@ -343,6 +345,62 @@ class Planner:
                        f"skeleton: {note}",
                        {"phase": "skeleton", "files": written, "ok": ok})
         return {"ok": ok, "files": written, "note": note}
+
+    def _make_packages(self, plan: Plan) -> None:
+        """Give every Python subdirectory an `__init__.py`.
+
+        THE REASON THIS EXISTS IS THE MOST EXPENSIVE BUG THIS ENGINE HAD.
+
+        Every build, of every project, reported on every file::
+
+            the test command succeeded but ran ZERO tests — that is not
+            evidence the code works, only that nothing contradicted it
+
+        That sentence was written as a warning about an edge case. It was in
+        fact describing the normal state of affairs, every time, and it was
+        exactly right — nothing was ever being verified.
+
+        The cause is one line of `unittest` behaviour:
+
+            discover will not descend into a directory that is not an
+            importable package
+
+        (kept on one line so a grep for it finds it). The
+        generated `tests\\` folder had no `__init__.py`, so discovery from the
+        project root walked past it, found nothing, ran nothing, and exited
+        zero. Measured on a real project: **0 tests, "OK"**. Adding the file:
+        **14 tests, 10 failing.** Ten real defects that a green build had been
+        quietly stepping over.
+
+        It is worth being precise about how this hid. The caveat was honest,
+        prominent and repeated — and because it appeared on every single file
+        it read as boilerplate rather than as a finding:
+
+            a warning that is always on is a warning nobody sees
+
+        Empty files, written once, never regenerated. `src\\` gets one too:
+        a namespace package is enough for `import src.physics` to work, but
+        being explicit costs nothing and removes the difference between a
+        layout that happens to work and one that is meant to.
+        """
+        if (self.lang or "python") != "python":
+            return
+        folders: set[str] = set()
+        for task in plan.tasks:
+            path = str(task.path).replace("\\", "/")
+            if "/" not in path or not path.endswith(".py"):
+                continue
+            folders.add(path.rsplit("/", 1)[0])
+        for folder in sorted(folders):
+            init = f"{folder}/__init__.py"
+            try:
+                if self.host.fs.exists(init):
+                    continue
+                self.host.fs.write(init, "")
+            except Exception:                                # noqa: BLE001
+                continue          # a folder we cannot write is the write
+                #: jail doing its job, and it is not this method's business
+                #: to argue with it.
 
     def stub_for(self, task: Task, plan: Plan) -> str:
         """A stub that compiles. Written deterministically where possible.

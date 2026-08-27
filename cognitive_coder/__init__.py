@@ -43,6 +43,7 @@ from . import (
                redact,
                review,
                runner,
+               skills,
                textio,
 )
 from .codemap import CodeMap
@@ -95,6 +96,7 @@ from .ports import (
 from .providers import RemoteGate, available_providers, make_provider
 from .redact import Budget, RedactionReport
 from .session import Session, SessionConfig
+from .skills import SKILLS_DIR, STARTER_SKILLS, Skill, SkillLoad, load_skills
 
 # -- the contract (§5) -----------------------------------------------------
 from .types import (
@@ -147,10 +149,12 @@ __all__ = [
     "AutoApprove", "DenyAll",
     # engine
     "langs", "diagnostics", "guard", "runner", "patcher", "textio",
-    "context", "redact", "review", "Budget", "RedactionReport",
+    "context", "redact", "review", "skills", "Budget", "RedactionReport",
     "CodeMap", "Journal", "Loop", "LoopConfig", "Patcher",
     "Transaction", "Planner", "Persona", "PromptBuilder",
     "detect_commentary", "strip_commentary", "strip_think",
     "Session", "SessionConfig", "RemoteGate", "make_provider",
     "available_providers",
+    # deployed skills (F3)
+    "Skill", "SkillLoad", "load_skills", "SKILLS_DIR", "STARTER_SKILLS",
 ]

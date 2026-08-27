@@ -80,6 +80,10 @@ host = Host(
 )
 
 session = Session(host, config=SessionConfig(lang="python"))
+# Deployed skills: if the project has `.ccoder/skills/*.md`, they are
+# discovered through YOUR FileSystemPort here, at construction, and join
+# the cached prompt prefix. `use_skills=False` opts out; the journal's
+# `skills` event records what loaded. See `cognitive_coder/skills.py`.
 for outcome in session.run("add CSV import to the report module"):
     print(outcome.summary())
 print(session.report())

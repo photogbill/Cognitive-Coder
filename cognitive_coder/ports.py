@@ -590,8 +590,12 @@ class SubprocessExec:
         except (OSError, ValueError) as exc:
             return ProcResult(exit_code=-1, stderr=f"could not run: {exc}",
                               duration_s=time.monotonic() - t0)
+        # 0 (or negative) means WAIT — `communicate` reads that as None. The
+        # operator asked for no ceiling; the ExecPort is where that has to be
+        # honoured, because every phase timeout funnels through here.
+        patience = timeout if timeout and timeout > 0 else None
         try:
-            out, err = proc.communicate(input=stdin or None, timeout=timeout)
+            out, err = proc.communicate(input=stdin or None, timeout=patience)
             timed_out = False
         except subprocess.TimeoutExpired:
             self._kill_tree(proc)
@@ -600,9 +604,13 @@ class SubprocessExec:
             except Exception:                            # noqa: BLE001
                 out, err = "", ""
             err = (err or "") + (
-                f"\ncognitive-coder: this exceeded {timeout:.0f}s and the "
-                f"whole process tree was killed. If the program is waiting "
-                f"for input it will never finish here — nothing is typed in.")
+                f"\ncognitive-coder: this was still running after "
+                f"{timeout:.0f}s and the whole process tree was killed. This "
+                f"clock is on the PROGRAM, not on the model that wrote it. "
+                f"Two ordinary reasons a program never finishes here: it is "
+                f"waiting for input, and nothing is typed in; or it has a "
+                f"main loop — a game, a server, a window — and is behaving "
+                f"correctly.")
             timed_out = True
         out, cut_a = _cap(out or "")
         err, cut_b = _cap(err or "")

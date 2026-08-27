@@ -49,7 +49,12 @@ from .base import (
     parse_tool_calls,
 )
 
-DEFAULT_TIMEOUT = 300.0
+#: The one place a generation clock survives, and only because the risk here
+#: is the opposite one. A local model that takes an hour costs an hour; a
+#: hung METERED call can bill for a socket nobody is reading. The local
+#: providers wait as long as it takes (see `openai_compatible.DEFAULT_TIMEOUT`)
+#: — this is a hang guard on a paid connection, set well past any real answer.
+DEFAULT_TIMEOUT = 1800.0
 
 
 class RemoteProvider(ProviderBase):

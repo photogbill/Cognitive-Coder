@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Sequence
+from dataclasses import replace
 import os
 import re
 from typing import Any
 
 from . import diagnostics, guard, langs
-from .types import Diagnostic, PhaseResult, ProcResult, RunResult
+from .types import Diagnostic, PhaseResult, ProcResult, RunResult, Timeouts
 
 # Environment handed to every child process. Deliberately minimal: whatever is
 # in the operator's environment — tokens, proxies, licence servers — has no
@@ -98,17 +99,119 @@ def scrubbed_env(workdir: str, project_root: str = "") -> dict[str, str]:
 def _phase(ex: Any, name: str, argv: Sequence[str], *, cwd: str,
            timeout: float, stdin: str = "",
            project_root: str = "") -> PhaseResult:
-    """Run one phase through the ExecPort and wrap the result."""
+    """Run one phase through the ExecPort and wrap the result.
+
+    ``timeout`` of 0 (or negative) means **no limit** — the phase waits. The
+    ExecPort honours that; see `SubprocessExec.run`.
+    """
     argv = [str(a) for a in argv]
     proc = ex.run(argv, cwd=cwd, timeout=timeout, stdin=stdin,
                   env=scrubbed_env(cwd, project_root or cwd))
     note = ""
     if proc.timed_out:
-        note = (f"{name} exceeded {timeout:.0f}s and the whole process tree "
-                f"was killed.")
+        # Say which knob raises it. An operator reading "exceeded 15s" cannot
+        # tell whether that is a limit on the MODEL or on the program it
+        # wrote, and the two have opposite remedies.
+        note = (f"{name} was still going after {timeout:.0f}s and the whole "
+                f"process tree was killed. This is a limit on the program "
+                f"being verified, not on generation — raise it in "
+                f"Setup › Coder › verification timeouts, or set it to 0 to "
+                f"wait indefinitely.")
     return PhaseResult(name=name, argv=tuple(argv), proc=proc,
                        ok=proc.exit_code == 0 and not proc.timed_out,
                        note=note)
+
+
+# ---------------------------------------------------------------------------
+# programs that are SUPPOSED to keep running
+# ---------------------------------------------------------------------------
+#
+# A game, a server and a GUI have one thing in common: they do not exit. The
+# run phase launches them, waits, and kills them on the clock — and until now
+# recorded that as `ok=False` with "run exceeded 15s and the whole process tree
+# was killed".
+#
+# Which is exactly backwards. For a pygame racing game, exiting within fifteen
+# seconds would be the BUG. The window opens, `while running:` spins, and the
+# only way that process ends is somebody closing it. The build was correct and
+# was marked a failure — then the timeout text went back to the model as a
+# diagnostic, and it spent its remaining attempts trying to fix code that was
+# already right.
+#
+# Same shape as the zero-tests bug and the same cost: a verdict that did not
+# match what happened. There it was success reported for work not done; here it
+# is failure reported for work done properly.
+#
+# THE DISCRIMINATION HAS TO BE HONEST, because "it timed out" alone cannot tell
+# a healthy main loop from a deadlock. So BOTH must hold:
+#
+#   1. the code actually uses a main-loop framework — an import, not a guess;
+#   2. it produced no error output before the clock ran out.
+#
+# A program that printed a traceback and then hung is still a failure. And what
+# this earns is narrow and gets said out loud in a caveat: the program STARTED
+# and STAYED UP. Nobody watched it play.
+
+#: Import names that mean "this process is designed to outlive its launch".
+#: Keyed by language, matched against the source. Deliberately imports and
+#: call signatures rather than heuristics like `while True` — a marker that
+#: guesses would eventually excuse a real hang.
+_MAIN_LOOP_MARKERS: dict[str, tuple[str, ...]] = {
+    "python": (
+        # games / graphics
+        "pygame", "pyglet", "arcade", "panda3d", "ursina", "raylib",
+        # GUI toolkits
+        "tkinter", "Tkinter", "PySide6", "PySide2", "PyQt6", "PyQt5",
+        "wx", "kivy", "dearpygui", "customtkinter",
+        # servers
+        "flask", "fastapi", "uvicorn", "gunicorn", "waitress", "aiohttp",
+        "http.server", "socketserver", "SimpleHTTPServer", "django",
+        "streamlit", "gradio",
+        # explicit loop calls
+        ".mainloop(", ".exec()", ".exec_()", "serve_forever(", "run_forever(",
+    ),
+    "javascript": ("express", "http.createServer", "app.listen(",
+                   "createServer(", "fastify", "koa", "socket.io"),
+    "typescript": ("express", "http.createServer", "app.listen(",
+                   "createServer(", "fastify", "koa", "socket.io"),
+    "go": ("http.ListenAndServe", "ListenAndServe(", "ebiten", "raylib"),
+    "rust": ("actix_web", "axum", "rocket", "warp", "bevy", "ggez",
+             "macroquad", "winit"),
+    "csharp": ("Application.Run", "MonoGame", "Microsoft.Xna",
+               "WebApplication.", "app.Run("),
+    "java": ("ServerSocket", "SpringApplication.run", "JFrame",
+             "Application.launch"),
+    "cpp": ("SDL_Init", "glfwInit", "glutMainLoop", "QApplication"),
+    "c": ("SDL_Init", "glfwInit", "glutMainLoop"),
+}
+
+#: Text that means the program was already in trouble when the clock ran out.
+#: Lowercased substring match against combined output.
+_CRASHED = ("traceback (most recent call last)", "segmentation fault",
+            "panic:", "fatal error", "unhandled exception",
+            "core dumped", "abort trap", "stack overflow",
+            "modulenotfounderror", "importerror", "syntaxerror")
+
+
+def has_main_loop(code: str, lang_id: str) -> bool:
+    """Is this a program designed not to exit?"""
+    markers = _MAIN_LOOP_MARKERS.get(lang_id, ())
+    return any(m in code for m in markers)
+
+
+def _still_running(phase: PhaseResult, code: str, lang_id: str) -> bool:
+    """Did a long-running program simply outlast the clock, healthily?
+
+    Requires the main-loop marker AND clean output. Either alone is not
+    enough: a script with no loop that hangs is a deadlock, and a game that
+    printed a traceback before hanging is a crash.
+    """
+    proc = phase.proc
+    if proc is None or not proc.timed_out:
+        return False
+    if not has_main_loop(code, lang_id):
+        return False
+    return not any(bad in proc.output.lower() for bad in _CRASHED)
 
 
 def _unreachable_workspace(phase: PhaseResult, cwd: str) -> str:
@@ -284,7 +387,8 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
         argv = langs.render(lang.build_cmd, build=tool, src=src,
                             out=out_path, dirpath=root, stem=stem)
         phases.append(_phase(ex, "build", argv, cwd=root,
-                             timeout=build_timeout or lang.build_timeout))
+                             timeout=Timeouts.resolve(build_timeout,
+                                                      lang.build_timeout)))
         if not phases[-1].ok:
             return finish(False)
 
@@ -297,8 +401,24 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
                         src=src, out=out_path, dirpath=root, stem=stem)
     # SQL is the odd one: statements are piped in rather than passed as a file.
     piped = code if lang_id == "sql" else stdin
+    patience = Timeouts.resolve(timeout, lang.run_timeout)
     phases.append(_phase(ex, "run", argv, cwd=root,
-                         timeout=timeout or lang.run_timeout, stdin=piped))
+                         timeout=patience, stdin=piped))
+
+    # A game that was still playing when the clock ran out passed. See
+    # `_still_running` for why this needs two signals, not one.
+    if _still_running(phases[-1], code, lang_id):
+        held = phases[-1].proc.duration_s or patience
+        phases[-1] = replace(
+            phases[-1], ok=True,
+            note=(f"still running after {held:.0f}s, which is what this "
+                  f"program is supposed to do."))
+        caveats.append(
+            f"{src_rel} started cleanly and was still running after "
+            f"{held:.0f}s, so it was stopped. That is the expected result for "
+            f"a program with a main loop and it is NOT a failure — but it "
+            f"also means only startup was verified. Nothing here checked that "
+            f"it behaves correctly once running; only a test can do that.")
 
     if lang_id == "gdscript":
         caveats.append("run headlessly; without a viewport, scene-tree, "
@@ -327,7 +447,7 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 
     caveats: list[str] = []
     argv: list[str] = []
-    test_timeout = timeout or lang.test_timeout
+    test_timeout = Timeouts.resolve(timeout, lang.test_timeout)
 
     if lang_id == "gdscript":
         tool = lang.which_run(ex)
@@ -405,22 +525,27 @@ def zero_tests(output: str) -> str:
 def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
            workdir: str = "", project_mode: bool = False,
            test_source: str = "", skip_guard: bool = False,
-           path: str = "") -> RunResult:
+           path: str = "", timeouts: Timeouts | None = None) -> RunResult:
     """The C4 definition of done: it builds AND the tests run (M4).
 
     This is the function the loop calls, and the one place where "done" is
     decided. It refuses to report success on a parse, and where a project
     genuinely has no tests it says so in `caveats` rather than counting the
     absence as a pass.
+
+    ``timeouts`` bounds the generated PROGRAM, never the model. `None` on any
+    field takes the language default; `0` waits indefinitely.
     """
+    clocks = timeouts or Timeouts()
     built = build_and_run(code, lang_id, fs=fs, ex=ex, stem=stem,
                           workdir=workdir, project_mode=project_mode,
-                          skip_guard=skip_guard, path=path)
+                          skip_guard=skip_guard, path=path,
+                          timeout=clocks.run, build_timeout=clocks.build)
     if not built.ok:
         return built
 
     tested = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
-                       test_source=test_source)
+                       test_source=test_source, timeout=clocks.test)
     if tested.blocked:
         # No test runner is not a pass and not a failure — it is a stated
         # weakness in the evidence. C4 requires saying so out loud.

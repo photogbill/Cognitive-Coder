@@ -54,7 +54,7 @@ EVENT_KINDS = ("phase", "token", "status", "diagnostic", "patch", "remote",
 JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "generate", "continuation", "guard", "prefix", "verify",
                   "autofix", "patch", "rollback", "codemap", "review",
-                  "budget", "cancel", "epoch", "error")
+                  "budget", "cancel", "epoch", "error", "skills")
 
 
 # --------------------------------------------------------------------------
@@ -423,6 +423,32 @@ class Plan:
                 return t
         return None
 
+    def blocked(self) -> list[tuple[Task, list[str]]]:
+        """Pending tasks that can never run, and what is blocking each.
+
+        A dependency that FAILED never becomes done, so a task waiting on it
+        waits forever — `next_ready` simply stops returning it and the run
+        ends. On a real build that produced "[build 6/6]" against a plan of
+        seven files, with `src/main.py` never mentioned again: it depended on
+        `src/render.py`, which had failed three attempts earlier.
+
+        Not running it is right — a program whose renderer does not build has
+        nothing to run. Saying nothing about it is not. An absence is the
+        hardest thing to notice in a wall of output, which is the same lesson
+        the installer taught, and the fix is the same: name it.
+        """
+        settled = {t.id for t in self.tasks if t.status == "done"}
+        by_id = {t.id: t for t in self.tasks}
+        out: list[tuple[Task, list[str]]] = []
+        for t in self.tasks:
+            if t.status != "pending":
+                continue
+            missing = [by_id[d].path for d in t.depends_on
+                       if d not in settled and d in by_id]
+            if missing:
+                out.append((t, missing))
+        return out
+
     def replace(self, task: Task) -> Plan:
         return Plan(request=self.request,
                     tasks=tuple(task if t.id == task.id else t
@@ -606,6 +632,39 @@ class TaskOutcome:
         if self.attempts and self.attempts[-1].diagnostics:
             last = f" Last real error: {self.attempts[-1].diagnostics[0].one_line()}"
         return f"{self.path}: {why}.{last}"
+
+
+@dataclass(frozen=True)
+class Timeouts:
+    """How long to wait on the PROGRAM being verified. Never on the model.
+
+    Bill: *"if there are any time limits on generation they should be
+    removed… I don't want to lose final result quality for speed reasons."*
+
+    Generation has no clock — see `providers.openai_compatible`. These three
+    are what remains, and they are a different thing entirely: they bound the
+    generated program while it builds, runs and tests. Without them a game
+    with a main loop would hang the build forever.
+
+    `None` means "use the language's default". `0` means **wait indefinitely**
+    — the operator's explicit choice, honoured all the way down to
+    `SubprocessExec.run`.
+    """
+
+    build: float | None = None
+    run: float | None = None
+    test: float | None = None
+
+    @staticmethod
+    def resolve(chosen: float | None, default: float) -> float:
+        """The value to actually use. 0 survives; None falls back.
+
+        Written out rather than left as `chosen or default`, because that
+        idiom silently turns a deliberate 0 — "no limit" — back into the
+        default. The bug it prevents is the one this whole change is about:
+        an operator setting a limit and getting a different one.
+        """
+        return default if chosen is None else float(chosen)
 
 
 def as_dict(obj: Any) -> dict:

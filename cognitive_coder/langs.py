@@ -73,9 +73,18 @@ class Lang:
     test_scaffold: str = ""        # a test file the loop can run
     stub_style: str = "raise"      # raise | todo | empty — how stubs are made
     cascades: bool = False         # one error produces many (F7)
-    build_timeout: float = 60.0
-    run_timeout: float = 15.0
-    test_timeout: float = 120.0
+    # HOW LONG TO WAIT ON THE PROGRAM — never on the model. These three are
+    # the only clocks left in a build, they apply to the code being verified,
+    # and `0` on any of them means wait indefinitely.
+    #
+    # The old numbers (60/15/120) were sized for a single scratch file. A real
+    # project compiles more, runs longer and has a test suite worth the name,
+    # and the run limit in particular was doing harm: 15s is shorter than the
+    # startup of many programs and infinitely shorter than a game, so it fired
+    # constantly and every firing was recorded as a failure.
+    build_timeout: float = 300.0
+    run_timeout: float = 60.0
+    test_timeout: float = 900.0
     notes: str = ""                # what an operator should know
     install_hint: str = ""
 
@@ -398,7 +407,7 @@ _add(Lang(
     test_cmd=["{run}", "--headless", "--fixed-fps", "60", "-s",
               "addons/gut/gut_cmdln.gd", "-gdir=res://test", "-gexit"],
     stub_style="todo",
-    build_timeout=30.0, run_timeout=60.0, test_timeout=120.0,
+    build_timeout=300.0, run_timeout=60.0, test_timeout=900.0,
     notes="Godot uses res:// paths; the patcher works in OS paths and "
           "translates at the boundary — res:// must never reach the "
           "FileSystemPort. Without a `godot` binary this degrades to "

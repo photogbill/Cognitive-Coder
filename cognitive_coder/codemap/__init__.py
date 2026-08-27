@@ -112,7 +112,8 @@ class CodeMap:
         """Index everything indexable. `.git/` is excluded (M27)."""
         skip = (".git/", "__pycache__/", "node_modules/", ".venv/", "venv/",
                 "target/", "build/", "dist/", ".cc_snapshots/",
-                ".atk_snapshots/", ".cc_journal/", ".python/", ".tools/")
+                ".atk_snapshots/", ".cc_journal/", ".ccoder/",
+                ".python/", ".tools/")
         n = 0
         try:
             paths = self.fs.list("*")

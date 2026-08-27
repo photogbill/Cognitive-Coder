@@ -75,6 +75,199 @@ def prompt_hash(messages: Sequence[Any] | str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+#: How much of one command's output the readable log keeps. Generous, because
+#: the thing that hid the zero-tests bug for four builds was two lines —
+#: "Ran 0 tests" and "OK" — and a stingy cap is how you lose exactly those.
+LOG_OUTPUT_CHARS = 4000
+
+
+class SessionLog:
+    """A plain-text record of the session, written as it happens.
+
+    Bill: *"Maybe we should implement a comprehensive logging setup for
+    cognitive coder, so that everything you possibly need to see to make it
+    better is automatically put in a text document that builds as it goes?"*
+
+    WHY THE JSONL WAS NOT ENOUGH, which is the whole argument for this.
+
+    The journal is a provenance record: what was produced, by which model,
+    from which prompt hash, and whether verification passed. It is exactly
+    right for "can this change be defended" and it is the wrong shape for
+    "why is this engine behaving like that".
+
+    The difference showed up in one line. For every file of every build the
+    journal recorded::
+
+        "verify": {"run": "ok", "test": "ok", "caveats": [...]}
+
+    A VERDICT. What it never recorded was the evidence behind the verdict —
+    the command that ran and what it printed. Had it kept that, the first
+    build ever run would have shown::
+
+        $ python -m unittest discover -s . -p test_*.py -v
+        Ran 0 tests in 0.000s
+        OK
+
+    and the bug that made four green builds meaningless would have been
+    obvious the same afternoon. Instead it survived until somebody read the
+    generated project by hand.
+
+    So this file keeps what a verdict throws away: **the command, and its
+    output, verbatim**. Plus prompts, timings, tokens, caveats and the tasks
+    that were never attempted.
+
+    Append-only, one file per session, and it never raises: a log that can
+    take a build down with it is worse than no log. It sits beside the JSONL
+    rather than replacing it — one is for defending a change, the other for
+    fixing the engine, and neither does the other's job well.
+    """
+
+    #: THE PROJECT ROOT, and a name a person would look for.
+    #:
+    #: Bill: *"have it automatically output to a file in the code project
+    #: folder? Then I can just give you that folder each time instead of lots
+    #: of copy and paste and screenshots."*
+    #:
+    #: It used to land in `.cc_journal/<session-id>.log` — inside a hidden
+    #: folder, under a name like `cc-20260808-134722-a23ed6`. Technically in
+    #: the project; practically invisible. A diagnostic nobody can find is a
+    #: diagnostic nobody uses, and the alternative was him screenshotting a
+    #: console.
+    #:
+    #: So: `BUILD_LOG.txt`, beside `BUILD_SPEC.md` and `Recommendation.md`.
+    #: Handing over the folder now hands over what was asked for, what
+    #: happened, what was produced and what the review said.
+    FILENAME = "BUILD_LOG.txt"
+
+    def __init__(self, fs: Any, session_id: str, *,
+                 directory: str = ".cc_journal",
+                 path: str = "") -> None:
+        self.fs = fs
+        self.session_id = session_id
+        #: `directory` is kept for callers that want it filed with the JSONL;
+        #: the default is the root, because that is where it gets read.
+        self.path = path or self.FILENAME
+        self._started = time.time()
+        self._opened = False
+
+    # -- writing ----------------------------------------------------------
+    def _append(self, text: str) -> None:
+        try:
+            prior = (self.fs.read_bytes(self.path)
+                     if self.fs.exists(self.path) else b"")
+            self.fs.write_bytes(self.path, prior + text.encode("utf-8"))
+        except Exception:                                # noqa: BLE001
+            pass          # a log must never be the thing that fails a build
+
+    def _stamp(self) -> str:
+        return f"[{time.time() - self._started:7.1f}s]"
+
+    def line(self, text: str = "") -> None:
+        self._append(f"{text}\n")
+
+    def rule(self, title: str = "") -> None:
+        self.line()
+        self.line(f"{'=' * 74}")
+        if title:
+            self.line(title)
+            self.line(f"{'=' * 74}")
+
+    def event(self, what: str, detail: str = "") -> None:
+        self.line(f"{self._stamp()} {what}" + (f" — {detail}" if detail else ""))
+
+    def block(self, title: str, body: str, limit: int = LOG_OUTPUT_CHARS
+              ) -> None:
+        """A titled chunk of verbatim text, indented and capped.
+
+        Truncation SAYS how much it dropped. A silently shortened log is the
+        same failure as a silently shortened prompt: the reader cannot tell
+        the difference between "nothing more" and "more, withheld".
+        """
+        body = (body or "").rstrip()
+        if not body:
+            return
+        cut = ""
+        if len(body) > limit:
+            cut = (f"\n    … {len(body) - limit:,} more characters not "
+                   f"logged")
+            body = body[:limit]
+        self.line(f"  {title}")
+        for row in body.splitlines():
+            self.line(f"    {row}")
+        if cut:
+            self.line(cut.strip("\n"))
+
+    # -- the shapes the engine actually produces --------------------------
+    def start(self, request: str, model: str, config: dict) -> None:
+        #: APPENDED, NOT REPLACED. Re-running a build in the same folder adds
+        #: a session rather than erasing the last one — and comparing this
+        #: run against the previous one is most of what the file is for.
+        #: Sessions are separated by a rule and stamped with an id, so a long
+        #: file is still navigable.
+        first = not self.fs.exists(self.path)
+        if first:
+            self.line("COGNITIVE CODER — BUILD LOG")
+            self.line()
+            self.line("Everything this engine did, in order, with the "
+                      "commands it ran and")
+            self.line("what they printed. Append-only: each build adds a "
+                      "session below.")
+            self.line()
+            self.line("Alongside this file:")
+            self.line("  BUILD_SPEC.md      what was asked for")
+            self.line("  Recommendation.md  the review of what was built")
+            self.line("  .cc_journal/*.jsonl  the machine-readable "
+                      "provenance record")
+            self.line("  .cc_snapshots/     every version of every file")
+        self.rule(f"SESSION {self.session_id}")
+        self.line(f"started   {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.line(f"model     {model or '(none reported)'}")
+        self.line(f"config    " + ", ".join(f"{k}={v}"
+                                            for k, v in sorted(config.items())))
+        self.block("request", request)
+        self._opened = True
+
+    def phases(self, task: str, attempt: int, result: Any) -> None:
+        """Every phase of one verification, with its command and output.
+
+        This is the method the whole file exists for.
+        """
+        self.line()
+        self.event(f"verify {task}", f"attempt {attempt}")
+        for phase in getattr(result, "phases", ()) or ():
+            argv = " ".join(getattr(phase, "argv", ()) or ())
+            ok = "ok" if getattr(phase, "ok", False) else "FAILED"
+            self.line(f"  [{getattr(phase, 'name', '?')}] {ok}"
+                      + (f"  ({phase.note})" if getattr(phase, "note", "")
+                         else ""))
+            if argv:
+                self.line(f"    $ {argv}")
+            self.block("output", getattr(phase, "output", ""))
+        for caveat in getattr(result, "caveats", ()) or ():
+            self.line(f"  CAVEAT: {caveat}")
+        for diag in (getattr(result, "diagnostics", ()) or ())[:10]:
+            self.line(f"  diagnostic: {diag}")
+
+    def generation(self, task: str, attempt: int, *, temperature: float,
+                   seed: Any, tokens_in: int, tokens_out: int,
+                   prompt_ms: int, decode_ms: int, text: str = "") -> None:
+        rate = (round(tokens_out / (decode_ms / 1000), 1)
+                if decode_ms > 0 and tokens_out else 0)
+        self.line()
+        self.event(f"generate {task}", f"attempt {attempt}")
+        self.line(f"  temperature={temperature} seed={seed} "
+                  f"in={tokens_in} out={tokens_out} "
+                  f"prefill={prompt_ms}ms decode={decode_ms}ms"
+                  + (f" ({rate} tok/s)" if rate else ""))
+        self.block("produced", text)
+
+    def close(self, summary: str) -> None:
+        self.rule("SUMMARY")
+        self.line(summary)
+        self.line(f"finished  {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"after {time.time() - self._started:.0f}s")
+
+
 class Journal:
     """Append-only JSONL through the FileSystemPort (C2).
 

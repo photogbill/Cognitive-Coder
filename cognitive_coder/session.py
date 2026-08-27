@@ -39,16 +39,17 @@ import uuid
 
 from . import journal as journal_mod
 from . import personas
+from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import BudgetExceeded, Cancelled, NoModelLoadedError
-from .journal import Journal
+from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
 from .patcher import Patcher
 from .planner import Planner, _looks_like_test
 from .ports import Cancel, Host
 from .providers import RemoteGate
 from .redact import Budget
-from .types import ModelCapabilities, Plan, Task, TaskOutcome
+from .types import ModelCapabilities, Plan, Task, TaskOutcome, Timeouts
 
 
 @dataclass
@@ -83,8 +84,19 @@ class SessionConfig:
     #: --spec flag exists to serve.
     max_files: int = 12
     conventions: str = ""
+    #: Deployed skills (F3). Discovered once, at Session construction, from
+    #: `skills_dir` — never re-read mid-session, because the prefix must not
+    #: change mid-session (M52). See `cognitive_coder/skills.py`.
+    use_skills: bool = True
+    skills_dir: str = skills_mod.SKILLS_DIR
     model_system_prompt: str = ""        # the model's OWN shipped prompt
     journal_dir: str = ".cc_journal"
+    #: HOW LONG TO WAIT ON THE GENERATED PROGRAM. Not on the model — nothing
+    #: in this config bounds generation, by design (see `Timeouts`). `None`
+    #: takes the language default; `0` waits indefinitely.
+    build_timeout: float | None = None
+    run_timeout: float | None = None
+    test_timeout: float | None = None
 
 
 class Session:
@@ -99,6 +111,10 @@ class Session:
 
         self.journal = Journal(host.fs, self.id, events=host.events,
                                directory=self.config.journal_dir)
+        #: The readable half. The JSONL defends a change; this explains a
+        #: behaviour — see SessionLog for the line that made the difference.
+        self.log = SessionLog(host.fs, self.id,
+                              directory=self.config.journal_dir)
         # One gate per session, never global and never persisted: a gate
         # that survives a restart is a gate that turns itself on while
         # nobody is looking (C3).
@@ -108,9 +124,20 @@ class Session:
         self.codemap = CodeMap(host.fs, host.storage, events=host.events)
         self.patcher = Patcher(host.fs, host.storage, host.approval,
                                host.events)
+        # Deployed skills join the config's conventions in the CACHED
+        # prefix. Discovery happens HERE, once — a skill edited mid-session
+        # takes effect next session, exactly like an epoch (skills.py).
+        self.skill_load = (
+            skills_mod.load_skills(host.fs, lang=self.config.lang,
+                                   directory=self.config.skills_dir,
+                                   events=host.events)
+            if self.config.use_skills else skills_mod.SkillLoad())
+        conventions = "\n\n".join(
+            part for part in (self.config.conventions,
+                              self.skill_load.block()) if part)
         self.prompts = personas.PromptBuilder(
             model_system_prompt=self.config.model_system_prompt,
-            conventions=self.config.conventions)
+            conventions=conventions)
         self.planner = Planner(host, codemap=self.codemap,
                                journal=self.journal, prompts=self.prompts,
                                lang=self.config.lang,
@@ -125,7 +152,13 @@ class Session:
                 max_tokens=self.config.max_tokens, seed=self.config.seed,
                 project_mode=self.config.project_mode,
                 use_tools=self.config.use_tools, autofix=self.config.autofix,
-                wall_clock_s=self.config.per_task_s))
+                wall_clock_s=self.config.per_task_s,
+                timeouts=Timeouts(build=self.config.build_timeout,
+                                  run=self.config.run_timeout,
+                                  test=self.config.test_timeout)))
+        #: The readable log is the Loop's too — it is where the verify
+        #: phases happen, and their output is the whole point of the file.
+        self.loop.log = self.log
 
         self.plan: Plan | None = None
         self.outcomes: list[TaskOutcome] = []
@@ -156,6 +189,20 @@ class Session:
                                  "temperature": self.config.temperature,
                                  "max_tokens": self.config.max_tokens,
                                  "lang": self.config.lang})
+        if self.skill_load.skills or self.skill_load.skipped:
+            # C8: which guidance shaped this session, at which revision —
+            # and equally which guidance did NOT load, so a session that
+            # ignored a rule can be told apart from one that never saw it.
+            self.journal.log("skills",
+                             active=self.skill_load.provenance(),
+                             skipped=[{"path": p, "reason": r}
+                                      for p, r in self.skill_load.skipped])
+        self.log.start(request, caps.name,
+                       {"attempts": self.config.attempts,
+                        "temperature": self.config.temperature,
+                        "max_tokens": self.config.max_tokens,
+                        "max_files": self.config.max_files,
+                        "lang": self.config.lang})
         self._git_warning()
 
         stats = self.codemap.index_project()
@@ -165,6 +212,11 @@ class Session:
         self.codemap.maybe_bump_epoch(operator_asked=True)
 
         self.plan = self.planner.plan(request, profile)
+        self.log.rule("PLAN")
+        for i, t in enumerate(self.plan.tasks, 1):
+            self.log.line(f"  {i}. {t.path}  — {t.purpose[:60]}")
+        for c in self.plan.caveats:
+            self.log.line(f"  CAVEAT: {c}")
         if self.config.skeleton_first:
             #: ORDER FIRST, THEN STUBS. This line is the whole fix for a
             #: deadlock that made ordering a no-op on every project: the
@@ -277,6 +329,11 @@ class Session:
         self.plan = self.plan.replace(
             task.with_status("done" if outcome.ok else "failed",
                              attempts=len(outcome.attempts)))
+        self.log.event(
+            f"{'DONE' if outcome.ok else 'FAILED'} {task.path}",
+            f"{len(outcome.attempts)} attempt(s)"
+            + (f" — {outcome.stopped_because}" if outcome.stopped_because
+               else ""))
         self.journal.log("verify", task=task.path,
                          verify={"ok": outcome.ok,
                                  "attempts": len(outcome.attempts),
@@ -304,6 +361,29 @@ class Session:
             while True:
                 outcome = self.step()
                 if outcome is None:
+                    #: NOTHING READY IS NOT THE SAME AS NOTHING LEFT.
+                    #:
+                    #: A task whose dependency failed can never become ready,
+                    #: so the loop ends and the file is simply never
+                    #: mentioned. On a real build that showed as "[build 6/6]"
+                    #: against a seven-file plan, with src/main.py absent from
+                    #: the log entirely — it was waiting on src/render.py,
+                    #: which had failed three attempts earlier.
+                    #:
+                    #: Not building it is correct. Not saying so is the same
+                    #: mistake the installer made: an absence nobody can see.
+                    for task, blockers in (self.plan.blocked()
+                                           if self.plan else []):
+                        self.host.emit(
+                            "warning",
+                            f"{task.path} was never attempted — it needs "
+                            f"{', '.join(blockers)}, which did not build",
+                            {"task": task.path, "blocked_by": blockers})
+                        self.journal.log("blocked", task=task.path,
+                                         blocked_by=blockers)
+                        self.log.event(f"SKIPPED {task.path}",
+                                       f"needs {', '.join(blockers)}, "
+                                       f"which did not build")
                     break
         except Cancelled as exc:
             self.journal.log("cancel", sentence=str(exc))

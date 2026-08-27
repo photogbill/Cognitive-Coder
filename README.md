@@ -168,6 +168,31 @@ example the model reported "reads fine to me" while the deterministic scanner
 found the AWS key it was sitting on. That is the whole argument for asking
 tools first, in one line of output.
 
+## Deployed skills
+
+Project guidance that travels with the code. `ccoder skills deploy` seeds
+`.ccoder/skills/` with three editable markdown files — house style, testing
+conventions, forbidden patterns — and every session loads whatever is there
+into the cached prompt prefix as project conventions. The idea is borrowed
+from deepseek-cowork's deployed skill templates; the reason it fits HERE is
+one that project never had: a small local model needs scaffolding, and
+guidance that lives beside the code is versioned, diffed and reviewed like
+the code, and present on the disconnected laptop where a settings screen
+is not.
+
+```
+ccoder skills deploy     # seed the starter pack (never overwrites)
+ccoder skills            # what a session would load, and what it skipped
+ccoder skills new NAME   # scaffold a new one
+ccoder build ... --no-skills   # opt out for one run
+```
+
+A skill may scope itself with `lang: python` in its header. Sorted filename
+order is priority order; an oversized skill is skipped by name, never
+truncated mid-rule. The journal records each active skill's content hash at
+session start, so a generated line is traceable to the exact revision of
+the guidance that shaped it.
+
 ## Languages
 
 Python, C, C++, Rust, Java, Go, C#, JavaScript, TypeScript, **GDScript**,

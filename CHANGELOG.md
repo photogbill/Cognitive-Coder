@@ -10,6 +10,29 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — deployed skills: guidance that travels with the code (F3)
+
+`.ccoder/skills/*.md` now loads into every session's cached prompt prefix
+as project conventions — the seat `SessionConfig.conventions` always
+reserved and nothing on disk fed. Borrowed from deepseek-cowork's deployed
+skill templates, and worth more here than there: a 7B-24B local model
+needs the scaffolding, and files beside the code are versioned, diffed
+and offline.
+
+- `cognitive_coder/skills.py` — zero-dep discovery and a hand-parsed
+  `---` header (`name`, `description`, `lang`). Sorted order is priority
+  order; loaded once at Session construction (M52 — the prefix must not
+  change mid-session); an oversized skill is **skipped by name, never
+  truncated**; `lang:` scoping filters before the budget is spent.
+- `ccoder skills list | deploy | new`, and `--no-skills` on `build`.
+  Deploy seeds three editable starters and never overwrites.
+- The journal gains a `skills` event: each active skill's path, name and
+  content hash at session start, plus what was skipped and why (C8).
+- Public API additions: `Skill`, `SkillLoad`, `load_skills`, `SKILLS_DIR`,
+  `STARTER_SKILLS`; `SessionConfig.use_skills` / `.skills_dir`;
+  `"skills"` in `JOURNAL_EVENTS`. All additive.
+
+
 ### Fixed — `prompt_ms` was measuring the wrong thing
 
 `Completion` and `JournalEvent` gain `decode_ms`, and `prompt_ms` now means

@@ -38,6 +38,7 @@ from .ports import (
 )
 from .providers import available_providers, detect, make_provider
 from .session import Session, SessionConfig
+from .skills import SKILLS_DIR, STARTER_SKILLS, load_skills
 from .version import IMPLEMENTED_PHASES, __version__
 
 # The toolchains the installer records and `doctor` re-probes. The record is
@@ -327,7 +328,8 @@ def build(args: argparse.Namespace) -> int:
         temperature=args.temperature, max_tokens=args.max_tokens,
         wall_clock_s=args.budget * 60 if args.budget else 0.0,
         max_files=args.max_files,
-        skeleton_first=not args.no_skeleton))
+        skeleton_first=not args.no_skeleton,
+        use_skills=not args.no_skills))
     if args.preview:
         try:
             _print_preview(session.preview(request))
@@ -395,6 +397,75 @@ def history(args: argparse.Namespace) -> int:
     return 0
 
 
+def skills_cmd(args) -> int:
+    """`ccoder skills list | deploy | new <name>` — deployed guidance (F3).
+
+    `deploy` NEVER overwrites: the starter files are a seed, and once a file
+    exists it belongs to the project, not to us. Re-running deploy after
+    editing must be safe or nobody will dare run it twice.
+    """
+    root = os.path.abspath(args.project or os.getcwd())
+    fs = LocalFileSystem(root)
+
+    if args.action == "deploy":
+        wrote, kept = [], []
+        for filename, content in STARTER_SKILLS.items():
+            path = f"{SKILLS_DIR}/{filename}"
+            if fs.exists(path):
+                kept.append(path)
+            else:
+                fs.write(path, content)
+                wrote.append(path)
+        for path in wrote:
+            print(f"  deployed  {path}")
+        for path in kept:
+            print(f"  kept      {path}  (already exists; not touched)")
+        if wrote:
+            print("\nEdit them — they are starting points, not rules we "
+                  "chose for you.\nThey load into every session's prompt "
+                  "from now on; `--no-skills` turns that off per run.")
+        return 0
+
+    if args.action == "new":
+        if not args.name:
+            print("A name is needed: `ccoder skills new api-conventions`",
+                  file=sys.stderr)
+            return 2
+        stem = "".join(c if c.isalnum() or c in "-_" else "-"
+                       for c in args.name.strip().lower()).strip("-")
+        path = f"{SKILLS_DIR}/{stem}.md"
+        if fs.exists(path):
+            print(f"{path} already exists; edit it instead.", file=sys.stderr)
+            return 2
+        fs.write(path, ("---\n"
+                        f"name: {stem}\n"
+                        "description: what this guidance covers, in a line\n"
+                        "---\n"
+                        "Write the rules here, one short paragraph each.\n"))
+        print(f"  created  {path}")
+        return 0
+
+    # list — show exactly what a session would load, and what it would not.
+    load = load_skills(fs, lang=args.lang)
+    if not load.skills and not load.skipped:
+        print(f"No skills deployed (nothing in {SKILLS_DIR}/).")
+        print("`ccoder skills deploy` writes an editable starter pack.")
+        return 0
+    if load.skills:
+        scope = f" for a {args.lang} session" if args.lang else ""
+        print(f"Active{scope}:")
+        for sk in load.skills:
+            langs_note = ", ".join(sk.langs) if sk.langs else "all languages"
+            desc = f"  — {sk.description}" if sk.description else ""
+            print(f"  {sk.name:<20} {sk.path}  [{langs_note}, "
+                  f"{len(sk.body)} chars, {sk.sha256[:12]}]{desc}")
+    if load.skipped:
+        print("Not loaded:")
+        for path, reason in load.skipped:
+            print(f"  {path}: {reason}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ccoder",
@@ -445,6 +516,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="skip the compiling-skeleton step (not advised)")
     b.add_argument("--dry-run", action="store_true",
                    help="refuse every write, to see what it would do")
+    b.add_argument("--no-skills", action="store_true",
+                   help="build without the deployed skills in "
+                        f"{SKILLS_DIR}/ (see `ccoder skills`)")
 
     r = sub.add_parser("resume", parents=[common],
                        help="resume a session, or list them")
@@ -452,6 +526,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sub.add_parser("history", parents=[common],
                    help="what has been changed in this project")
+
+    sk = sub.add_parser("skills", parents=[common],
+                        help="project guidance files that load into every "
+                             "session's prompt")
+    sk.add_argument("action", nargs="?", default="list",
+                    choices=("list", "deploy", "new"),
+                    help="list what would load; deploy the starter pack; "
+                         "new <name> scaffolds an empty skill")
+    sk.add_argument("name", nargs="?", default="",
+                    help="the new skill's name (for `new`)")
+    sk.add_argument("--lang", default="",
+                    help="list as a session in this language would see it")
 
     args = parser.parse_args(argv)
     if args.command == "doctor" or args.command is None:
@@ -462,6 +548,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return resume(args)
     if args.command == "history":
         return history(args)
+    if args.command == "skills":
+        return skills_cmd(args)
     parser.print_help()
     return 0
 
