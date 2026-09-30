@@ -10,6 +10,38 @@ is a major version.
 
 ## [Unreleased]
 
+### Changed — the prompt cache: two design decisions, measured
+
+A local model re-reads every prompt token its prefix cache cannot reuse,
+and the cache keeps only the longest run matching the previous prompt.
+Measured on a scripted build that extends a fifteen-module project, the
+reusable share of each prompt went from 37% to 69% — 46% less prompt
+processing, identical results.
+
+- **The persona goes last in the cached prefix**, after the conventions
+  and the architecture. It came first and it is the part that changes
+  most (planner, engineer, tester, repairer on every repair), so each
+  switch threw away the whole prompt: about 1% survived, measured.
+- **The architecture snapshot is no longer rebuilt after every file.**
+  `maybe_bump_epoch(target=<the file just written>)` always fired. What
+  the rebuild bought — the first attempt at a file seeing what was just
+  written — now comes from the tail: the staleness note carries each
+  changed file's CURRENT line in the summary's format. Rebuilds happen at
+  G.7.2's threshold (five changed files) or when the plan gains or loses
+  files. M31's forced every-write rebuild for tool-less models is met the
+  same way, since snapshot plus note never lags.
+- The review stage's prompt carries the architecture too, so it starts
+  from the build's cache instead of from nothing.
+- `Completion.prompt_processed` (new, defaulted): tokens the server really
+  processed (`timings.prompt_n`, or OpenAI's `cached_tokens`). The session
+  report now says "N% of prompt tokens came from the cache" when the
+  server reports it. `cache_health()` counts planned full reads — it used
+  to call a healthy run with a planned rebuild broken — and, without the
+  server's count, reads time per prompt token, so a cache broken on most
+  calls can no longer hide in the median.
+- `tests/test_prefix_stability.py` measures the reuse directly: each of
+  the new tests fails on the previous design.
+
 ### Added — `ccoder audit`: improve what already exists
 
 `ccoder audit FOLDER` reviews an existing project — one this engine built

@@ -155,6 +155,12 @@ class Completion:
     #: Optional and defaulted, so a provider that cannot separate them
     #: reports 0 and nothing downstream changes.
     decode_ms: int = 0
+    #: How many prompt tokens the server actually PROCESSED; the rest of
+    #: `tokens_in` came from its prefix cache. llama-server reports it as
+    #: `timings.prompt_n`, OpenAI as `usage.prompt_tokens_details.
+    #: cached_tokens`. 0 means not reported. It is the exact answer to "did
+    #: the cache hold?", where `prompt_ms` can only suggest one.
+    prompt_processed: int = 0
     #: When ``finish_reason == "error"``: one operator-facing sentence
     #: saying what went wrong — the HTTP status and the server's own
     #: (redacted, shortened) message where there was one. Added because the

@@ -486,6 +486,7 @@ class Journal:
             #: estimate — which is the difference between "the machine feels
             #: slow" and "11.2 tokens per second, and here is last week's".
             decode_ms=completion.decode_ms,
+            prompt_processed=getattr(completion, "prompt_processed", 0),
             verify=verify or {},
             finish_reason=completion.finish_reason, **extra)
 
@@ -563,12 +564,20 @@ class Journal:
                               for r in rows),
         }
 
-    def cache_health(self) -> str:
+    def cache_health(self, planned_rebuilds: int = 0) -> str:
         """One honest sentence about the prefix cache (G.7.5).
 
         A broken cache is silent and makes everything slowly worse, so the
-        only defence is looking at the number. A 10× spread between the median
-        and the maximum means the prefix changed when it should not have.
+        only defence is looking at the number. A prompt that takes ten times
+        the median to process was read from scratch.
+
+        SOME FULL READS ARE PLANNED, and are not a fault: one after each
+        snapshot of the architecture the engine takes. `planned_rebuilds` is
+        how many it took; the first is taken before any model call, so it
+        and the session's cold first call are the same read. The verdict used to fire on any single
+        slow read, which would have told a healthy run it was broken — the
+        kind of confident wrong diagnosis that stops anyone looking at the
+        real one.
         """
         s = self.stats()
         med, mx = s["prompt_ms_median"], s["prompt_ms_max"]
@@ -592,14 +601,57 @@ class Journal:
                     f"times and nothing can be concluded about the prefix "
                     f"cache from them.")
 
-        if mx > med * 10 and mx > 5000:
-            return (f"prompt processing spiked to {mx} ms against a median of "
-                    f"{med} ms — the cached prompt prefix was probably "
-                    f"invalidated. Something varying (a timestamp, an id, a "
-                    f"reordered block) may have got into the stable part of "
-                    f"the prompt.{speed}")
+        gens = [r for r in self.events() if r.get("event") == "generate"]
+        expected = max(1, int(planned_rebuilds))
+
+        # EXACT, when the server counted: tokens it processed against tokens
+        # sent. The rest came from its prefix cache.
+        exact = [(int(_num(r.get("tokens_in"))), int(_processed(r)))
+                 for r in gens
+                 if _processed(r) > 0 and _num(r.get("tokens_in")) > 0]
+        if exact:
+            total = sum(t for t, _p in exact)
+            read = sum(min(p, t) for t, p in exact)
+            share = 1 - read / total
+            full = sum(1 for t, p in exact if p >= 0.9 * t)
+            if full > expected:
+                return (f"only {share:.0%} of prompt tokens came from the "
+                        f"cache, and {full} prompts were processed almost "
+                        f"entirely from scratch — more than the {expected} "
+                        f"the engine planned. The cached prompt prefix was "
+                        f"invalidated when it should not have been.{speed}")
+            return (f"{share:.0%} of prompt tokens came from the cache "
+                    f"({total - read:,} of {total:,}), with {full} planned "
+                    f"full read{'s' * (full != 1)} — the prefix cache is "
+                    f"working.{speed}")
+
+        # WITHOUT THE SERVER'S COUNT: time per prompt token. A median of
+        # raw times cannot do this — when most prompts are read from
+        # scratch, the median IS a from-scratch time, and nothing looks
+        # unusual. A prompt read from scratch has the slowest rate per
+        # token; a cached one is faster in proportion to what was cached.
+        rows = [(int(_num(r.get("prompt_ms"))), int(_num(r.get("tokens_in"))))
+                for r in gens
+                if _num(r.get("prompt_ms")) > 0
+                and _num(r.get("tokens_in")) > 0]
+        if len(rows) < 3:
+            return (f"prompt processing: median {med} ms, worst {mx} ms — "
+                    f"too few calls to judge the prefix cache.{speed}")
+        per = [ms / tokens for ms, tokens in rows]
+        slowest = max(per)
+        full = [ms for (ms, _t), rate_ in zip(rows, per, strict=True)
+                if rate_ >= 0.8 * slowest and ms > 2000]
+        if len(full) > expected:
+            return (f"{len(full)} prompts were processed from scratch (up to "
+                    f"{max(full)} ms), more than the {expected} the engine "
+                    f"planned — the cached prompt prefix was invalidated "
+                    f"when it should not have been. Something varying (a "
+                    f"timestamp, an id, a reordered block) may have got "
+                    f"into the stable part of the prompt.{speed}")
+        planned = (f", with {len(full)} planned full read"
+                   f"{'s' * (len(full) != 1)}" if full else "")
         return (f"prompt processing is steady: median {med} ms, worst "
-                f"{mx} ms — the prefix cache looks healthy.{speed}")
+                f"{mx} ms{planned} — the prefix cache looks healthy.{speed}")
 
     def summary(self) -> str:
         """The closing line of a session, in the shape of Appendix E."""
@@ -624,6 +676,12 @@ class Journal:
 # ---------------------------------------------------------------------------
 # reading journals that this process did not write (resume, §6.13)
 # ---------------------------------------------------------------------------
+
+def _processed(row: dict) -> float:
+    """`prompt_processed` from a journal row, top level or under `data`."""
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    return _num(row.get("prompt_processed") or data.get("prompt_processed"))
+
 
 def read_jsonl(fs: Any, path: str) -> Iterable[dict]:
     """Every parseable line. A corrupt tail does not lose the whole file.

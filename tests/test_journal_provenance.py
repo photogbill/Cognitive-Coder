@@ -105,3 +105,52 @@ def test_prompt_hash_is_unchanged_for_plain_messages():
     assert J.prompt_hash(msgs) == hashlib.sha256(
         b"system:s\nuser:u").hexdigest()
     assert J.prompt_hash("raw") == hashlib.sha256(b"raw").hexdigest()
+
+
+def _timed(fs, times, decode=500, tokens_in=4000):
+    journal = J.Journal(fs, "s")
+    for ms in times:
+        journal.log("generate", task="a.py", attempt=1, prompt_ms=ms,
+                    decode_ms=decode, tokens_out=100, tokens_in=tokens_in)
+    return journal
+
+
+def test_planned_full_reads_are_not_reported_as_a_broken_cache():
+    """The first call and one per planned snapshot read the whole prompt.
+    The verdict fired on any single slow read, so a healthy run with a
+    planned rebuild was told its cache had been invalidated."""
+    fs = MemoryFileSystem()
+    journal = _timed(fs, [9000, 300, 280, 8800, 310, 290, 300])
+    verdict = journal.cache_health(planned_rebuilds=2)
+    assert "looks healthy" in verdict and "2 planned full reads" in verdict
+
+
+def test_more_full_reads_than_planned_is_still_caught():
+    fs = MemoryFileSystem()
+    journal = _timed(fs, [9000, 300, 8700, 280, 8800, 310, 9100])
+    verdict = journal.cache_health(planned_rebuilds=1)
+    assert "invalidated" in verdict and "4 prompts" in verdict
+
+
+def test_a_cache_broken_on_most_calls_is_not_called_steady():
+    """With a median of raw times, a cache that failed on most calls made
+    the median itself a from-scratch time, and the verdict said steady."""
+    fs = MemoryFileSystem()
+    journal = _timed(fs, [9000, 8800, 9100, 8700, 300, 8900, 9050])
+    assert "invalidated" in journal.cache_health(planned_rebuilds=2)
+
+
+def test_the_servers_own_count_gives_an_exact_verdict():
+    from cognitive_coder.types import Completion
+    fs = MemoryFileSystem()
+    journal = J.Journal(fs, "s")
+    for processed in (4000, 400, 350, 420, 380):
+        journal.generation(
+            task="a.py", attempt=1, provider="p", prompt="x",
+            temperature=0.1,
+            completion=Completion(text="x", tokens_in=4000, tokens_out=100,
+                                  prompt_ms=300, decode_ms=900,
+                                  prompt_processed=processed))
+    verdict = journal.cache_health(planned_rebuilds=1)
+    assert "72% of prompt tokens came from the cache" in verdict
+    assert "working" in verdict

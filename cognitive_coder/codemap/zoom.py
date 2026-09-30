@@ -47,6 +47,7 @@ journal (M55).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from ..types import CodemapStats
@@ -74,13 +75,7 @@ def architecture_prefix(store: Any, *, target: str = "",
     lines = ["# PROJECT ARCHITECTURE (low resolution — names and paths only)"]
     shown = sorted(files, key=lambda f: f["path"])[:max_files]
     for row in shown:
-        syms = store.symbols_in(row["path"])
-        heads = [s["name"] for s in syms
-                 if s["kind"] in ("class", "struct", "trait", "interface")]
-        funcs = [s["name"] for s in syms if s["kind"] == "function"]
-        summary = ", ".join(heads[:4] + funcs[:4]) or "(no symbols indexed)"
-        approx = " ~approx" if row.get("approximate") else ""
-        lines.append(f"  {row['path']}{approx}: {summary}")
+        lines.append(_arch_line(store, row))
     if len(files) > len(shown):
         lines.append(f"  … and {len(files) - len(shown)} more files not "
                      f"listed here. Use search_codemap to look any of them "
@@ -88,16 +83,39 @@ def architecture_prefix(store: Any, *, target: str = "",
     return "\n".join(lines)
 
 
+def _arch_line(store: Any, row: dict) -> str:
+    """One file's line in the architecture summary — and in its delta."""
+    syms = store.symbols_in(row["path"])
+    heads = [s["name"] for s in syms
+             if s["kind"] in ("class", "struct", "trait", "interface")]
+    funcs = [s["name"] for s in syms if s["kind"] == "function"]
+    summary = ", ".join(heads[:4] + funcs[:4]) or "(no symbols indexed)"
+    approx = " ~approx" if row.get("approximate") else ""
+    return f"  {row['path']}{approx}: {summary}"
+
+
 def dependency_interfaces(store: Any, target: str, *,
                           budget_tokens: int = 1200,
-                          count_tokens=None) -> str:
+                          count_tokens=None,
+                          planned: Sequence[str] = ()) -> str:
     """HIGH-RESOLUTION interfaces for what `target` depends on. VOLATILE TAIL.
 
     F9, and on the target machine the highest-value item in that appendix.
     The model cannot hallucinate around a signature it has been handed
     verbatim (D4), and the cost of handing it over is small and predictable.
     """
+    # `planned` is what the PLAN says the target depends on. It has to be
+    # here: the call graph starts from calls the target already makes, and
+    # a fresh stub makes none — so the first attempt at every file used to
+    # get no interfaces at all, and only saw a dependency's real signatures
+    # if the architecture block had been rebuilt after that dependency was
+    # written. That rebuild after every file is what threw away the cached
+    # prefix once per file; this is what makes it unnecessary.
     deps = _direct_dependencies(store, target)
+    known = {row["path"] for row in store.files()}
+    for path in planned:
+        if path != target and path in known and path not in deps:
+            deps.append(path)
     if not deps:
         return ""
     lines = [""]                         # the header, chosen below
@@ -194,23 +212,41 @@ def similar_examples(store: Any, target: str, *, limit: int = 2) -> str:
     return "\n".join(lines)
 
 
-def staleness_note(store: Any) -> str:
-    """The lag declaration. **Goes in the TAIL, never the prefix** (G.7.3).
+def staleness_note(store: Any, *, can_look_up: bool = True) -> str:
+    """What changed since the snapshot, as CURRENT lines. The TAIL (G.7.3).
 
     A note in the prefix would change the prefix bytes and invalidate the
     very cache it describes. The tail is reprocessed anyway, so putting it
     there is free.
+
+    THE DELTA, NOT JUST THE NAMES. This used to name the changed files and
+    tell the model to look them up — so the only way a first attempt saw the
+    functions of a module written a minute earlier was a rebuilt snapshot,
+    and the session rebuilt it after every file: the whole cached prefix
+    thrown away once per file. Carrying each changed file's current line
+    here, in the same format as the summary, gives the model the whole
+    current picture — snapshot above, changes here — and lets the snapshot
+    stand until enough has changed to be worth rebuilding (G.7.2's
+    threshold). It is also what M31 asks for a model with no tools: a
+    summary it cannot check must not lag, and this one does not.
     """
     changed = store.changed_since_epoch()
     epoch = store.epoch
     if not changed:
-        return (f"Architecture snapshot: epoch {epoch}, up to date.")
-    listed = ", ".join(f"`{p}`" for p in changed[:6])
-    more = "" if len(changed) <= 6 else f" and {len(changed) - 6} more"
-    return (f"Architecture snapshot: epoch {epoch}. "
-            f"{len(changed)} file(s) have changed since it was taken "
-            f"({listed}{more}). For anything you are about to touch, call "
-            f"search_codemap rather than trusting the summary above.")
+        return f"Architecture snapshot: epoch {epoch}, up to date."
+    rows = {r["path"]: r for r in store.files()}
+    current = [_arch_line(store, rows[p]) for p in changed[:12] if p in rows]
+    gone = [p for p in changed if p not in rows]
+    more = len(changed) - 12
+    lines = [f"# CHANGED SINCE THE ARCHITECTURE SUMMARY (epoch {epoch}) — "
+             f"these lines are current and replace the summary's"]
+    lines += current
+    lines += [f"  {p}: (removed)" for p in gone[:6]]
+    if more > 0:
+        lines.append(f"  … and {more} more changed file(s)"
+                     + (". Use search_codemap for them." if can_look_up
+                        else "."))
+    return "\n".join(lines)
 
 
 def should_bump_epoch(store: Any, *, target: str = "",

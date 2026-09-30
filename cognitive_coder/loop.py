@@ -507,7 +507,8 @@ class Loop:
         if self.codemap is not None:
             arch = self.codemap.prefix_block(task.path)
             blocks = self.codemap.tail_blocks(
-                task.path, count_tokens=self.host.llm.count_tokens)
+                task.path, count_tokens=self.host.llm.count_tokens,
+                planned=task.depends_on)
             for b in blocks:
                 if b.startswith("# INTERFACES"):
                     interfaces = b

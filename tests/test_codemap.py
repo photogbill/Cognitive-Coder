@@ -226,13 +226,16 @@ def test_the_query_interface_is_never_stale(codemap):
     assert not codemap.search("summarise")
 
 
-def test_the_injected_summary_may_lag_but_declares_that_it_does(codemap):
+def test_the_summary_may_lag_but_the_tail_carries_what_changed(codemap):
+    """The snapshot stands between epochs; the note carries each changed
+    file's CURRENT line in the summary's own format, so snapshot plus note
+    is the present state. It used to name the file and say "look it up"."""
     codemap.store.bump_epoch("test")
     codemap.fs.write("src/cli.py", "def main():\n    return 1\n")
     codemap.reindex_after_write("src/cli.py")
     note = zoom.staleness_note(codemap.store)
-    assert "changed since" in note
-    assert "search_codemap" in note
+    assert "changed since" in note.lower()
+    assert "src/cli.py: main" in note
 
 
 # --------------------------------------------------------------------------
@@ -284,21 +287,23 @@ def test_an_interface_is_far_cheaper_than_the_file(codemap):
     assert "return []" not in surface, "a body leaked into the interface"
 
 
-def test_a_tool_less_model_forces_an_epoch_on_every_write(codemap):
-    """M31 — the injected summary may lag ONLY because the model can check.
-
-    With no live tools there is no safety net, so the summary is not allowed
-    to lag at all. G.7's closing paragraph says so explicitly, and notes that
-    the slower prompts are the accepted cost.
-    """
+def test_a_tool_less_model_never_sees_a_lagging_summary(codemap):
+    """M31 — a model that cannot look anything up must not be shown a
+    summary that lags. That used to be met by rebuilding the snapshot on
+    every write, discarding the cached prefix per file. It is now met by
+    the tail: the file just written appears there with its current
+    functions, with no rebuild and no "use search_codemap" to a model
+    that cannot."""
     codemap.force_epoch_per_write = True
     codemap.store.bump_epoch("start")
     before = codemap.store.epoch
 
     codemap.fs.write("src/cli.py", "def main():\n    return 1\n")
     codemap.reindex_after_write("src/cli.py")
-    assert codemap.maybe_bump_epoch(target="src/cli.py") > before, (
-        "a tool-less host must rebuild the summary on every write")
+    assert codemap.maybe_bump_epoch() == before, "no rebuild per write"
+    tail = "\n".join(codemap.tail_blocks("src/other.py"))
+    assert "src/cli.py: main" in tail
+    assert "search_codemap" not in tail
 
 
 def test_a_tool_using_model_is_allowed_to_lag(codemap):

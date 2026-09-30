@@ -116,10 +116,10 @@ def test_the_staleness_note_is_in_the_TAIL_and_never_the_prefix():
     cm.store.bump_epoch("test")
     cm.store.note_change("src/stats.py")
     note = zoom.staleness_note(cm.store)
-    assert "changed since" in note
+    assert "changed since" in note.lower()
 
     prefix = cm.prefix_block("src/stats.py")
-    assert "changed since" not in prefix
+    assert "changed since" not in prefix.lower()
     assert note not in prefix
     assert note in cm.tail_blocks("src/stats.py")
 
@@ -226,3 +226,148 @@ def test_the_first_file_sees_the_skeleton_in_the_cached_prefix(tmp_path):
     assert (tmp_path / "src" / "beta.py").exists(), "no skeleton written"
     prefix = session.codemap.prefix_block()
     assert "src/beta.py" in prefix, prefix
+
+
+# --------------------------------------------------------------------------
+# what a prefix cache can actually reuse (the two design decisions, 09-30)
+# --------------------------------------------------------------------------
+#
+# llama-server and llama-cpp-python keep the previous prompt's KV and reuse
+# the longest run of tokens matching the next prompt. These tests measure
+# that run directly, on the prompts the engine sends.
+
+def _rendered(messages) -> str:
+    return "".join(f"<|{m.role}|>{m.content}" for m in messages)
+
+
+def _common(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def test_a_persona_switch_keeps_the_conventions_and_architecture_cached():
+    """The persona came FIRST in the prefix, so the switch to the repairer
+    on every repair — and back to the engineer for the next file — threw
+    away the whole cached prompt: about 1% survived, measured."""
+    builder = PromptBuilder(conventions="Use type hints everywhere. " * 40)
+    architecture = _codemap().prefix_block()
+    engineer = builder.build(personas.PERSONAS["engineer"], "write a.py",
+                             architecture=architecture).messages()
+    repairer = builder.build(personas.PERSONAS["repairer"], "fix a.py",
+                             architecture=architecture).messages()
+    a, b = _rendered(engineer), _rendered(repairer)
+    shared = a[:_common(a, b)]
+    assert "Use type hints everywhere." in shared
+    assert architecture in shared, "the architecture was not reused"
+
+
+class _Model:
+    """Answers by what it is asked for; records every prompt."""
+
+    FILES = {
+        "src/vec.py": "def add(a, b):\n    return (a[0] + b[0], a[1] + b[1])\n",
+        "src/physics.py": "from src.vec import add\n\n\n"
+                          "def step(p, v):\n    return add(p, v)\n",
+        "src/world.py": "from src.physics import step\n\n\n"
+                        "def tick(p):\n    return step(p, (0, 1))\n",
+    }
+
+    def __init__(self):
+        self.prompts = []
+
+    def capabilities(self):
+        from cognitive_coder.types import ModelCapabilities
+        return ModelCapabilities(name="fake", family="mistral",
+                                 context_tokens=32768, supports_tools=True)
+
+    def count_tokens(self, text):
+        return max(1, len(text or "") // 4)
+
+    def stream(self, messages, **kw):
+        yield self.complete(messages, **kw).text
+
+    def complete(self, messages, **kw):
+        from cognitive_coder.types import Completion
+        self.prompts.append(list(messages))
+        last = messages[-1].content
+        if "security" in last and "performance" in last:
+            return Completion(text='{"security": [], "performance": [], '
+                                   '"overall": "fine"}')
+        m = re.search(r"`(src/\w+\.py)`", last)
+        if not m:
+            return Completion(text="src/vec.py — vector maths\n"
+                                   "src/physics.py — uses vec\n"
+                                   "src/world.py — uses physics\n")
+        body = self.FILES.get(m.group(1), "X = 1\n")
+        return Completion(text=f"```python\n{body}```")
+
+
+def _session(tmp_path):
+    from cognitive_coder import (
+        AutoApprove,
+        Host,
+        LocalFileSystem,
+        RecordingEvents,
+        Session,
+        SessionConfig,
+        SubprocessExec,
+    )
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "__init__.py").write_text("")
+    for i in range(10):
+        (lib / f"part{i}.py").write_text("".join(
+            f"def {n}_{i}(value):\n    return value\n\n\n"
+            for n in ("load", "parse", "clamp", "blend", "report")))
+    model = _Model()
+    host = Host(llm=model, fs=LocalFileSystem(str(tmp_path)),
+                exec=SubprocessExec(),
+                storage=MemoryStorage(str(tmp_path / ".cc_state")),
+                events=RecordingEvents(), approval=AutoApprove())
+    session = Session(host, config=SessionConfig(attempts=2))
+    session.run("a small physics package in src")
+    return session, model
+
+
+def test_the_snapshot_is_not_rebuilt_after_every_file(tmp_path):
+    """It was: `maybe_bump_epoch(target=<the file just written>)` always
+    fired, so every task began by re-reading the whole cached prefix."""
+    session, _model = _session(tmp_path)
+    rebuilt = [r for r in session.journal.events()
+               if r.get("event") == "epoch"]
+    epochs = session.codemap.store.epoch
+    # One for the session start and one after the skeleton; three files
+    # is under G.7.2's threshold, so nothing after that.
+    assert epochs <= 2, (epochs, rebuilt)
+
+
+def test_the_first_attempt_still_sees_what_was_already_written(tmp_path):
+    """Why the rebuild existed: without it the snapshot shows the skeleton,
+    and a fresh stub has no calls for the interfaces block to follow. The
+    tail now carries each changed file's CURRENT line instead."""
+    _session_, model = _session(tmp_path)
+    first_world = next(p for p in model.prompts
+                       if "`src/world.py`" in p[-1].content)
+    tail = first_world[-1].content
+    assert "src/physics.py: step" in tail, tail[-1500:]
+
+
+def test_a_build_reuses_most_of_each_prompt(tmp_path):
+    """The number both decisions were made on. On this small build 29% of
+    the prompt text was reusable before and 45% after (the rest is each
+    file's own tail, which no ordering can share); on a realistic project —
+    fifteen library modules and a skill file — it was 37% before and 67%
+    after, 46% less prompt processing. The floor sits between the two
+    small-build numbers."""
+    _session_, model = _session(tmp_path)
+    total = reused = 0
+    previous = ""
+    for prompt in model.prompts:
+        text = _rendered(prompt)
+        reused += _common(previous, text)
+        total += len(text)
+        previous = text
+    assert reused / total >= 0.40, f"{reused / total:.0%} reused"

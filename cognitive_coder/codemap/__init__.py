@@ -37,7 +37,7 @@ which is where that bargain is explained and enforced.
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import re
 import sqlite3
 from typing import Any
@@ -112,14 +112,15 @@ class CodeMap:
         self._events = events
         self.store = Store(storage.sqlite_path("codemap"))
         self.use_treesitter = use_treesitter
-        # M31 / G.7's honest cost. The injected architecture summary is
-        # allowed to lag by an epoch ONLY because the model can always call
-        # `search_codemap` and get the live answer. A host whose model has no
-        # tool calling has no such safety net, so on that path the summary is
-        # not allowed to lag: the epoch is rebuilt on every write, and the
-        # slower prompts are accepted. Set from `capabilities().supports_
-        # tools` by the Session — noted here so nobody removes the tools and
-        # quietly breaks the guarantee.
+        # M31: a model with no tool calling cannot check a lagging summary,
+        # so what it is shown must not lag. That used to be met by rebuilding
+        # the snapshot on every write — the cached prefix discarded per
+        # file. It is now met by the tail: the staleness note carries every
+        # changed file's CURRENT line (zoom.staleness_note), so snapshot plus
+        # note is always the present state, for every model, at no cache
+        # cost. The flag remains (Session sets it from `supports_tools`) and
+        # now only changes the note's wording: no "use search_codemap" to a
+        # model that cannot.
         self.force_epoch_per_write = force_epoch_per_write
         self._text_lookups = 0
         self._syntax_corrected = False
@@ -365,25 +366,20 @@ class CodeMap:
             return snapshot
         return zoom.architecture_prefix(self.store, target=target)
 
-    def tail_blocks(self, target: str, *, count_tokens=None) -> list[str]:
+    def tail_blocks(self, target: str, *, count_tokens=None,
+                    planned: Sequence[str] = ()) -> list[str]:
         """The volatile tail: interfaces, examples, staleness (G.7.1)."""
         return [b for b in (
             zoom.dependency_interfaces(self.store, target,
-                                       count_tokens=count_tokens),
+                                       count_tokens=count_tokens,
+                                       planned=planned),
             zoom.similar_examples(self.store, target),
-            zoom.staleness_note(self.store)) if b]
+            zoom.staleness_note(
+                self.store,
+                can_look_up=not self.force_epoch_per_write)) if b]
 
     def maybe_bump_epoch(self, **why: Any) -> int:
         bump, reason = zoom.should_bump_epoch(self.store, **why)
-        if not bump and self.force_epoch_per_write \
-                and self.store.changed_since_epoch():
-            # The text-marker fallback path (M31, G.7's closing paragraph):
-            # with no live tools the summary has no safety net, so it is not
-            # allowed to lag at all.
-            bump = True
-            reason = ("this model has no tool calling, so the architecture "
-                      "summary is rebuilt on every write rather than being "
-                      "allowed to lag")
         if not bump:
             return self.store.epoch
         n = self.store.bump_epoch(reason)

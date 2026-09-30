@@ -408,11 +408,23 @@ class Session:
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
 
-        # A replan is an epoch boundary (G.7.2), and re-planning after each
-        # file is what stops a plan being wrong by file five (§6.8).
+        # Re-planning after each file is what stops a plan being wrong by
+        # file five (§6.8). A REVISED plan — files added or dropped — is an
+        # epoch boundary (G.7.2); a plan whose statuses or order moved is
+        # not, because the architecture summary lists neither.
+        #
+        # This used to be `maybe_bump_epoch(target=task.path)`: the file just
+        # written had of course changed since the snapshot, so the snapshot
+        # was rebuilt after EVERY file and the model re-read its whole
+        # cached prefix at the start of every task. The target rule is for
+        # the file about to be worked on, and the tail now carries every
+        # changed file's current line, so no per-file rebuild is needed; the
+        # G.7.2 threshold still rebuilds once enough has changed.
+        before = {t.path for t in self.plan.tasks}
         self.plan = self.planner.replan(self.plan,
                                         reason=f"after {task.path}")
-        self.codemap.maybe_bump_epoch(target=task.path)
+        self.codemap.maybe_bump_epoch(
+            replanned={t.path for t in self.plan.tasks} != before)
         return outcome
 
     def _repair_step(self) -> TaskOutcome:
@@ -612,6 +624,10 @@ class Session:
             return ""
 
         merged = review_mod.ReviewResult()
+        try:
+            architecture = self.codemap.prefix_block()
+        except Exception:                                # noqa: BLE001
+            architecture = ""
         for outcome in done:
             self._check_cancel()
             try:
@@ -631,7 +647,7 @@ class Session:
                 fs=self.host.fs, ex=self.host.exec,
                 llm=self.host.llm if use_model else None,
                 prompts=self.prompts, test_source=test_source,
-                use_model=use_model)
+                use_model=use_model, architecture=architecture)
             merged.findings.extend(one.findings)
             merged.notes.extend(one.notes)
             merged.model_reviewed |= one.model_reviewed
@@ -941,7 +957,10 @@ class Session:
                          f"tested: {', '.join(untested)}")
         lines.append(f"[codemap]   {self.codemap.stats().one_line()}")
         lines.append(f"[journal]   {self.journal.summary()}")
-        lines.append(f"            {self.journal.cache_health()}")
+        # Every snapshot after the first is a planned full read of the
+        # prompt; the first call of the session is counted inside.
+        lines.append(f"            "
+                     f"{self.journal.cache_health(self.codemap.store.epoch)}")
         return "\n".join(lines)
 
     def history(self) -> list:

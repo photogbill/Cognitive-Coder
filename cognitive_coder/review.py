@@ -580,7 +580,8 @@ ws     ::= [ \t\n]*
 def model_review(code: str, path: str, *, llm: Any, prompts: PromptBuilder,
                  deterministic: Sequence[Finding] = (),
                  lang_id: str = "python",
-                 temperature: float = 0.35) -> tuple[list[Finding], str, bool]:
+                 temperature: float = 0.35,
+                 architecture: str = "") -> tuple[list[Finding], str, bool]:
     """One call, both perspectives, schema'd. Returns (findings, overall, ok).
 
     The model is told what the scanners ALREADY found and asked not to repeat
@@ -611,8 +612,11 @@ def model_review(code: str, path: str, *, llm: Any, prompts: PromptBuilder,
         _numbered(code),
     ])
 
+    # `architecture`: the same cached prefix the build used, so the review
+    # starts where the build's cache left off instead of from nothing —
+    # and the reviewer knows what else is in the project.
     prompt = prompts.build(
-        PERSONAS["reviewer"], task,
+        PERSONAS["reviewer"], task, architecture=architecture,
         contract=("OUTPUT CONTRACT\nReturn one JSON object in exactly this "
                   f"shape and nothing else:\n{REVIEW_SCHEMA}\n"
                   "Use an empty list where you have nothing to report. An "
@@ -733,7 +737,8 @@ def _numbered(code: str, limit: int = REVIEW_WINDOW) -> str:
 def review(code: str, path: str, *, lang_id: str = "python",
            fs: Any = None, ex: Any = None, llm: Any = None,
            prompts: PromptBuilder | None = None, test_source: str = "",
-           use_model: bool = True, workdir: str = "") -> ReviewResult:
+           use_model: bool = True, workdir: str = "",
+           architecture: str = "") -> ReviewResult:
     """Deterministic → scanners → one model pass. In that order (§6.10)."""
     result = ReviewResult()
 
@@ -764,7 +769,8 @@ def review(code: str, path: str, *, lang_id: str = "python",
         result.model_name = caps.name
         model_findings, overall, ok = model_review(
             code, path, llm=llm, prompts=prompts or PromptBuilder(),
-            deterministic=list(result.findings), lang_id=lang_id)
+            deterministic=list(result.findings), lang_id=lang_id,
+            architecture=architecture)
         result.model_reviewed = ok
         if ok:
             result.findings.extend(model_findings)

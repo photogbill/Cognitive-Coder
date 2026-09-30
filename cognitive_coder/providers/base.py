@@ -480,7 +480,25 @@ class StreamAccumulator:
             finish_reason=finish,
             tokens_in=_as_int(self.usage.get("prompt_tokens")),
             tokens_out=_as_int(self.usage.get("completion_tokens")),
-            model=self.model, prompt_ms=prompt_ms, decode_ms=decode_ms)
+            model=self.model, prompt_ms=prompt_ms, decode_ms=decode_ms,
+            prompt_processed=processed_tokens(self.timings, self.usage))
+
+
+def processed_tokens(timings: dict, usage: dict) -> int:
+    """Prompt tokens the server processed rather than served from cache.
+
+    llama-server says so directly (`timings.prompt_n`); an OpenAI-shaped
+    server says how many were CACHED, and the rest were processed. 0 when
+    neither is reported — which `Journal.cache_health` reads as "unknown".
+    """
+    n = _as_int((timings or {}).get("prompt_n"))
+    if n > 0:
+        return n
+    details = (usage or {}).get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        total = _as_int((usage or {}).get("prompt_tokens"))
+        return max(1, total - _as_int(details.get("cached_tokens")))
+    return 0
 
 
 def map_finish(reason: str, has_calls: bool) -> str:

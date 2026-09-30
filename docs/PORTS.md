@@ -72,6 +72,11 @@ def count_tokens(self, text: str) -> int
 8. `Completion.prompt_ms` — prompt-processing time — where you can measure
    it. It is the only signal that the prompt prefix cache broke, and a broken
    cache is otherwise completely silent: everything just gets slower.
+9. `Completion.prompt_processed` — how many prompt tokens your server
+   actually processed, where it says (llama-server's `timings.prompt_n`,
+   OpenAI's `cached_tokens`). Optional; 0 means "not reported". When
+   present, the session report states exactly what share of each prompt
+   came from the cache instead of inferring it from timings.
 
 ---
 

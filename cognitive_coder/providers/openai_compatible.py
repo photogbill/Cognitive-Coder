@@ -53,6 +53,7 @@ from .base import (
     map_finish,
     messages_to_openai,
     parse_tool_calls,
+    processed_tokens,
     sse_data,
     supports_fim,
 )
@@ -519,7 +520,8 @@ class OpenAICompatible(ProviderBase):
             tokens_out=_as_int(usage.get("completion_tokens")),
             model=str(data.get("model") or self.model),
             prompt_ms=prompt_ms if prompt_ms is not None else elapsed_ms,
-            decode_ms=decode_ms or 0)
+            decode_ms=decode_ms or 0,
+            prompt_processed=processed_tokens(timings, usage))
 
     def stream(self, messages: Sequence[Message], **kw) -> Iterator[str]:
         """Server-sent events, for display. Cancel is checked per chunk."""

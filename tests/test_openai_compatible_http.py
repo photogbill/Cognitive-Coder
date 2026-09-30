@@ -354,6 +354,29 @@ def test_llamacpp_timings_override_the_wall_clock(server, no_proxy_env):
     assert out.decode_ms == 900
 
 
+def test_llamacpp_reports_how_much_of_the_prompt_it_processed(
+        server, no_proxy_env):
+    """`timings.prompt_n` is the exact answer to "did the prefix cache
+    hold?" — 40 of 4,000 tokens processed means 3,960 came from cache."""
+    def handler(h, body):
+        send_sse(h, [chunk("a", finish="stop"),
+                     b'data: {"choices":[],"usage":{"prompt_tokens":4000,'
+                     b'"completion_tokens":1},"timings":{"prompt_n":40,'
+                     b'"prompt_ms":30.0,"predicted_ms":90.0}}\n\n',
+                     b"data: [DONE]\n\n"])
+    server.post_handler = handler
+    out = _local(server).complete([Message(role="user", content="hi")])
+    assert (out.tokens_in, out.prompt_processed) == (4000, 40)
+
+
+def test_an_openai_shaped_cached_count_is_read_too():
+    from cognitive_coder.providers.base import processed_tokens
+    usage = {"prompt_tokens": 1000,
+             "prompt_tokens_details": {"cached_tokens": 900}}
+    assert processed_tokens({}, usage) == 100
+    assert processed_tokens({}, {"prompt_tokens": 1000}) == 0
+
+
 def test_sse_frames_are_assembled_per_the_spec(server, no_proxy_env):
     """Comments, CRLF, and one JSON object split across two `data:` lines
     (legal SSE: the lines join with a newline)."""

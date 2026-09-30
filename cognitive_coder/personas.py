@@ -431,14 +431,24 @@ class PromptBuilder:
     # -- the stable half --------------------------------------------------
     def prefix_for(self, persona: Persona, *, architecture: str = "",
                    epoch: int = 0) -> str:
-        """CACHED PREFIX: persona, conventions, low-resolution architecture.
+        """CACHED PREFIX: conventions, low-resolution architecture, persona.
 
-        Nothing time-varying, nothing task-varying. `epoch` appears only as
-        an integer that changes when the architecture is deliberately
-        rebuilt — which is the one thing in here that is ALLOWED to change
-        the prefix, because when it changes the cache should be discarded.
+        Nothing time-varying, nothing task-varying. The architecture changes
+        only when it is deliberately rebuilt (an epoch), and then the cache
+        should be discarded.
+
+        ORDERED BY HOW OFTEN EACH PART CHANGES, rarest first. A prefix cache
+        (llama-server, llama-cpp-python) keeps the longest run of tokens that
+        matches the previous prompt, so a part that changes throws away
+        everything AFTER it. The persona used to come first — and it is the
+        part that changes most: planner, engineer, tester, a switch to the
+        repairer on every repair attempt and back for the next file.
+        Measured on a scripted five-file build, each switch kept about 1% of
+        the previous prompt. Conventions are fixed for the session and the
+        architecture for an epoch, so they go first and survive a persona
+        switch; the persona sits last, directly before the task it frames.
         """
-        parts = [persona.block(self.profile)]
+        parts = []
         if self.conventions:
             parts.append("[PROJECT CONVENTIONS]\n" + self.conventions)
         if architecture:
@@ -446,6 +456,7 @@ class PromptBuilder:
                          "This is the project you are working in. Do not "
                          "invent files, functions or imports that are not "
                          "here.\n\n" + architecture)
+        parts.append(persona.block(self.profile))
         return "\n\n".join(parts)
 
     # -- the volatile half ------------------------------------------------
