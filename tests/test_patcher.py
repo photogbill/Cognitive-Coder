@@ -41,9 +41,12 @@ CORPUS = {
                    "    return 2\r\n".encode("utf-8"),
     "bom_lf.py": "\ufeffdef a():\n    return 1\n".encode("utf-8"),
     "no_trailing_newline.py": b"def a():\n    return 1",
-    "utf16.py": "def a():\n    return 'héllo'\n".encode("utf-16"),
+    # `return 1` is what the edit test anchors on; the é keeps the
+    # encoding load-bearing. It used to be `return 'héllo'`, so the
+    # encoding-preservation test skipped UTF-16 for want of an anchor.
+    "utf16.py": "# héllo\ndef a():\n    return 1\n".encode("utf-16"),
     "latin1.py": b"# caf\xe9\ndef a():\n    return 1\n",
-    "mixed_eol.py": b"a = 1\r\nb = 2\nc = 3\r\n",
+    "mixed_eol.py": b"def a():\r\n    return 1\nc = 3\r\n",
 }
 
 
@@ -86,24 +89,27 @@ def test_an_edit_preserves_encoding_bom_and_line_endings(name):
     """
     fs, p = _patcher()
     before = fs.files[name]
-    if b"a()" not in textio.decode(before).text.encode("utf-8"):
-        pytest.skip("no anchor in this fixture")
-
     tx = p.begin("edit", atomic=False)
     result = tx.apply([Edit(path=name, kind="replace",
                             old="return 1", new="return 42")])
-    if not result[0].ok:
-        pytest.skip(f"anchor not applicable: {result[0].reason}")
+    assert result[0].ok, result[0].reason
     tx.commit()
 
     after = fs.files[name]
     tf_before, tf_after = textio.decode(before), textio.decode(after)
-    if textio.is_mixed_eol(tf_before.text) or tf_before.assumption:
-        pytest.skip("mixed line endings — the declared-assumption path")
-    assert tf_after.eol == tf_before.eol, "line endings were rewritten"
     assert tf_after.bom == tf_before.bom, "the BOM was added or dropped"
     assert tf_after.encoding == tf_before.encoding, "the encoding changed"
     assert "return 42" in tf_after.text
+    raw_before = before.decode(tf_before.encoding, "replace")
+    if textio.is_mixed_eol(raw_before):
+        # The one case that cannot be byte-faithful: the minority endings
+        # become the dominant one. C7 — it is SAID, in the result.
+        assert tf_after.eol == tf_before.eol
+        assert "line-ending" in result[0].reason, result[0].reason
+    else:
+        assert tf_after.eol == tf_before.eol, "line endings were rewritten"
+        assert after.count(b"\r") == before.count(b"\r"), (
+            "line endings were rewritten")
 
 
 def test_apply_then_undo_restores_byte_identical_content():
@@ -162,6 +168,36 @@ def test_an_ambiguous_anchor_is_refused_not_guessed():
                                 b"    return 1\n")
 
 
+def test_an_anchor_inside_a_longer_name_is_refused():
+    """Observed: raw substring search let `x = 1` → `x = 2` apply to
+    `max = 10` and produce `max = 20` — applied cleanly, silently wrong."""
+    fs, p = _patcher({"m.py": b"max = 10\nprint(max)\n"})
+    tx = p.begin("sub")
+    result = tx.apply([Edit(path="m.py", kind="replace", old="x = 1",
+                            new="x = 2")])[0]
+    assert not result.ok
+    assert "matches only inside a longer name" in result.reason
+    assert fs.files["m.py"] == b"max = 10\nprint(max)\n"
+
+
+def test_a_whole_word_match_is_used_when_a_partial_one_also_exists():
+    """The in-a-name hit is not a candidate, so it does not make the real
+    one ambiguous either."""
+    fs, p = _patcher({"m.py": b"max = 10\nx = 1\n"})
+    tx = p.begin("sub")
+    result = tx.apply([Edit(path="m.py", kind="replace", old="x = 1",
+                            new="x = 2")])[0]
+    assert result.ok, result.reason
+    assert fs.files["m.py"] == b"max = 10\nx = 2\n"
+
+
+def test_preview_names_an_anchor_inside_a_longer_name():
+    fs, p = _patcher({"m.py": b"total = 10\n"})
+    out = p.preview([Edit(path="m.py", kind="replace", old="tal = 1",
+                          new="tal = 2")])
+    assert "inside a longer name" in out
+
+
 def test_a_missing_anchor_says_the_file_may_have_changed():
     """C6 — a sentence naming what happened, and what it probably means."""
     fs, p = _patcher({"m.py": b"x = 1\n"})
@@ -170,6 +206,36 @@ def test_a_missing_anchor_says_the_file_may_have_changed():
                             new="y = 3")])[0]
     assert not result.ok
     assert "not in the file" in result.reason
+
+
+def test_editing_a_mixed_eol_file_says_what_else_it_changed():
+    """C7: "edited one line of a mostly-CRLF file, rewrote every LF line"
+    must be stated. The assumption used to be computed and thrown away."""
+    fs = MemoryFileSystem({"m.py": b"a = 1\r\nb = 2\nc = 3\r\n"})
+    events = RecordingEvents()
+    p = patcher.Patcher(fs, MemoryStorage(), AutoApprove(), events)
+    tx = p.begin("mixed")
+    result = tx.apply([Edit(path="m.py", kind="replace", old="a = 1",
+                            new="a = 9")])[0]
+    assert result.ok
+    assert "line-ending" in result.reason
+    assert any("line-ending" in msg for _k, msg, _d in events.of("warning"))
+
+
+def test_a_whole_file_edit_of_a_utf16_file_keeps_its_bom():
+    fs, p = _patcher({"u.py": "\ufeffx = 1\r\n".encode("utf-16-le")})
+    tx = p.begin("u")
+    assert tx.apply([Edit(path="u.py", kind="whole", new="x = 2\n")])[0].ok
+    assert fs.files["u.py"] == "\ufeffx = 2\r\n".encode("utf-16-le")
+
+
+def test_an_edit_that_widens_the_encoding_says_so():
+    fs, p = _patcher({"l.py": b"# caf\xe9\nx = 1\n"})
+    tx = p.begin("l")
+    result = tx.apply([Edit(path="l.py", kind="replace", old="x = 1",
+                            new="x = '\u2192'")])[0]
+    assert result.ok
+    assert "UTF-8" in result.reason, result.reason
 
 
 def test_an_anchor_matching_crlf_text_still_applies():
@@ -202,6 +268,28 @@ def test_no_write_lands_outside_the_project_root(path):
     result = tx.apply([Edit(path=path, kind="whole", new="pwned")])[0]
     assert not result.ok, f"{path} was WRITTEN"
     assert list(fs.files) == ["keep.py"]
+
+
+@pytest.mark.parametrize("path", [".GIT/config", ".Git/hooks/pre-commit",
+                                  "src/../.GIT/HEAD"])
+def test_git_is_refused_in_any_case(path):
+    """On Windows and macOS `.GIT` IS `.git`; a case-sensitive check was a
+    way into the one directory the engine promises never to touch (M27)."""
+    fs, p = _patcher({"keep.py": b"x = 1\n"})
+    tx = p.begin("git")
+    assert not tx.apply([Edit(path=path, kind="whole", new="x")])[0].ok
+    assert list(fs.files) == ["keep.py"]
+
+
+def test_list_excludes_git_in_any_case(tmp_path):
+    from cognitive_coder.ports import LocalFileSystem
+    mem = MemoryFileSystem({".GIT/config": b"", "a.py": b"",
+                            "sub/.Git/x": b""})
+    assert mem.list("*") == ["a.py"]
+    (tmp_path / ".Git").mkdir()
+    (tmp_path / ".Git" / "config").write_text("x")
+    (tmp_path / "a.py").write_text("")
+    assert LocalFileSystem(str(tmp_path)).list("*") == ["a.py"]
 
 
 def test_a_godot_res_path_is_translated_rather_than_taken_literally():
@@ -317,6 +405,69 @@ def test_undo_to_states_how_much_verified_work_it_would_discard():
     assert fs.files["a.py"] == b"a = 2\n", "it went back too far"
 
 
+def _commit_three_edits_of_keep(p):
+    for i in range(1, 4):
+        tx = p.begin(f"t{i}")
+        tx.apply([Edit(path="keep.py", kind="whole", new=f"v{i}\n")])
+        tx.commit(verified=True)
+
+
+def test_undo_to_past_a_pruned_snapshot_refuses_rather_than_deleting(
+        monkeypatch):
+    """Observed: a missing snapshot was read as "created by this
+    transaction" and the pre-existing file was DELETED, with ok=True. The
+    pruner removes exactly those bytes, so this happened to any project
+    more than MAX_SNAPSHOTS transactions old."""
+    monkeypatch.setattr(patcher, "MAX_SNAPSHOTS", 1)
+    fs, p = _patcher({"keep.py": b"v0\n"})
+    _commit_three_edits_of_keep(p)
+    asked = []
+    out = p.undo_to(1, confirm=lambda s: asked.append(s) or True)
+    assert not out["ok"]
+    assert fs.files.get("keep.py") == b"v3\n", "the file was changed"
+    assert "pruned" in out["note"] and "keep.py" in out["note"]
+    assert "Nothing was changed" in out["note"]
+    assert not asked, "it asked to confirm an undo it was going to refuse"
+
+
+def test_undo_to_still_deletes_a_file_the_transaction_CREATED(monkeypatch):
+    """The manifest says NEW — so deleting is the correct undo, even when
+    the snapshot directory itself has been pruned."""
+    monkeypatch.setattr(patcher, "MAX_SNAPSHOTS", 1)
+    fs, p = _patcher({"keep.py": b"k\n"})
+    t1 = p.begin("base")
+    t1.apply([Edit(path="keep.py", kind="whole", new="k2\n")])
+    t1.commit(verified=True)
+    t2 = p.begin("create")
+    t2.apply([Edit(path="made.py", kind="whole", new="m = 1\n")])
+    t2.commit(verified=True)
+    t3 = p.begin("later")
+    t3.apply([Edit(path="other.py", kind="whole", new="o = 1\n")])
+    t3.commit(verified=True)
+    out = p.undo_to(t1.seq, confirm=lambda s: True)
+    assert out["ok"], out["note"]
+    assert "made.py" not in fs.files and "other.py" not in fs.files
+    assert fs.files["keep.py"] == b"k2\n"
+
+
+def test_prune_keeps_the_NEWEST_snapshots_past_seq_9999(monkeypatch):
+    """`{seq:04d}` sorts "10000" before "9999" as text, so a lexicographic
+    prune deleted the newest snapshot once the counter reached five
+    digits."""
+    monkeypatch.setattr(patcher, "MAX_SNAPSHOTS", 2)
+    fs, p = _patcher({"a.py": b"a = 0\n"})
+    p.storage.set("cognitive_coder.patcher.seq", 9997)
+    seqs = []
+    for i in range(1, 5):
+        tx = p.begin(f"n{i}")
+        tx.apply([Edit(path="a.py", kind="whole", new=f"a = {i}\n")])
+        tx.commit(verified=True)
+        seqs.append(tx.seq)
+    kept = {k.split("/")[1].split("-")[0] for k in fs.files
+            if k.startswith(".cc_snapshots/")}
+    assert kept == {str(s).zfill(4) for s in seqs[-2:]}, kept
+
+
 def test_a_second_open_transaction_is_refused():
     fs, p = _patcher({"a.py": b"a = 1\n"})
     p.begin("one")
@@ -392,6 +543,35 @@ def test_extract_code_prefers_a_fence_that_parses():
     out = patcher.extract_code(text, "python", validator=validates)
     assert "def good" in out
     assert "broken" not in out
+
+
+@pytest.mark.parametrize("lang_id,tag,code,command", [
+    ("rust", "rust", "fn main() {\n    println!(\"hi\");\n}", "cargo run"),
+    ("c", "c", "int main(void) {\n    return 0;\n}", "gcc main.c"),
+    ("go", "go", "package main\n\nfunc main() {}", "go run ."),
+])
+def test_an_untagged_command_fence_is_not_taken_as_the_code(
+        lang_id, tag, code, command):
+    """Observed: `.get(lang_id, "")` put "" into the alias set for every
+    language outside a five-entry map, so an UNTAGGED fence counted as
+    tagged for the target — and `main.rs` was written as `cargo run`."""
+    text = (f"Build with:\n```\n{command}\n```\n\nHere is the file:\n"
+            f"```{tag}\n{code}\n```\n")
+    assert patcher.extract_code(text, lang_id) == code
+
+
+def test_the_longest_untagged_fence_beats_a_fence_for_another_language():
+    text = ("Run it:\n```bash\ncargo build --release && ./target/release/"
+            "app --verbose --config ./config/app.toml\n```\n"
+            "```\nfn main() {}\n```\n"
+            "```\nfn main() {\n    let x = 1;\n}\n```\n")
+    assert patcher.extract_code(text, "rust") == (
+        "fn main() {\n    let x = 1;\n}")
+
+
+def test_a_fence_tagged_rs_counts_as_rust():
+    text = "```\ncargo run\n```\n```rs\nfn main() {}\n```\n"
+    assert patcher.extract_code(text, "rust") == "fn main() {}"
 
 
 def test_preview_changes_nothing():

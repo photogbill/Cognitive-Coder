@@ -14,16 +14,21 @@ this repo as a git submodule and `sys.path`-insert it with no install at all:
   * **No package-metadata reads.** The version comes from `version.py`, never
     from `importlib.metadata`, which raises for a vendored copy.
 
-Ten-line embedding example — it runs anywhere, with no model and no network:
+Ten-line embedding example — it runs anywhere, with no model and no network
+(`tests/test_cli.py` executes it, so it cannot quietly stop working again):
 
-    from cognitive_coder import (AutoApprove, Host, MemoryFileSystem,
-                                 ScriptedLLM, Session)
+    import tempfile
 
-    host = Host(llm=ScriptedLLM(["def main():\\n    return 0\\n"]),
-                fs=MemoryFileSystem({"src/main.py": b""}),
-                approval=AutoApprove())
-    session = Session(host)
-    session.run("make src/main.py return zero")
+    from cognitive_coder import (AutoApprove, Host, LocalFileSystem,
+                                 ScriptedLLM, Session, SessionConfig)
+
+    # A scripted model answers each call in order: the plan, then the file.
+    replies = ["greet.py — say hello to a named person\\n",
+               '```python\\ndef greet(name):\\n    return f"hi {name}"\\n```']
+    host = Host(llm=ScriptedLLM(replies, supports_tools=False),
+                fs=LocalFileSystem(tempfile.mkdtemp()), approval=AutoApprove())
+    session = Session(host, config=SessionConfig(attempts=1))
+    session.run("a greet function")
     print(session.report())
 
 The meta-lesson, worth knowing before you tune anything (Appendix D): with a
@@ -46,6 +51,7 @@ from . import (
                skills,
                textio,
 )
+from .audit import AuditConfig, AuditFinding, AuditReport, audit_project
 from .codemap import CodeMap
 
 # -- errors (C6: every one of these carries an operator-facing sentence) ----
@@ -60,6 +66,7 @@ from .errors import (
                PortError,
                TransactionError,
 )
+from .filestorage import JsonFileStorage
 from .journal import Journal
 from .loop import Loop, LoopConfig
 from .patcher import Patcher, Transaction
@@ -147,6 +154,8 @@ __all__ = [
     "NullLLM", "ScriptedLLM", "MemoryFileSystem", "LocalFileSystem",
     "SubprocessExec", "MemoryStorage", "SilentEvents", "RecordingEvents",
     "AutoApprove", "DenyAll",
+    # a StoragePort that outlives the process — what the CLI uses
+    "JsonFileStorage",
     # engine
     "langs", "diagnostics", "guard", "runner", "patcher", "textio",
     "context", "redact", "review", "skills", "Budget", "RedactionReport",
@@ -157,4 +166,6 @@ __all__ = [
     "available_providers",
     # deployed skills (F3)
     "Skill", "SkillLoad", "load_skills", "SKILLS_DIR", "STARTER_SKILLS",
+    # the audit: review an existing project, report, plan the fix
+    "audit_project", "AuditConfig", "AuditReport", "AuditFinding",
 ]

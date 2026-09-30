@@ -9,8 +9,9 @@ message covers the least interesting part of the conversation.
 
 WHAT THIS IS AND IS NOT
 
-It is a scrubber for the things that are *recognisable*: keys with known
-shapes, private-key blocks, `.env` contents, connection strings. It is not a
+It is a scrubber for the things that are *recognisable* — 18 secret shapes
+(`PATTERNS`, counted by a test so this number stays true): keys with known
+shapes, private-key blocks, `.env` secrets, connection strings. It is not a
 guarantee that nothing sensitive leaves, and no honest document should say it
 is — a variable called `x` holding a patient's name is invisible to every
 pattern here. The guarantee this project actually makes is different and
@@ -30,9 +31,11 @@ Two design decisions that follow from that:
     code that references a variable that now appears not to exist.
 
 And one that is easy to get wrong: **the same secret gets the same
-placeholder within one payload.** If a key appears in three places and
-becomes three different tokens, the model sees three unrelated values and
-writes code that treats them as different.
+placeholder within one payload** — and different secrets different ones,
+across every message of it. If a key appears in three places and becomes
+three different tokens, the model sees three unrelated values and writes
+code that treats them as different. A caller that wants the numbering to
+hold across a whole SESSION passes one `RedactionState` to every call.
 """
 
 from __future__ import annotations
@@ -47,16 +50,32 @@ from .types import Message
 # (kind, pattern). Ordered: the most specific first, because a connection
 # string contains a password and should be reported as the connection string
 # it is rather than as a loose credential.
+#
+# Where a pattern has a `secret` group, ONLY that group is replaced and only
+# that group is judged harmless or not. Both used to apply to the whole
+# match: `postgres://user:RealPassw0rd@localhost/db` leaked because the
+# match contained `localhost`, and a label like `aws_secret_access_key = `
+# vanished along with the value, so the model saw code with a hole in it.
+_KEYWORDS = (r"(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|"
+             r"access[_-]?token|auth[_-]?token|client[_-]?secret|"
+             r"private[_-]?key)")
+# An unquoted value is only a secret if it looks like one: 8+ characters
+# with a letter AND a digit, ending at whitespace or a separator. That keeps
+# `password=password`, `token = get_token()` and `request.form[...]` out.
+_BARE = r"[^\s'\"#,;()\[\]{}<>]"
 PATTERNS: tuple[tuple[str, str], ...] = (
     ("private_key",
-     r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
-     r".*?-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+     r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+     r".*?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE "
+     r"KEY-----"),
     ("connection_string",
      r"\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis|amqp|mssql)"
-     r"://[^\s'\"<>]*:[^\s'\"@<>]+@[^\s'\"<>]+"),
-    ("aws_key_id", r"\bAKIA[0-9A-Z]{16}\b"),
+     r"://[^\s'\"<>/:@]*:(?P<secret>[^\s'\"<>]+)@[^\s'\"<>@]+"),
+    # AKIA is a long-lived key id; ASIA the temporary (STS) one.
+    ("aws_key_id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     ("aws_secret",
-     r"(?i)(?:aws_?secret_?access_?key\s*[:=]\s*)['\"]?([0-9a-zA-Z/+]{40})"),
+     r"(?i)aws_?secret_?access_?key['\"]?\s*[:=]\s*['\"]?"
+     r"(?P<secret>[0-9a-zA-Z/+]{40})"),
     # Anthropic BEFORE OpenAI, and OpenAI's pattern excludes `ant-`:
     # `sk-[A-Za-z0-9_-]{20,}` happily swallows `sk-ant-…`, and whichever
     # runs first wins. The value is scrubbed either way, but the KIND is
@@ -65,37 +84,78 @@ PATTERNS: tuple[tuple[str, str], ...] = (
     ("anthropic_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
     ("openai_key", r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}"),
     ("google_key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    ("github_token", r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
-    ("slack_token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    ("github_token",
+     r"\bgh[pousr]_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}"),
+    ("slack_token",
+     r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b|\bxapp-[A-Za-z0-9-]{10,}"),
     ("stripe_key", r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}\b"),
     ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
-    ("bearer_token", r"(?i)\b(?:authorization|bearer)\s*[:=]?\s*"
-                     r"['\"]?[A-Za-z0-9._-]{24,}"),
+    ("basic_auth",
+     r"(?i)\bauthorization\s*[:=]\s*['\"]?basic\s+"
+     r"(?P<secret>[A-Za-z0-9+/=]{8,})"),
+    # A separator or `bearer ` is required: `authorization_header_value_…`
+    # is an identifier, and scrubbing it broke the code it was in.
+    ("bearer_token",
+     r"(?i)(?:\bauthorization\s*[:=]\s*['\"]?(?:bearer\s+)?|\bbearer\s+)"
+     r"['\"]?(?P<secret>[A-Za-z0-9._~+/=-]{24,})"),
+    ("api_key_header",
+     r"(?i)(?<![\w-])(?:x-api-key|x-auth-token|api-key)\s*:\s*['\"]?"
+     r"(?P<secret>[A-Za-z0-9._~+/=-]{16,})"),
     ("credential_assignment",
-     r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|"
-     r"auth[_-]?token|client[_-]?secret)\s*[:=]\s*['\"][^'\"\n]{6,}['\"]"),
+     r"(?i)\b[\w-]*?" + _KEYWORDS + r"[\w-]*['\"]?\s*[:=]\s*"
+     r"(?P<q>['\"])(?P<secret>[^'\"\n]{6,})(?P=q)"),
+    # `.env` syntax — `NAME=value`, no spaces around `=` — for a NAME that
+    # says it holds a secret. The name is kept; only the value goes. It used
+    # to match ANY `UPPER_CASE = <8+ chars>` line and replace the whole
+    # line, so a settings module lost LOG_FORMAT, DATA_DIR and DATABASE_URL
+    # and the model was shown code using variables that did not exist.
     ("env_line",
-     r"(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]{2,}[ \t]*=[ \t]*"
-     r"[^\n#]{8,}$"),
+     r"(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|"
+     r"PASSWORD|PASSWD|PWD|PASS|CREDENTIALS?|AUTH|PRIVATE|SALT|DSN|"
+     r"SESSION|COOKIE)[A-Z0-9_]*=(?P<q>['\"]?)(?P<secret>[^\s'\"#]{6,})"
+     r"(?P=q)[ \t]*(?:#[^\n]*)?$"),
+    # The same credential names, UNQUOTED: `db_password=…`, YAML
+    # `password: …`, TOML `token = …`.
+    ("credential_assignment",
+     r"(?i)\b[\w-]*?(?:" + _KEYWORDS[3:-1] + r"|token)[\w-]*[ \t]*[:=][ \t]*"
+     r"(?P<secret>(?=" + _BARE + r"*\d)(?=" + _BARE + r"*[A-Za-z])"
+     + _BARE + r"{8,})(?=[\s#,;]|$)"),
     ("private_ip", r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))"
                    r"\.\d{1,3}\.\d{1,3}\b"),
 )
 
 # Values that look like secrets and are not. Redacting these produces a
 # prompt full of `[REDACTED:…]` where the model needed to see the shape, and
-# it teaches the operator that the count means nothing.
+# it teaches the operator that the count means nothing. Judged on the SECRET
+# alone (see above), never on the text around it.
 _HARMLESS = re.compile(
     r"(?i)\b(changeme|example|placeholder|your[-_]?(?:key|token|secret)|"
     r"xxx+|todo|dummy|fake|sample|redacted|none|null|true|false|"
-    r"localhost|127\.0\.0\.1|0\.0\.0\.0)\b")
+    r"localhost|127\.0\.0\.1|0\.0\.0\.0)\b|\*{3,}|<[^<>\n]+>")
 
 #: Kinds that are advisory rather than secret. On by default because C3's
 #: host is air-gapped and a LAN topology is information; a host that does not
-#: care can drop them.
-SOFT_KINDS = ("private_ip", "env_line")
+#: care can drop them. (`env_line` used to be here; now that it only fires on
+#: a name that says "secret", it is a secret, and the journal scrubber —
+#: which skips soft kinds — must not skip it.)
+SOFT_KINDS = ("private_ip",)
 
 _COMPILED = [(kind, re.compile(pattern, re.S))
              for kind, pattern in PATTERNS]
+
+
+@dataclass
+class RedactionState:
+    """Placeholder numbering, carried across calls when a caller wants it.
+
+    Without one, numbering restarts per call, and a key that was
+    `[REDACTED:aws_key_id_2]` in one message is `[REDACTED:aws_key_id]` in
+    the next — the model then treats one credential as two. Holds the
+    secrets themselves in memory, as keys, for as long as the caller keeps
+    it; it is never serialised.
+    """
+    seen: dict[str, str] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -150,13 +210,19 @@ class RedactionReport:
 
 
 def redact_text(text: str, *, soft: bool = True,
-                extra: Sequence[tuple[str, str]] = ()) -> tuple[str,
-                                                                RedactionReport]:
+                extra: Sequence[tuple[str, str]] = (),
+                state: RedactionState | None = None
+                ) -> tuple[str, RedactionReport]:
     """Scrub one string. Returns (clean, report).
 
     ``extra`` is the host's own configured patterns — a project name, an
     internal hostname, a client identifier. The host knows things about what
-    is sensitive that no general pattern can.
+    is sensitive that no general pattern can. A host pattern may name a
+    `secret` group to have only that part replaced.
+
+    ``state`` keeps placeholder numbering stable across calls. Without it
+    each call stands alone, as before. The report counts secrets NEW to the
+    state, so a session total is a count of distinct secrets.
     """
     report = RedactionReport(bytes_before=len(text.encode("utf-8")))
     if not text:
@@ -164,11 +230,11 @@ def redact_text(text: str, *, soft: bool = True,
         return text, report
 
     out = text
-    # The same value gets the same placeholder within one payload, so a key
-    # appearing three times does not become three apparently-different
-    # values the model then treats as unrelated.
-    seen: dict[str, str] = {}
-    counts: dict[str, int] = {}
+    # The same value gets the same placeholder, so a key appearing three
+    # times does not become three apparently-different values the model
+    # then treats as unrelated.
+    st = state if state is not None else RedactionState()
+    new: dict[str, int] = {}
 
     patterns = list(_COMPILED)
     patterns += [(kind, re.compile(pattern, re.S)) for kind, pattern in extra]
@@ -176,29 +242,39 @@ def redact_text(text: str, *, soft: bool = True,
     for kind, pattern in patterns:
         if not soft and kind in SOFT_KINDS:
             continue
+        grouped = "secret" in pattern.groupindex
 
-        def replace(match: re.Match, kind: str = kind) -> str:
-            value = match.group(0)
+        def replace(match: re.Match, kind: str = kind,
+                    grouped: bool = grouped) -> str:
+            whole = match.group(0)
+            if grouped and match.group("secret") is not None:
+                value = match.group("secret")
+                lo = match.start("secret") - match.start()
+                hi = match.end("secret") - match.start()
+            else:
+                value, lo, hi = whole, 0, len(whole)
             if _HARMLESS.search(value):
-                return value
-            if value not in seen:
-                index = counts.get(kind, 0) + 1
-                counts[kind] = index
+                return whole
+            if value not in st.seen:
+                index = st.counts.get(kind, 0) + 1
+                st.counts[kind] = index
                 suffix = "" if index == 1 else f"_{index}"
-                seen[value] = f"[REDACTED:{kind}{suffix}]"
-            return seen[value]
+                st.seen[value] = f"[REDACTED:{kind}{suffix}]"
+                new[kind] = new.get(kind, 0) + 1
+            return whole[:lo] + st.seen[value] + whole[hi:]
 
         out = pattern.sub(replace, out)
 
     report.redactions = [Redaction(kind=kind, count=n,
                                    placeholder=f"[REDACTED:{kind}]")
-                         for kind, n in counts.items()]
+                         for kind, n in new.items()]
     report.bytes_after = len(out.encode("utf-8"))
     return out, report
 
 
 def redact_messages(messages: Sequence[Message], *, soft: bool = True,
-                    extra: Sequence[tuple[str, str]] = ()
+                    extra: Sequence[tuple[str, str]] = (),
+                    state: RedactionState | None = None
                     ) -> tuple[list[Message], RedactionReport]:
     """Scrub EVERY message, of every role (M43).
 
@@ -207,13 +283,19 @@ def redact_messages(messages: Sequence[Message], *, soft: bool = True,
     model is a chunk of somebody's source going over the wire, and it did not
     pass through the redactor on the way in because it never came from the
     model.
+
+    One numbering for the whole payload (or for ``state``'s whole session):
+    each message used to restart it, so two DIFFERENT keys in two messages
+    both became `[REDACTED:aws_key_id]`.
     """
     import dataclasses
 
     out: list[Message] = []
     total = RedactionReport()
+    st = state if state is not None else RedactionState()
     for message in messages:
-        clean, report = redact_text(message.content, soft=soft, extra=extra)
+        clean, report = redact_text(message.content, soft=soft, extra=extra,
+                                    state=st)
         total.merge(report)
         if message.tool_calls:
             # Arguments travel too — an `apply_patch` call carries source.
@@ -221,7 +303,8 @@ def redact_messages(messages: Sequence[Message], *, soft: bool = True,
             calls = []
             for call in message.tool_calls:
                 raw = json.dumps(call.arguments)
-                scrubbed, sub = redact_text(raw, soft=soft, extra=extra)
+                scrubbed, sub = redact_text(raw, soft=soft, extra=extra,
+                                            state=st)
                 total.merge(sub)
                 try:
                     args = json.loads(scrubbed)

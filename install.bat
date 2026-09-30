@@ -36,6 +36,23 @@ set "VENV=%HERE%\.venv"
 set "PYDIR=%HERE%\.python"
 set "TOOLS=%HERE%\.tools"
 set "SUMMARY=%TEMP%\cc-install-summary-%RANDOM%.txt"
+set "PIPERR=%TEMP%\cc-install-piperr-%RANDOM%.txt"
+REM pip's download cache stays in the clone too - rule 4.
+set "PIP_CACHE_DIR=%TOOLS%\pip-cache"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+
+REM uv, PINNED, and its installer verified before it runs. It was
+REM `irm https://astral.sh/uv/install.ps1 | iex`: whatever that URL served
+REM on the day, unverified, executed - and the pipe reached PowerShell as a
+REM literal ^| because a caret inside double quotes is not an escape. Now a
+REM fixed release's installer is saved to a file and its SHA-256 compared
+REM with the one below; a mismatch means it is NOT run. What remains
+REM trusted: that installer downloads the uv archive itself, over HTTPS from
+REM the same GitHub release, and 0.8.22's installer has no checksum for it.
+REM To move to a newer uv: change both lines, from the release's own asset.
+set "UV_VERSION=0.8.22"
+set "UV_PS1_SHA256=2d3386e8c4eae90f7292f2664db5563f6465c4280e0b33faf1023cca0c70803d"
+set "UV_PS1_URL=https://github.com/astral-sh/uv/releases/download/%UV_VERSION%/uv-installer.ps1"
 set "CORE_OK=0"
 set "WANT_PROVIDERS=0"
 set "WANT_TREESITTER=0"
@@ -85,25 +102,43 @@ REM Step 3 of section 10.2a: fetching is the NORMAL path on an old machine.
 REM Not an error, not a warning.
 echo No Python 3.11 or later was found. Fetching one into
 echo %PYDIR% - nothing is installed system-wide.
+REM INTO THE CLONE, all of it. Without these uv puts the interpreter in its
+REM global data directory, its cache in the user profile and, from 0.8, a
+REM python3.x shim on the user's PATH - while this script, the README and
+REM CONFORMANCE M46 said "into the clone" and PYDIR was only ever echoed.
+set "UV_PYTHON_INSTALL_DIR=%PYDIR%"
+set "UV_PYTHON_BIN_DIR=%TOOLS%\bin"
+set "UV_CACHE_DIR=%TOOLS%\uv-cache"
+set "UV_PYTHON_PREFERENCE=only-managed"
+set "UV_WHY="
 if not exist "%TOOLS%" mkdir "%TOOLS%" >nul 2>&1
-if not exist "%TOOLS%\uv.exe" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$ErrorActionPreference='SilentlyContinue'; $env:UV_INSTALL_DIR='%TOOLS%'; $env:UV_NO_MODIFY_PATH='1'; irm https://astral.sh/uv/install.ps1 ^| iex" >nul 2>&1
-)
-if exist "%TOOLS%\uv.exe" (
-    "%TOOLS%\uv.exe" python install 3.11 >nul 2>&1
-    for /f "usebackq delims=" %%P in (`"%TOOLS%\uv.exe" python find 3.11 2^>nul`) do set "PYTHON=%%P"
-    set "PY_SOURCE=fetched by uv into this clone"
-)
-if not defined PYTHON (
-    echo.
-    echo FAILED: no usable Python, and one could not be fetched.
-    echo   Tried: py -3.11, py -3.12, python3.11, python, py -3
-    echo   Then:  downloading uv from https://astral.sh/uv/install.ps1
-    echo   Fix:   install Python 3.11 or later, then run this again.
-    echo          Nothing was changed.
-    exit /b 1
-)
+if exist "%TOOLS%\uv.exe" goto uv_ready
+if exist "%TOOLS%\uv-installer.ps1" del /q "%TOOLS%\uv-installer.ps1" >nul 2>&1
+REM No parenthesised block around this, and every value reaches PowerShell
+REM through the environment rather than inside the command string, so no
+REM path, quote or bracket in it can end the block or the string early.
+REM UV_UNMANAGED_INSTALL is uv's documented CI mode: into this folder, no
+REM receipt, no PATH edit, no self-update.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $f=Join-Path $env:TOOLS 'uv-installer.ps1'; try { Invoke-WebRequest -UseBasicParsing -Uri $env:UV_PS1_URL -OutFile $f } catch { exit 2 }; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash -ne $env:UV_PS1_SHA256) { Remove-Item -LiteralPath $f; exit 3 }; $env:UV_UNMANAGED_INSTALL=$env:TOOLS; $env:UV_NO_MODIFY_PATH='1'; & $f; exit 0" >nul 2>&1
+set "PSRC=%ERRORLEVEL%"
+if "%PSRC%"=="2" set "UV_WHY=the download of %UV_PS1_URL% failed"
+if "%PSRC%"=="3" set "UV_WHY=its SHA-256 was not the pinned %UV_PS1_SHA256%, so it was not run"
+if not exist "%TOOLS%\uv.exe" if not defined UV_WHY set "UV_WHY=its installer did not produce %TOOLS%\uv.exe"
+:uv_ready
+if not exist "%TOOLS%\uv.exe" goto no_uv
+"%TOOLS%\uv.exe" python install 3.11 >nul 2>&1
+for /f "usebackq delims=" %%P in (`"%TOOLS%\uv.exe" python find 3.11 2^>nul`) do set "PYTHON=%%P"
+set "PY_SOURCE=fetched by uv into .python in this clone"
+:no_uv
+if defined PYTHON goto have_python
+echo.
+echo FAILED: no usable Python, and one could not be fetched.
+echo   Tried: py -3.11, py -3.12, python3.11, python, py -3
+echo   Then:  uv %UV_VERSION% from %UV_PS1_URL%
+if defined UV_WHY echo          - %UV_WHY%.
+echo   Fix:   install Python 3.11 or later, then run this again.
+echo          Nothing outside .tools was changed.
+exit /b 1
 
 :have_python
 for /f "delims=" %%V in ('"%PYTHON%" --version 2^>^&1') do set "PYVER=%%V"
@@ -129,14 +164,16 @@ set "VPY=%VENV%\Scripts\python.exe"
 REM ----------------------------------------------------------------------
 REM 3. the core: zero required runtime dependencies
 REM ----------------------------------------------------------------------
-"%VPY%" -m pip install --quiet -e "%HERE%" >nul 2>&1
-if errorlevel 1 (
-    call :note "  [!!] core engine          pip install -e . FAILED - the"
-    call :note "                            engine will not import."
-) else (
-    set "CORE_OK=1"
-    call :note "  [OK] core engine          .venv ready, 0 required deps"
-)
+call :pip_install -e "%HERE%"
+if errorlevel 1 goto core_failed
+set "CORE_OK=1"
+call :note "  [OK] core engine          .venv ready, 0 required deps"
+goto core_done
+:core_failed
+call :note "  [!!] core engine          pip install -e . FAILED - the"
+call :note "                            engine will not import. pip said:"
+call :pip_tail
+:core_done
 for /f "delims=" %%V in ('"%VPY%" --version 2^>^&1') do set "VPYVER=%%V"
 call :note "  [OK] Python               %VPYVER% - %PY_SOURCE%"
 
@@ -202,6 +239,7 @@ echo   Next:  %VENV%\Scripts\ccoder doctor
 echo          %VENV%\Scripts\ccoder build "a CSV parser with tests"
 echo.
 del /q "%SUMMARY%" >nul 2>&1
+del /q "%PIPERR%" >nul 2>&1
 
 if "%CORE_OK%"=="1" exit /b 0
 exit /b 1
@@ -236,12 +274,32 @@ goto :eof
 
 :optional
 REM %~1 extra name, %~2 label, %~3 cost of absence
-"%VPY%" -m pip install --quiet -e "%HERE%[%~1]" >nul 2>&1
-if errorlevel 1 (
-    call :note "  [--] %~2 could not be installed. %~3"
-) else (
-    call :note "  [OK] %~2 installed"
-)
+call :pip_install -e "%HERE%[%~1]"
+if errorlevel 1 goto optional_failed
+call :note "  [OK] %~2 installed"
+goto :eof
+:optional_failed
+call :note "  [--] %~2 could not be installed. %~3 pip said:"
+call :pip_tail
+goto :eof
+
+:pip_install
+REM %* = the pip install arguments. OFFLINE FIRST: `pip install -e .`
+REM builds in an isolated environment that fetches setuptools from PyPI
+REM even when every wheel is already present, so an offline machine failed
+REM here. --no-build-isolation uses the venv's own setuptools; only if that
+REM cannot build does the isolated way run. stderr is KEPT - it used to go
+REM to nul, and a failure was then one line saying only that it failed.
+"%VPY%" -m pip install --quiet --no-build-isolation %* >nul 2>"%PIPERR%"
+if not errorlevel 1 exit /b 0
+"%VPY%" -m pip install --quiet %* >nul 2>"%PIPERR%"
+exit /b
+
+:pip_tail
+REM The last five lines pip wrote to stderr, straight into the summary.
+REM Through PowerShell and a redirect, never through echo: pip's text is
+REM full of the characters that break a batch echo.
+powershell -NoProfile -Command "Get-Content -Tail 5 -LiteralPath $env:PIPERR | ForEach-Object { '        | ' + $_ }" >> "%SUMMARY%" 2>nul
 goto :eof
 
 :note

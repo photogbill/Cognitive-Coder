@@ -16,6 +16,7 @@ the wire can tell the difference.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -157,6 +158,139 @@ def test_a_hosts_own_patterns_are_honoured():
 def test_nothing_in_produces_nothing_out():
     clean, report = redact.redact_text("")
     assert clean == "" and report.total == 0
+
+
+# --------------------------------------------------------------------------
+# precision: ordinary code survives, and the SECRET decides harmlessness
+# --------------------------------------------------------------------------
+
+SETTINGS_PY = (
+    '"""Settings for the app."""\n'
+    "import os\n\n"
+    'LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"\n'
+    'DATA_DIR = os.path.join(os.path.dirname(__file__), "data")\n'
+    'SUPPORTED_LANGS = ["python", "rust", "go", "javascript"]\n'
+    'DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///app.db")\n'
+    "MAX_RETRIES_DEFAULT = compute_from_config(settings)\n"
+    'DEFAULT_TIMEZONE = "Europe/London"\n'
+    "export PATH=/usr/local/bin:$PATH\n")
+
+
+def test_an_ordinary_settings_module_is_not_redacted():
+    """Observed: `env_line` replaced the WHOLE line of any `UPPER = <8+
+    chars>`, so a settings module lost LOG_FORMAT, DATA_DIR,
+    SUPPORTED_LANGS and DATABASE_URL — and the model was then shown code
+    using variables that did not exist."""
+    clean, report = redact.redact_text(SETTINGS_PY)
+    assert clean == SETTINGS_PY, clean
+    assert report.total == 0
+
+
+def test_a_password_to_localhost_is_still_a_password():
+    """`_HARMLESS` ran on the WHOLE match, so `localhost` in the host part
+    let the password through."""
+    for text in ("DATABASE_URL=postgres://user:RealPassw0rd@localhost:5432/db",
+                 "postgres://sample:RealPassw0rd@db.internal/app"):
+        clean, report = redact.redact_text(text)
+        assert "RealPassw0rd" not in clean, clean
+        assert report.total == 1
+
+
+def test_only_the_secret_is_replaced_so_the_structure_survives():
+    clean, _ = redact.redact_text(
+        "postgres://svc:hunter2hunter2@db.internal:5432/prod")
+    assert clean.startswith("postgres://svc:[REDACTED:connection_string]@")
+    assert "db.internal:5432/prod" in clean
+
+
+@pytest.mark.parametrize("kind,text,secret", [
+    ("aws_key_id", 'k = "ASIAIOSFODNN7EXAMPLE"', "ASIAIOSFODNN7EXAMPLE"),
+    ("github_token",
+     'T = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCD"',
+     "github_pat_11ABCDEFG0123456789"),
+    ("slack_token", 'x = "xapp-1-A0123456789-1234567890123-abcdef"',
+     "xapp-1-A0123456789"),
+    ("private_key", "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkq\n"
+                    "-----END ENCRYPTED PRIVATE KEY-----\n", "MIIFHDBOBgkq"),
+    ("basic_auth", "Authorization: Basic dXNlcjpodW50ZXIyCg==",
+     "dXNlcjpodW50ZXIyCg=="),
+    ("api_key_header", "x-api-key: 4f9a1c2e7b6d8a0f3e5c9b2a1d7f6e4c",
+     "4f9a1c2e7b6d8a0f3e5c9b2a1d7f6e4c"),
+    ("credential_assignment", "password=Sup3rS3cretValue",
+     "Sup3rS3cretValue"),
+    ("credential_assignment", "db_password=Sup3rS3cretValue",
+     "Sup3rS3cretValue"),
+    ("credential_assignment", "password: hunter2hunter2", "hunter2hunter2"),
+    ("credential_assignment", 'SECRET_KEY = "k8s-prod-4f9a1c2e"',
+     "k8s-prod-4f9a1c2e"),
+    ("env_line", "DB_PASSWORD=hunter2", "hunter2"),
+])
+def test_shapes_that_used_to_leak(kind, text, secret):
+    clean, report = redact.redact_text(text)
+    assert secret not in clean, clean
+    assert {r.kind for r in report.redactions if r.count} == {kind}, (
+        report.redactions)
+
+
+def test_a_dotenv_secret_keeps_its_name():
+    clean, _ = redact.redact_text("DB_PASSWORD=hunter2hunter2\nDEBUG=1\n")
+    assert clean == "DB_PASSWORD=[REDACTED:env_line]\nDEBUG=1\n"
+
+
+def test_keyword_arguments_and_lookups_are_not_secrets():
+    code = ('db.connect(user=user, password=password)\n'
+            'password = request.form["password"]\n'
+            'token = get_token()\n')
+    clean, report = redact.redact_text(code)
+    assert clean == code and report.total == 0, clean
+
+
+def test_a_masked_value_is_left_alone():
+    assert redact.redact_text('password = "********"')[1].total == 0
+
+
+def test_numbering_can_be_kept_stable_across_a_session():
+    """Numbering restarted per call, so one key was `_2` in one message
+    and unsuffixed in the next. A caller that passes a state keeps it."""
+    state = redact.RedactionState()
+    first, r1 = redact.redact_text("a = AKIAIOSFODNN7EXAMPLE", state=state)
+    second, r2 = redact.redact_text(
+        "b = AKIAJJJJJJJJJJJJJJJJ and a = AKIAIOSFODNN7EXAMPLE", state=state)
+    assert first == "a = [REDACTED:aws_key_id]"
+    assert second == ("b = [REDACTED:aws_key_id_2] and "
+                      "a = [REDACTED:aws_key_id]")
+    assert (r1.total, r2.total) == (1, 1), "a secret is counted once"
+
+
+def test_without_a_state_each_call_stands_alone():
+    one, _ = redact.redact_text("AKIAJJJJJJJJJJJJJJJJ")
+    two, _ = redact.redact_text("AKIAJJJJJJJJJJJJJJJJ")
+    assert one == two == "[REDACTED:aws_key_id]"
+
+
+def test_two_messages_of_one_payload_never_share_a_placeholder():
+    """Within one payload the same secret gets the same placeholder AND
+    different secrets get different ones — across messages too."""
+    clean, report = redact.redact_messages([
+        Message(role="user", content="AKIAIOSFODNN7EXAMPLE"),
+        Message(role="tool", content="AKIAJJJJJJJJJJJJJJJJ",
+                tool_call_id="c"),
+        Message(role="user", content="AKIAIOSFODNN7EXAMPLE again")])
+    assert clean[0].content == "[REDACTED:aws_key_id]"
+    assert clean[1].content == "[REDACTED:aws_key_id_2]"
+    assert clean[2].content == "[REDACTED:aws_key_id] again"
+    assert report.total == 2
+
+
+def test_the_journal_scrubber_catches_a_dotenv_secret():
+    """`env_line` is a real secret shape now, not an advisory one, so the
+    log scrubber (which skips soft kinds) must not skip it."""
+    assert "hunter2hunter2" not in str(
+        redact.scrub_for_log({"line": "API_TOKEN=hunter2hunter2"}))
+
+
+def test_the_documented_shape_count_is_the_real_one():
+    assert f"{len(redact.PATTERNS)} secret shapes" in redact.__doc__
 
 
 # --------------------------------------------------------------------------
@@ -409,3 +543,26 @@ def test_scrub_for_log_is_the_last_defence_for_the_journal():
         {"note": 'key was AKIAIOSFODNN7EXAMPLE', "nested": ["ghp_" + "A" * 36]})
     assert "AKIAIOSFODNN7EXAMPLE" not in str(scrubbed)
     assert "ghp_" + "A" * 36 not in str(scrubbed)
+
+
+def test_one_key_keeps_one_placeholder_across_a_session():
+    """Numbering restarted on every call, so across a session the same key
+    could be `[REDACTED:aws_key_id_2]` in one request and
+    `[REDACTED:aws_key_id]` in the next, and a second key could take the
+    first one's name. The model then reasons about the wrong credential."""
+    CapturingAnthropic.sent = []
+    gate = RemoteGate(RecordingEvents(), AutoApprove(remote=True))
+    gate.enable("anthropic", reason="the operator asked")
+    provider = CapturingAnthropic(api_key="sk-ant-not-a-real-key-000000000000",
+                                  gate=gate, events=RecordingEvents())
+    first = 'A = "AKIAIOSFODNN7EXAMPLE"\n'
+    second = 'B = "AKIAI44QH8DHBEXAMPLE"\n'
+    provider.complete([Message(role="user", content=first + second)])
+    provider.complete([Message(role="user", content=second)])
+    one, two = (repr(p) for p in CapturingAnthropic.sent)
+    marks = re.findall(r"\[REDACTED:[a-z_]+\d*\]", one)
+    assert len(marks) == 2 and marks[0] != marks[1], marks
+    # The second key has the SAME placeholder in the second request.
+    assert marks[1] in two and marks[0] not in two, (marks, two)
+    # And the session total counts two keys, not three sightings.
+    assert gate.redactions == 2, gate.redactions

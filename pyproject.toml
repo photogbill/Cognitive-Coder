@@ -45,14 +45,27 @@ classifiers = [
 # than crashes (C7). The installer's summary names what each missing one
 # costs, in one line, so nobody has to guess.
 llamacpp    = ["llama-cpp-python>=0.3.0"]
-treesitter  = ["tree-sitter>=0.21", "tree-sitter-languages>=1.10"]
+# tree-sitter-languages bundled every grammar in one wheel, but it was
+# archived and is incompatible with tree-sitter >= 0.22: the extra as it
+# was installed cleanly and then raised TypeError in get_parser, so
+# outlines silently stayed pattern-matched. One grammar package per
+# language is what current tree-sitter expects.
+treesitter  = ["tree-sitter>=0.22", "tree-sitter-c>=0.23",
+               "tree-sitter-cpp>=0.23", "tree-sitter-rust>=0.23",
+               "tree-sitter-javascript>=0.23",
+               "tree-sitter-typescript>=0.23", "tree-sitter-go>=0.23",
+               "tree-sitter-java>=0.23"]
 anthropic   = ["anthropic>=0.40"]
 google      = ["google-genai>=0.3"]
 mistral     = ["mistralai>=1.2"]
 openai      = ["openai>=1.50"]
 openrouter  = []                        # OpenAI-compatible; no SDK needed
 tokenizers  = ["mistral-common>=1.5"]   # exact counts live in the HOST (M14)
-dev         = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
+# ruff is PINNED to a minor range. Unpinned, "ruff clean" was true in
+# August and false in September with no line of ours changed — a newer
+# ruff grew new rules. A lint result that depends on install day is not a
+# result; bump the range deliberately, and fix what the bump finds.
+dev         = ["pytest>=8", "pytest-cov>=5", "ruff>=0.16,<0.17"]
 all         = ["cognitive-coder[llamacpp,treesitter,anthropic,google,mistral,openai,tokenizers,dev]"]
 
 [project.scripts]
@@ -99,7 +112,11 @@ force-sort-within-sections = true
 skip-magic-trailing-comma = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# adapters/atk holds test_adapter.py: the ATK Ports tested with no Qt and no
+# ATK. It is part of THIS suite because a Port that breaks the engine's
+# contract is this project's bug. (test_migration.py there is ATK-style —
+# a script with no test_ functions — and CI runs it as one.)
+testpaths = ["tests", "adapters/atk"]
 # Toolchain-conditional tests skip with a printed note rather than failing on
 # a machine that lacks Rust (§9). -ra surfaces those notes.
 addopts = "-ra --strict-markers"
@@ -113,7 +130,16 @@ source = ["cognitive_coder"]
 branch = true
 
 [tool.coverage.report]
-# ≥85% on the core; the parsers and the loop should be near 100% because
-# they are where wrongness hides (§9).
+# The parsers and the loop should be near 100% because they are where
+# wrongness hides (§9). The FLOOR is a measured number, not an aspiration:
+# it was 85 while the suite measured 75.85%, which made CI's full-suite step
+# red on every run and so taught everyone to ignore it. After the
+# September review pass the total measured 86%, so the floor is back at
+# 85 — just under the measured total. Raise it when the total rises.
+#
+# Two toolchain-gated modules are covered only on a machine that has their
+# optional dependency, and are the first place to look if it drops:
+#   providers/local_llamacpp.py    needs llama-cpp-python and a GGUF
+#   codemap/parse_treesitter.py    needs the tree-sitter grammar wheels
 fail_under = 85
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

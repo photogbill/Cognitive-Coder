@@ -19,11 +19,13 @@ code* is still screened by `cognitive_coder.guard` before it is compiled.
 
 Installation into ATK, in order, each step leaving the suite green (§7.3):
 
-    1. copy this file to `atk/core/ccoder_host.py`
-    2. copy `ccoder_panel.py` to `atk/ui/ccoder_panel.py`
-    3. run `python adapters/atk/migrate.py --dry-run` from the CC clone
-    4. run it for real, then ATK's full suite
-    5. only then delete the re-export shims
+    1. run `python adapters/atk/migrate.py --atk <ATK> --dry-run` from the
+       CC clone and read what it would write
+    2. run it with `--apply` — it installs this file as
+       `atk/core/ccoder_host.py`, the panel as `atk/ui/ccoder_panel.py` and
+       `atk_compat.py` as `atk/core/ccoder_compat.py`, and shims the six
+    3. run ATK's full suite
+    4. only then update ATK's imports and delete the re-export shims
 
 Nothing here writes to ATK's `state.db`. A second database FILE is fine; a
 second schema in the same file is not (§7.1).
@@ -31,16 +33,18 @@ second schema in the same file is not (§7.1).
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+import hashlib
+import json
+import logging
 import os
 from pathlib import Path
 import shutil
-import signal
-import subprocess
+import stat
 import sys
-import tempfile
+import threading
 import time
-from typing import Any, Callable
+from typing import Any
 
 # The engine itself imports nothing from ATK, which is why this import is
 # one-directional and safe.
@@ -52,9 +56,13 @@ from cognitive_coder import (
     Session,
     SessionConfig,
 )
-from cognitive_coder.ports import Host
+from cognitive_coder.ports import Host, SubprocessExec
+from cognitive_coder.runner import scrubbed_env
 
-MAX_OUTPUT = 200_000
+#: Where the adapter records what it cannot say through a port — chiefly a
+#: port callable that itself raised. ATK's own logging configuration decides
+#: where that lands.
+_log = logging.getLogger(__name__)
 
 
 # ==========================================================================
@@ -68,18 +76,42 @@ class ATKLLM:
     ceiling — the cognitive core and Whisper are mutually exclusive, and the
     swap button belongs to ATK (§0.1, §7.1). This class asks what is loaded
     and works with the answer.
+
+    `events` is an optional `(kind, message)` callable — the host's
+    EventPort, in practice — for the things worth saying that are not
+    failures of the call: nothing loaded, a tokenizer that broke, ATK's
+    think-splitter failing. None of them may raise out of here (M11).
     """
 
     name = "atk"
     is_remote = False
 
-    def __init__(self, engine: Any, *,
-                 n_ctx_default: int = 16384) -> None:
+    def __init__(self, engine: Any, *, n_ctx_default: int = 16384,
+                 events: Callable[[str, str], None] | None = None) -> None:
         self.engine = engine
         self._n_ctx_default = n_ctx_default
+        self._events = events
         self._tokenizer: Any = None
-        self._tokenizer_tried = False
+        #: Which model the tokenizer decision was made for. A swap in ATK's
+        #: Setup page changes the answer: a Mistral tokenizer kept after a
+        #: switch to Qwen counts the wrong vocabulary, EXACTLY, and says it
+        #: is not an estimate.
+        self._tokenizer_for: str | None = None
+        self._warned: set[str] = set()
         self.last_prompt_ms = 0
+
+    def _say(self, message: str, *, once: str = "") -> None:
+        if once:
+            if once in self._warned:
+                return
+            self._warned.add(once)
+        if self._events is not None:
+            try:
+                self._events("warning", message)
+            except Exception:                            # noqa: BLE001
+                # The EventPort contract says it does not raise; if it does
+                # anyway, the build matters more than the message.
+                _log.exception("the events callable raised")
 
     # -- generation -------------------------------------------------------
     def complete(self, messages: Sequence[Message], *, tools: Sequence = (),
@@ -94,6 +126,14 @@ class ATKLLM:
         checked between chunks, giving ATK's Stop button a response time of
         one token rather than one generation.
 
+        **Prefill and decode are timed apart.** The stream's first chunk is
+        the boundary: everything before it is prompt processing (`prompt_ms`,
+        the number G.7.5 reads to tell whether the prefix cache held), and
+        everything after it is generation (`decode_ms`). This adapter used to
+        report the whole call as `prompt_ms` and `decode_ms=0` — so on the
+        one host the timings were measured on, the cache check read a number
+        that tracked output length instead.
+
         **This never raises on a model refusal** (M11). An engine error comes
         back as `finish_reason="error"` with the sentence on the EventPort,
         because a refusal is data the loop can act on and an exception is a
@@ -105,70 +145,88 @@ class ATKLLM:
 
         if not getattr(self.engine, "is_loaded", False):
             # M10: a normal, reportable state — not an exception.
-            return Completion(text="", finish_reason="error",
-                              model="")
+            self._say("No model is loaded in ATK, so nothing was generated. "
+                      "Load one in Setup.", once="unloaded")
+            return Completion(text="", finish_reason="error", model="")
 
-        payload = [{"role": m.role, "content": m.content}
-                   for m in messages if m.role != "tool"]
-        # ATK's chat template has no tool role; a tool result is folded into
-        # the user turn rather than dropped, because dropping it makes the
-        # model answer a question it was never shown the answer to.
-        for m in messages:
-            if m.role == "tool":
-                payload.append({"role": "user",
-                                "content": f"[tool result]\n{m.content}"})
+        # ATK's chat template has no tool role, so a tool result becomes a
+        # user turn IN PLACE. It was appended after every other message,
+        # which moved the answer to a question below the questions asked
+        # after it.
+        payload = [{"role": "user", "content": f"[tool result]\n{m.content}"}
+                   if m.role == "tool" else
+                   {"role": m.role, "content": m.content}
+                   for m in messages]
 
         t0 = time.monotonic()
+        first: float | None = None
         chunks: list[str] = []
         cancelled = False
+        failed: Exception | None = None
         try:
             for token in self.engine.chat_stream(
                     payload, temperature=temperature, max_tokens=max_tokens):
+                if first is None:
+                    first = time.monotonic()
                 if cancel is not None and cancel.is_set():
                     cancelled = True
                     break
                 chunks.append(token)
-        except Exception:                                # noqa: BLE001
-            return Completion(text="".join(chunks), finish_reason="error",
-                              model=self._model_name(),
-                              prompt_ms=int((time.monotonic() - t0) * 1000))
-
+        except Exception as exc:                         # noqa: BLE001
+            # llama-cpp can raise anything from inside a generator; M11
+            # says it comes back as data, and the sentence goes out.
+            failed = exc
+        end = time.monotonic()
+        prompt_ms = int(((first if first is not None else end) - t0) * 1000)
+        decode_ms = int((end - first) * 1000) if first is not None else 0
+        self.last_prompt_ms = prompt_ms
         raw = "".join(chunks)
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        self.last_prompt_ms = elapsed_ms
+        if failed is not None:
+            self._say(f"ATK's model stopped with an error mid-reply "
+                      f"({failed}); the attempt is reported as failed.")
+            return Completion(text=raw, finish_reason="error",
+                              model=self._model_name(), prompt_ms=prompt_ms,
+                              decode_ms=decode_ms)
 
-        # ATK's `split_think` handles both `[THINK]…[/THINK]` (Magistral) and
-        # `<think>…</think>`, closed or unclosed. The core strips think tags
-        # too, but doing it here means ATK's own richer handling wins, and
-        # the reasoning stays available for the panel to display (D13, M37).
-        answer = raw
-        try:
-            from atk.core.llm_engine import split_think
-            _reasoning, answer = split_think(raw)
-        except Exception:                                # noqa: BLE001
-            pass
-
-        finish = "cancelled" if cancelled else (
-            "length" if len(answer) and max_tokens and
-            self._looks_truncated(answer, max_tokens) else "stop")
+        answer = self._split_think(raw)
+        # Tokens GENERATED, reasoning included: that is what `max_tokens`
+        # bounds. D1 wants truncation read from the finish reason, and ATK's
+        # stream carries none, so it is inferred from the one number that
+        # decides it. It was inferred from characters (len >= 3.2 per token)
+        # instead, which called a complete 7,200-character file at 2,048
+        # tokens "length" while the same Completion said tokens_out=1,800.
+        generated = self.count_tokens(raw) if raw else 0
+        finish = ("cancelled" if cancelled else
+                  "length" if max_tokens and generated >= max_tokens else
+                  "stop")
         return Completion(
             text=answer, finish_reason=finish,
             tokens_in=self.count_tokens(
                 "\n".join(m.content for m in messages)),
-            tokens_out=self.count_tokens(answer),
-            model=self._model_name(), prompt_ms=elapsed_ms)
+            tokens_out=generated, model=self._model_name(),
+            prompt_ms=prompt_ms, decode_ms=decode_ms)
 
-    @staticmethod
-    def _looks_truncated(text: str, max_tokens: int) -> bool:
-        """ATK's stream does not report a finish reason, so estimate it.
+    def _split_think(self, raw: str) -> str:
+        """ATK's `split_think`, when ATK is there; the raw reply otherwise.
 
-        D1 says truncation is detected STRUCTURALLY, and `finish_reason` is
-        the signal. ATK's API does not carry one, so this is the honest
-        approximation — and the loop's unbalanced-delimiter backstop catches
-        what it misses. Better an approximation that is usually right than a
-        `"stop"` that is confidently wrong.
+        It handles `[THINK]…[/THINK]` (Magistral) and `<think>…</think>`,
+        closed or unclosed. The core strips think tags too, but doing it here
+        means ATK's richer handling wins and the reasoning stays available
+        for the panel (D13, M37). Outside ATK — the CC clone, the tests —
+        the import fails and that is expected, not worth a word.
         """
-        return len(text) >= max_tokens * 3.2
+        try:
+            from atk.core.llm_engine import split_think
+        except ImportError:
+            return raw
+        try:
+            _reasoning, answer = split_think(raw)
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"ATK's split_think failed ({exc}); the reply is used "
+                      f"as it came and the core strips think tags itself.",
+                      once="split_think")
+            return raw
+        return answer
 
     def stream(self, messages: Sequence[Message], **kw) -> Iterator[str]:
         payload = [{"role": m.role, "content": m.content} for m in messages]
@@ -180,7 +238,9 @@ class ATKLLM:
                 if cancel is not None and cancel.is_set():
                     return
                 yield token
-        except Exception:                                # noqa: BLE001
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"ATK's model stopped with an error mid-stream "
+                      f"({exc}).")
             return
 
     # -- capabilities -----------------------------------------------------
@@ -228,26 +288,37 @@ class ATKLLM:
         if tokenizer is not None:
             try:
                 return len(tokenizer.encode(text or ""))
-            except Exception:                            # noqa: BLE001
-                pass
+            except Exception as exc:                     # noqa: BLE001
+                self._say(f"The Mistral tokenizer failed ({exc}); counting "
+                          f"with the loaded model's own tokenizer instead.",
+                          once="tokenizer")
         try:
             return len(self.engine._llm.tokenize((text or "").encode("utf-8")))
         except Exception:                                # noqa: BLE001
+            # No llama.cpp handle (unloaded, or a stub engine): the stated
+            # estimate, which capabilities() declares as one (M14).
             return max(1, len(text or "") // 4)
 
     def _get_tokenizer(self) -> Any:
-        if self._tokenizer_tried:
+        model = self._model_name()
+        if self._tokenizer_for == model:
             return self._tokenizer
-        self._tokenizer_tried = True
-        family = _family(self._model_name())
-        if family != "mistral":
+        self._tokenizer_for = model
+        self._tokenizer = None
+        if _family(model) != "mistral":
             return None
         try:
             from mistral_common.tokens.tokenizers.mistral import (
-                MistralTokenizer)
+                MistralTokenizer,
+            )
+        except ImportError:
+            return None             # not installed: the fallback is stated
+        try:
             self._tokenizer = MistralTokenizer.v3().instruct_tokenizer
-        except Exception:                                # noqa: BLE001
-            self._tokenizer = None
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"mistral-common is installed but its tokenizer could "
+                      f"not be built ({exc}); token counts fall back.",
+                      once="tokenizer-build")
         return self._tokenizer
 
     def _tokenizer_is_estimate(self) -> bool:
@@ -313,13 +384,22 @@ class ATKFileSystem:
         """
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".cc-",
-                                   suffix=".tmp")
+        # The target's permission bits survive the swap (docs/PORTS.md,
+        # FileSystemPort 5): mkstemp makes 0600, and os.replace put THAT in
+        # the target's place, so a 755 script lost its execute bit on every
+        # edit. A new file gets the ordinary 0666-less-umask default.
+        try:
+            keep: int | None = stat.S_IMODE(os.stat(target).st_mode)
+        except OSError:
+            keep = None
+        fd, tmp = _create_temp_beside(target)
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(content)
                 fh.flush()
                 os.fsync(fh.fileno())
+            if keep is not None:
+                os.chmod(tmp, keep)
             os.replace(tmp, target)
         except BaseException:
             try:
@@ -327,6 +407,14 @@ class ATKFileSystem:
             except OSError:
                 pass
             raise
+
+    def append_bytes(self, path: str, data: bytes) -> None:
+        """The optional append (docs/PORTS.md): the journal and the build
+        log cost what they add, instead of a read-and-rewrite per event."""
+        target = self._resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "ab") as fh:
+            fh.write(data)
 
     def read(self, path: str) -> str:
         return self.read_bytes(path).decode("utf-8", errors="replace")
@@ -388,95 +476,58 @@ class ATKExec:
 
     def __init__(self, *, extra_env: dict | None = None) -> None:
         self._extra = dict(extra_env or {})
+        self._exec = SubprocessExec(scrub_env=False)
 
     def run(self, argv: Sequence[str], *, cwd: str, timeout: float,
             stdin: str = "", env: dict | None = None) -> ProcResult:
-        argv = [str(a) for a in argv]
-        environment = dict(env or {})
-        environment.update(self._extra)
-        t0 = time.monotonic()
+        """Run one command; kill the whole tree at the timeout (M16).
 
-        kwargs: dict[str, Any] = {}
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
-        else:
-            # A new process GROUP is what makes taskkill /T able to find the
-            # children. Without it, a terminated cmd.exe leaves them running.
-            kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        `timeout` 0 (or less) means WAIT, as `types.Timeouts` defines it and
+        `ports.SubprocessExec` honours it. It was handed to `communicate`
+        as 0, which expires at once: a two-line script came back killed,
+        exit -9, "this exceeded 0s" — for an operator who had asked for no
+        limit at all.
 
-        try:
-            proc = subprocess.Popen(
-                argv, cwd=cwd, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                env=environment or None, **kwargs)
-        except (OSError, ValueError) as exc:
-            return ProcResult(exit_code=-1, stderr=f"could not run: {exc}",
-                              duration_s=time.monotonic() - t0)
-
-        try:
-            out, err = proc.communicate(input=stdin or None, timeout=timeout)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            self._kill_tree(proc)
-            try:
-                out, err = proc.communicate(timeout=5)
-            except Exception:                            # noqa: BLE001
-                out, err = "", ""
-            err = (err or "") + (
-                f"\ncognitive-coder: this exceeded {timeout:.0f}s and the "
-                f"whole process tree was killed. Godot and MSVC both spawn "
-                f"children that outlive their parent, which is why the tree "
-                f"and not just the process is killed.")
-            timed_out = True
-
-        out, cut_a = _cap(out or "")
-        err, cut_b = _cap(err or "")
-        return ProcResult(
-            exit_code=proc.returncode if not timed_out else -9,
-            stdout=out, stderr=err, duration_s=time.monotonic() - t0,
-            timed_out=timed_out, truncated=cut_a or cut_b)
-
-    @staticmethod
-    def _kill_tree(proc: subprocess.Popen) -> None:
-        """M16. On Windows a terminated shell does not take its children.
-
-        An orphaned Godot instance holding a file lock is the observed
-        failure this exists to prevent, and it is why `timed_out=True` is an
-        attestation rather than a note.
+        No `env` (None or empty) means the SCRUBBED environment, never the
+        inherited one. `env or {}` became `env=None` at Popen, which means
+        "inherit everything": API keys, tokens and proxy variables reached
+        every scanner the review stage runs, and a proxy variable is a
+        network path C3 does not allow.
         """
-        if os.name == "posix":
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                return
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        else:
-            taskkill = shutil.which("taskkill")
-            if taskkill:
-                try:
-                    subprocess.run(
-                        [taskkill, "/T", "/F", "/PID", str(proc.pid)],
-                        capture_output=True, timeout=10,
-                        creationflags=getattr(subprocess,
-                                              "CREATE_NO_WINDOW", 0))
-                    return
-                except Exception:                        # noqa: BLE001
-                    pass
-        try:
-            proc.kill()
-        except Exception:                                # noqa: BLE001
-            pass
+        environment = dict(env) if env else scrubbed_env(cwd, cwd)
+        environment.update(self._extra)
+        # The running itself is the core's. This class kept its own copy
+        # of the capture code, and with it every defect the core has since
+        # lost: `communicate()` buffered all output, so a generated program
+        # printing in a loop ran ATK out of memory before its timeout; the
+        # locale codec raised on a single invalid byte; and the head-only
+        # cap cut away the FAIL line of a long test run. One
+        # implementation, tested once, is the fix — the policy that is
+        # ATK's (its environment, its extra variables) stays here.
+        return self._exec.run(argv, cwd=cwd, timeout=timeout, stdin=stdin,
+                              env=environment)
 
     def which(self, binary: str) -> str | None:
         return shutil.which(binary)
 
 
-def _cap(text: str) -> tuple[str, bool]:
-    if len(text) <= MAX_OUTPUT:
-        return text, False
-    return (text[:MAX_OUTPUT] + f"\n… truncated at {MAX_OUTPUT:,} characters. "
-            f"A program producing this much output is usually looping.", True)
+def _create_temp_beside(target: Path) -> tuple[int, str]:
+    """An exclusive temp file in `target`'s directory, mode 0666 − umask.
+
+    Not `mkstemp`, which always makes 0600: a NEW file written through it
+    would be private to its owner, unlike anything `open()` makes. And not
+    by reading the umask either — `os.umask` can only be read by setting
+    it, and that is process-wide, in a process full of threads.
+    """
+    import uuid
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    while True:
+        tmp = str(target.parent / f".cc-{uuid.uuid4().hex[:12]}.tmp")
+        try:
+            return os.open(tmp, flags, 0o666), tmp
+        except FileExistsError:
+            continue
 
 
 # ==========================================================================
@@ -484,53 +535,129 @@ def _cap(text: str) -> tuple[str, bool]:
 # ==========================================================================
 
 class ATKStorage:
-    """Maps onto ATK's settings dict and data directory (§7.1).
+    """Maps onto ATK's settings dict and data directory (§7.1), per project.
 
-    Two rules from the conflict table, both load-bearing:
+    Three rules, all load-bearing:
 
       * **Never write to ATK's `state.db`.** A second database FILE is fine;
         a second schema in the same file is not. `sqlite_path` returns a
         separate file under ATK's data dir.
       * **The core never reads ATK settings directly.** It has no way to —
         it holds this object and nothing else, which is the point of C2.
+      * **One bucket per PROJECT.** The bucket and the SQLite directory were
+        keyed by name alone, so project B opened project A's codemap and
+        appended to A's transaction log. They are keyed by the first 12 hex
+        digits of the SHA-256 of the resolved project root:
+        `settings["ccoder"]["projects"][<key>]` and `<DATA_DIR>/ccoder/<key>/`.
+
+    **The worker thread never touches `ctx.settings`.** `set()` was called
+    from the build's worker thread and called `save_settings()` every time,
+    with failures swallowed: dozens of whole-settings writes per task, racing
+    the GUI thread's own, and a failed save invisible. Now `get`/`set` work
+    on a private copy under a lock, and `flush()` — which the panel calls on
+    the GUI thread after each patch and at the end of a build — writes it
+    back and saves once, and SAYS so through `report` when the save fails.
+    A crash mid-build therefore loses at most the log rows since the last
+    flush; the snapshots and the journal are on disk regardless.
     """
 
-    def __init__(self, ctx: Any, data_dir: str | Path, *,
-                 namespace: str = "ccoder") -> None:
+    def __init__(self, ctx: Any, data_dir: str | Path,
+                 project_root: str | Path, *, namespace: str = "ccoder",
+                 report: Callable[[str], None] | None = None) -> None:
         self._ctx = ctx
         self._namespace = namespace
-        self._dir = Path(data_dir) / "ccoder"
+        self._report = report
+        self.root = str(Path(project_root).expanduser().resolve())
+        self.key = project_key(self.root)
+        self._dir = Path(data_dir) / "ccoder" / self.key
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        # Read without creating anything: construction must not change
+        # ATK's settings, only a flush may.
+        bucket = (getattr(ctx, "settings", None) or {}).get(namespace) or {}
+        saved = (bucket.get("projects") or {}).get(self.key) or {}
+        self._data: dict[str, Any] = json.loads(
+            json.dumps(saved.get("state") or {}))
+        self._dirty = False
 
-    def _bucket(self) -> dict:
+    def _projects(self) -> dict:
+        """ATK's settings for every project. GUI thread only."""
         settings = getattr(self._ctx, "settings", None)
         if settings is None:
             self._ctx.settings = settings = {}
-        return settings.setdefault(self._namespace, {})
+        return settings.setdefault(self._namespace, {}).setdefault(
+            "projects", {})
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self._bucket().get(key, default)
+        with self._lock:
+            if key not in self._data:
+                return default
+            # A copy: the GUI thread serialises this dict in flush(), and a
+            # caller mutating a shared object mid-dump is a RuntimeError.
+            return json.loads(json.dumps(self._data[key]))
 
     def set(self, key: str, value: Any) -> None:
-        import json
         try:
-            json.dumps(value)
+            text = json.dumps(value)
         except (TypeError, ValueError) as exc:
             # M17. Failing here, at the moment of the mistake, beats failing
             # three days later when ATK cannot persist its settings.
             raise ValueError(
                 f"StoragePort values must be JSON-serialisable; {key!r} is "
                 f"not ({exc}).") from exc
-        self._bucket()[key] = value
+        with self._lock:
+            self._data[key] = json.loads(text)
+            self._dirty = True
+
+    def flush(self) -> bool:
+        """Write this project's state into ATK's settings and save. GUI only.
+
+        Returns False, after saying why through `report`, when ATK's save
+        fails; the state stays dirty and the next flush tries again.
+        """
+        with self._lock:
+            if not self._dirty:
+                return True
+            snapshot = json.loads(json.dumps(self._data))
+            self._dirty = False
+        self._projects()[self.key] = {"root": self.root, "state": snapshot}
         save = getattr(self._ctx, "save_settings", None)
-        if callable(save):
-            try:
-                save()
-            except Exception:                            # noqa: BLE001
-                pass
+        if not callable(save):
+            return True
+        try:
+            save()
+        except Exception as exc:                         # noqa: BLE001
+            # ATK's save can fail in any way its storage can; whatever the
+            # type, the operator is TOLD, which is what swallowing it lost.
+            with self._lock:
+                self._dirty = True
+            _say(self._report,
+                 f"Cognitive Coder could not save its history for "
+                 f"{self.root} into ATK's settings ({exc}). It is kept in "
+                 f"memory and will be saved again after the next change.")
+            return False
+        return True
 
     def sqlite_path(self, name: str) -> str:
         return str(self._dir / f"{name}.sqlite3")
+
+
+def project_key(root: str | Path) -> str:
+    """The per-project key: 12 hex digits of SHA-256 of the resolved root."""
+    resolved = str(Path(root).expanduser().resolve())
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+
+
+def _say(report: Callable[[str], None] | None, message: str) -> None:
+    """Hand a sentence to a callable that must not take the build down."""
+    if report is None:
+        _log.warning("%s", message)
+        return
+    try:
+        report(message)
+    except Exception:                                    # noqa: BLE001
+        _log.exception("the report callable raised; the message was: %s",
+                       message)
 
 
 # ==========================================================================
@@ -579,18 +706,20 @@ class ATKEvents:
             if self._console:
                 self._console(kind, message)
         except Exception:                                # noqa: BLE001
-            # An EventPort that raises must not take the build down with it.
-            # ATK's progress bar is not more important than the operator's
-            # code.
-            pass
+            # An EventPort that raises must not take the build down with it
+            # — ATK's progress bar is not more important than the operator's
+            # code. But a panel callback that raises is a bug in the panel,
+            # and it goes to ATK's log with its traceback rather than away.
+            _log.exception("a Cognitive Coder panel callback raised on a %r "
+                           "event: %s", kind, message)
 
 
 # ==========================================================================
-# ApprovalPort → auto-apply for diffs, a real prompt for the network
+# ApprovalPort → a real question, asked on the GUI thread
 # ==========================================================================
 
 class ATKApproval:
-    """The owner has chosen auto-apply with undo. Remote is a different question.
+    """Diffs: auto-apply if the operator chose it, else ask. Remote: ask.
 
     §6.5's settled position: the LIBRARY default is approval-required, and
     auto-apply is opt-in behind an advanced setting with an explicit warning.
@@ -599,10 +728,14 @@ class ATKApproval:
 
     Auto-apply is only safe BECAUSE snapshots and transactional undo exist.
     If anyone ever finds themselves removing the snapshot step, they should
-    remove this class's `auto_apply` default first.
+    remove this class's `auto_apply` option first.
 
     **`approve_remote` is never auto-approved**, whatever the diff setting
     says. C3 is ATK's core promise and it does not get a convenient default.
+
+    Both questions are called on the build's WORKER thread. The callables
+    are expected to marshal to the GUI thread themselves — `AskOnGuiThread`
+    below is how the panel does it.
     """
 
     def __init__(self, *, auto_apply: bool = False,
@@ -629,6 +762,144 @@ class ATKApproval:
         return bool(self._ask_remote(provider, bytes_out, estimate))
 
 
+class AskOnGuiThread:
+    """Run a dialog on the GUI thread, from whichever thread is asking.
+
+    The panel built its `QMessageBox` on the WORKER thread — the classic Qt
+    crash, on the one path (C3's remote question) that always asks. And with
+    no diff callable at all, a fresh install refused every change without a
+    word. This is the marshalling, Qt-free so it can be tested:
+
+      * `on_gui_thread()` — is the caller already on the GUI thread? The
+        panel passes `QThread.currentThread() is app.thread()`.
+      * `post(job)` — run `job` on the GUI thread and return once it has.
+        The panel passes a signal's `emit`, connected with
+        `Qt.BlockingQueuedConnection`.
+
+    A blocking queued call to one's OWN thread deadlocks, so a caller that
+    is already on the GUI thread runs the dialog directly. A dialog that
+    raises, or a post that never ran it, is a NO: nothing is approved by
+    accident.
+    """
+
+    def __init__(self, *, on_gui_thread: Callable[[], bool],
+                 post: Callable[[Callable[[], None]], None],
+                 report: Callable[[str], None] | None = None) -> None:
+        self._on_gui_thread = on_gui_thread
+        self._post = post
+        self._report = report
+
+    def __call__(self, dialog: Callable[[], bool]) -> bool:
+        box: dict[str, Any] = {}
+
+        def job() -> None:
+            try:
+                box["answer"] = bool(dialog())
+            except Exception as exc:                     # noqa: BLE001
+                box["error"] = exc
+
+        if self._on_gui_thread():
+            job()
+        else:
+            self._post(job)
+        if "error" in box:
+            _say(self._report, f"The approval dialog failed "
+                               f"({box['error']}), so the answer is no and "
+                               f"nothing was approved.")
+            return False
+        return bool(box.get("answer", False))
+
+    def for_diff(self, dialog: Callable[[str, str], bool]
+                 ) -> Callable[[str, str], bool]:
+        return lambda summary, diff: self(lambda: dialog(summary, diff))
+
+    def for_remote(self, dialog: Callable[[str, int, str], bool]
+                   ) -> Callable[[str, int, str], bool]:
+        return lambda provider, size, estimate: self(
+            lambda: dialog(provider, size, estimate))
+
+
+# ==========================================================================
+# small, Qt-free pieces of the panel — here so they can be tested
+# ==========================================================================
+
+def change_log(session: Any, *, limit: int = 10) -> str:
+    """The diffs of the most recent transactions, from the public history.
+
+    Read from `session.history()` and each transaction's snapshot
+    MANIFEST, which is where the patcher keeps the diff. The panel used
+    to iterate `session.patcher._open` — a private attribute that is one
+    Transaction or None, never a list — so every patch event raised
+    TypeError, and the codemap and recommendation refreshes after it never
+    ran. A transaction that is still open has no manifest yet and simply
+    appears on the next refresh.
+    """
+    parts: list[str] = []
+    records = [r for r in session.history()
+               if r.state != "rollback_of" and r.snapshot_dir]
+    for rec in records[-limit:]:
+        try:
+            manifest = session.host.fs.read(f"{rec.snapshot_dir}/MANIFEST.txt")
+        except (OSError, ValueError):
+            continue            # not committed yet, or pruned
+        _, _, diff = manifest.partition("--- what changed ---\n")
+        if diff.strip():
+            parts.append(f"# transaction {rec.seq} · {rec.state}"
+                         f"{' · sealed' if rec.sealed else ''} · "
+                         f"{', '.join(rec.files)}\n{diff.rstrip()}\n")
+    return "\n".join(parts)
+
+
+def project_root_for(ctx: Any) -> tuple[Path | None, str]:
+    """The folder a build may write into, or None and the sentence why not.
+
+    The panel fell back to `Path.cwd()` when ATK had no project set — and
+    ATK's working directory is ATK's own checkout, so the generator was
+    aimed at ATK's source tree. There is no safe default folder, so there
+    is no default: no project, no build. A folder that CONTAINS ATK's own
+    package is refused for the same reason.
+    """
+    raw = getattr(ctx, "project_root", None)
+    if not raw:
+        return None, ("No project folder is set, so nothing was built. "
+                      "Choose one first — Cognitive Coder will not guess, "
+                      "because its guess was once ATK's own source tree.")
+    root = Path(raw).expanduser().resolve()
+    atk = _atk_package_dir()
+    if atk is not None and (root == atk or root in atk.parents
+                            or atk in root.parents):
+        return None, (f"{root} holds ATK's own source ({atk}), so nothing "
+                      f"was built. Choose a project folder outside it.")
+    return root, ""
+
+
+def _atk_package_dir() -> Path | None:
+    """Where the running ATK's `atk` package is, if it is importable."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("atk")
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+    if spec.origin and spec.origin not in ("namespace", "built-in"):
+        return Path(spec.origin).resolve().parent
+    locations = list(spec.submodule_search_locations or [])
+    return Path(locations[0]).resolve() if locations else None
+
+
+def failure_line(detail: str) -> str:
+    """The last non-blank line of a failure's detail, for the console.
+
+    `detail.strip().splitlines()[-1]` raised IndexError on an empty detail,
+    inside the very slot that reports failures.
+    """
+    lines = [ln for ln in (detail or "").splitlines() if ln.strip()]
+    return (lines[-1].strip() if lines
+            else "no detail was given — see ATK's log")
+
+
 # ==========================================================================
 # putting it together
 # ==========================================================================
@@ -648,15 +919,23 @@ def build_host(ctx: Any, engine: Any, project_root: str | Path, *,
         try:
             from atk.config import DATA_DIR
             data_dir = DATA_DIR
-        except Exception:                                # noqa: BLE001
+        except ImportError:
+            # Outside ATK (the tests, the CC clone): beside the project,
+            # never in the working directory.
             data_dir = Path(project_root) / ".atk"
+    events = ATKEvents(status=status, console=console, flow=flow,
+                       remote_banner=remote_banner)
+
+    def warn(message: str) -> None:
+        events.event("warning", message)
+
     return Host(
-        llm=ATKLLM(engine),
+        llm=ATKLLM(engine, events=lambda kind, message:
+                   events.event(kind, message)),
         fs=ATKFileSystem(project_root, on_refusal=status),
         exec=ATKExec(),
-        storage=ATKStorage(ctx, data_dir),
-        events=ATKEvents(status=status, console=console, flow=flow,
-                         remote_banner=remote_banner),
+        storage=ATKStorage(ctx, data_dir, project_root, report=warn),
+        events=events,
         approval=ATKApproval(auto_apply=auto_apply, ask_diff=ask_diff,
                              ask_remote=ask_remote))
 
@@ -718,7 +997,9 @@ def preflight(engine: Any, project_root: str | Path) -> list[str]:
             "git and keeps its own snapshots in .cc_snapshots/, so your "
             "history, stash and index are untouched — but a clean working "
             "tree makes the diffs easier to read.")
-    if sys.version_info < (3, 11):
+    # ruff's target-version is OUR floor; this runs under ATK's interpreter,
+    # which nothing here chose. The check is the point, not dead code.
+    if sys.version_info < (3, 11):                       # noqa: UP036
         notes.append(
             f"This interpreter is {sys.version_info.major}."
             f"{sys.version_info.minor}; Cognitive Coder needs 3.11 or later.")

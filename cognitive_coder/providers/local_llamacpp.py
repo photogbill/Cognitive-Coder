@@ -21,15 +21,17 @@ Two behaviours worth knowing about:
     nothing. The core never drives a model swap — that is the host's button
     (§0.1, M10) — but if the host wants to preserve a prefix across one, this
     is the mechanism it needs.
-  * **`prompt_ms` is measured** (M55). llama-cpp-python reports timings in its
-    own way; where it doesn't, the eval time either side of the call is
-    measured, because a number that is only approximately right still catches
-    a 3-second prefix turning into 90.
+  * **`prompt_ms` is measured** (M55), by streaming: time to the first token
+    is prefill, the rest is decode. `Llama` has no `get_timings()` (the old
+    code called it and always fell back to the whole call), so the
+    non-streaming fallback reads llama.cpp's perf counters where the binding
+    exposes them and otherwise reports `decode_ms=0`, meaning "not split".
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+import dataclasses
 import time
 from typing import Any
 
@@ -37,7 +39,14 @@ from ..errors import ConfigurationError
 from ..types import Completion, Message, ModelCapabilities, ToolSpec
 from .base import (
     ProviderBase,
+    StreamAccumulator,
+    _as_int,
+    _as_ms,
+    as_dict,
+    error_detail,
     family_for,
+    first_choice,
+    map_finish,
     messages_to_openai,
     parse_tool_calls,
     supports_fim,
@@ -121,46 +130,87 @@ class LocalLlamaCpp(ProviderBase):
                 # makes the cost visible (C7, D9).
                 pass
 
+        # Streamed, for the same reason as `openai_compatible`: the time to
+        # the first token is prefill, the rest is decode. The old path timed
+        # one blocking call and then asked `self.llama.get_timings()` for the
+        # split — a method `Llama` does not have — so `prompt_ms` was always
+        # the whole call and `decode_ms` was never set.
+        t0 = time.monotonic()
+        try:
+            chunks = self.llama.create_chat_completion(stream=True, **kwargs)
+            acc = StreamAccumulator(t0, self._name)
+            for chunk in chunks:
+                if cancel is not None and cancel.is_set():
+                    return self.cancelled(self._name)
+                acc.feed(chunk, time.monotonic())
+            out = dataclasses.replace(acc.completion(time.monotonic()),
+                                      model=self._name)
+            self.last_prompt_ms = out.prompt_ms
+            return out
+        except Exception:                                # noqa: BLE001
+            # Some chat handlers cannot stream with tools; the call is made
+            # again whole rather than failed. Anything that fails both ways
+            # was never about streaming.
+            pass
+
         t0 = time.monotonic()
         try:
             data = self.llama.create_chat_completion(**kwargs)
-        except Exception:                                # noqa: BLE001
-            return Completion(text="", finish_reason="error",
-                              model=self._name,
-                              prompt_ms=int((time.monotonic() - t0) * 1000))
+        except Exception as exc:                         # noqa: BLE001
+            detail = error_detail({"error": f"{type(exc).__name__}: {exc}"})
+            return self.failed(
+                f"llama.cpp could not generate an answer ({detail}). "
+                f"Nothing was generated.", model=self._name,
+                prompt_ms=int((time.monotonic() - t0) * 1000))
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        usage = data.get("usage") or {}
-        calls = parse_tool_calls(msg.get("tool_calls") or ())
-        finish = str(choice.get("finish_reason") or "stop")
-        finish = {"length": "length", "tool_calls": "tool_calls"}.get(
-            finish, "stop")
-        if calls and finish != "length":
-            finish = "tool_calls"
-        prompt_ms = self._prompt_ms(elapsed_ms)
+        choice = first_choice(data)
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            return self.failed(
+                "llama.cpp answered in a shape that is not a chat "
+                "completion (no choices[0].message). Nothing was "
+                "generated.", model=self._name, prompt_ms=elapsed_ms)
+        usage = as_dict(data.get("usage"))
+        calls = parse_tool_calls([c for c in msg.get("tool_calls") or ()
+                                  if isinstance(c, dict)])
+        prompt_ms, decode_ms = self._perf(elapsed_ms)
         self.last_prompt_ms = prompt_ms
         return Completion(
             text=str(msg.get("content") or ""), tool_calls=calls,
-            finish_reason=finish,
-            tokens_in=int(usage.get("prompt_tokens") or 0),
-            tokens_out=int(usage.get("completion_tokens") or 0),
-            model=self._name, prompt_ms=prompt_ms)
+            finish_reason=map_finish(str(choice.get("finish_reason") or ""),
+                                     bool(calls)),
+            tokens_in=_as_int(usage.get("prompt_tokens")),
+            tokens_out=_as_int(usage.get("completion_tokens")),
+            model=self._name, prompt_ms=prompt_ms, decode_ms=decode_ms)
 
-    def _prompt_ms(self, fallback_ms: int) -> int:
-        """Prompt-processing time, from the library where it exposes it."""
+    def _perf(self, fallback_ms: int) -> tuple[int, int]:
+        """(prefill, decode) ms from llama.cpp's own counters, if reachable.
+
+        llama-cpp-python exposes them only through the low-level binding
+        (`llama_perf_context` on current builds, `llama_get_timings` on old
+        ones), on the context the `Llama` object holds privately. Where
+        neither is reachable the whole call is reported as `prompt_ms` with
+        `decode_ms` 0 — which `cache_health()` reads as "cannot tell", the
+        honest answer — rather than a guessed split.
+        """
         try:
-            timings = self.llama.get_timings()           # newer builds
-            value = int(float(timings.get("prompt_ms", 0)))
-            if value:
-                return value
+            import llama_cpp  # noqa: PLC0415 — optional, see module doc
+            ctx = self.llama._ctx.ctx
+            for fn in ("llama_perf_context", "llama_get_timings"):
+                if hasattr(llama_cpp, fn):
+                    perf = getattr(llama_cpp, fn)(ctx)
+                    p = _as_ms(getattr(perf, "t_p_eval_ms", None))
+                    d = _as_ms(getattr(perf, "t_eval_ms", None))
+                    if p is not None:
+                        return p, d or 0
         except Exception:                                # noqa: BLE001
             pass
-        return fallback_ms
+        return fallback_ms, 0
 
     def stream(self, messages: Sequence[Message], **kw) -> Iterator[str]:
         cancel = kw.pop("cancel", None)
+        acc = StreamAccumulator(time.monotonic(), self._name)
         try:
             chunks = self.llama.create_chat_completion(
                 messages=messages_to_openai(messages), stream=True,
@@ -169,10 +219,9 @@ class LocalLlamaCpp(ProviderBase):
             for chunk in chunks:
                 if cancel is not None and cancel.is_set():
                     return
-                delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-                text = delta.get("content")
-                if text:
-                    yield text
+                before = len(acc.parts)
+                acc.feed(chunk, time.monotonic())
+                yield from acc.parts[before:]
         except Exception:                                # noqa: BLE001
             return
 

@@ -55,6 +55,12 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    # Name resolution is traffic too, and it was the gap: classifying a
+    # provider URL called `gethostbyname` at construction, before any
+    # consent, and this fixture could not see it.
+    monkeypatch.setattr(socket, "gethostbyname", forbidden)
+    monkeypatch.setattr(socket, "gethostbyname_ex", forbidden)
+    monkeypatch.setattr(socket, "gethostbyaddr", forbidden)
     if hasattr(socket, "create_server"):
         monkeypatch.setattr(socket, "create_server", forbidden)
     return forbidden
@@ -209,6 +215,79 @@ def test_importing_the_remote_providers_opens_no_socket(no_network):
     from cognitive_coder.providers import remote
     importlib.reload(remote)
     assert remote.REMOTE_PROVIDERS
+
+
+@pytest.fixture
+def hostile_proxy(monkeypatch):
+    """A system proxy that records anything routed to it.
+
+    The corporate-laptop case: `HTTP_PROXY` (or the Windows registry proxy
+    that `urllib` reads the same way) is set and `NO_PROXY` is not, so a
+    request to 127.0.0.1 that honours the environment arrives at the proxy —
+    and the "local" model call has left the machine by default.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    seen: list[str] = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _record(self):
+            seen.append(f"{self.command} {self.path}")
+            body = b'{"choices":[{"message":{"content":"via proxy"}}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _record
+
+    srv = HTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}"
+    for key in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+                "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.setenv(key, url)
+    for key in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    # `urlopen` caches its opener (proxies included) on first use; clear it
+    # so this behaves like a process that started with the proxy set.
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    yield seen
+    srv.shutdown()
+    srv.server_close()
+
+
+def test_a_local_endpoint_never_goes_through_the_system_proxy(
+        hostile_proxy):
+    """Every path to a local model — complete, stream, capabilities,
+    count_tokens, detect — bypasses the proxy. A dead local port must fail
+    as a dead local port, not succeed through somebody else's machine."""
+    from cognitive_coder.providers import detect
+    from cognitive_coder.providers.openai_compatible import OpenAICompatible
+    from cognitive_coder.types import Message
+
+    provider = OpenAICompatible("http://127.0.0.1:9", model="m",
+                                timeout=2.0)
+    out = provider.complete([Message(role="user", content="hi")])
+    list(provider.stream([Message(role="user", content="hi")]))
+    provider.capabilities()
+    provider.count_tokens("some source")
+    detect(["http://127.0.0.1:9"], timeout=1.0)
+    assert hostile_proxy == [], hostile_proxy
+    assert out.finish_reason == "error"
+
+
+def test_building_a_provider_resolves_no_names(no_network):
+    """Construction classifies the URL; it must not look anything up."""
+    from cognitive_coder.providers.openai_compatible import OpenAICompatible
+    provider = OpenAICompatible("http://some-host.invalid:8080")
+    assert provider.is_remote
 
 
 def test_redaction_needs_no_network_of_its_own(no_network):

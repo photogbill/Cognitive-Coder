@@ -48,7 +48,11 @@ Optional extras, each buying exactly one capability:
 `install.bat` / `install.sh` build a `.venv` inside the clone, install the
 core, detect toolchains, and print an honest summary. Nothing global changes;
 deleting the clone removes every trace. If the machine has no usable Python
-they fetch 3.11 **into the clone** rather than failing.
+they fetch 3.11 **into the clone** rather than failing: a pinned `uv`, its
+installer checked against a SHA-256 before it runs, into `.tools/`, and the
+interpreter into `.python/` (`UV_PYTHON_INSTALL_DIR`), with uv's and pip's
+caches under `.tools/` too. `ccoder doctor` then reports the `.venv` and the
+Python it was made from.
 
 ---
 
@@ -170,7 +174,8 @@ self.session.cancel()
 
 ## What the engine does to your project
 
-Two directories, both inside the project root, both yours to delete:
+Everything below is inside the project root, and all of it is yours to
+delete. (This said "two directories"; a CLI run leaves four entries.)
 
 - **`.cc_snapshots/`** — `NNNN-<task_id>/` per transaction, with the original
   bytes of every file touched and a `MANIFEST.txt` holding the diff. This is
@@ -178,6 +183,19 @@ Two directories, both inside the project root, both yours to delete:
   approximately right.
 - **`.cc_journal/`** — one append-only JSONL per session. Provenance, and the
   source of truth for resume.
+- **`BUILD_LOG.txt`** — the readable account of every session, appended to:
+  what was asked, what was planned, what each phase printed.
+- **`Recommendation.md`** — the review, written after a build whose files
+  verified (`SessionConfig.recommendation_path` moves it).
+
+And one more that belongs to the HOST, not the engine: wherever its
+StoragePort keeps state. The `ccoder` CLI uses `JsonFileStorage` in
+**`.cc_state/`** — one JSON file per key, which is where the transaction log
+and its sequence counter live, plus the codemap's SQLite file. It has to be
+on disk: under `MemoryStorage` the log died with each `ccoder build`, and
+`ccoder history` answered "nothing has been changed" beside a full
+`.cc_snapshots/`. A host that embeds the engine picks its own place — ATK's
+adapter keeps it in ATK's settings and data directory, per project.
 
 **It never runs git.** If your project is a repository with uncommitted
 changes it says so once, at session start, and does nothing about it. A tool

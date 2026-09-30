@@ -77,8 +77,52 @@ class Report:
 
 def check_filesystem(fs: Any, report: Report | None = None,
                      claims_atomic: bool = True) -> Report:
-    r = report or Report()
+    """The FileSystemPort checks — run against the host's OWN root.
 
+    So it leaves that root as it found it. It used to leave
+    `cc_conformance/`, a symlink to the root's PARENT (a standing way out
+    of the jail for anything that follows links), and a `.git/config` that
+    makes git treat the folder as a broken repository. Everything it makes
+    is removed afterwards, and an existing `.git/` is only ever LISTED,
+    never written.
+    """
+    r = report or Report()
+    root = ""
+    try:
+        root = str(fs.root())
+    except Exception:                                    # noqa: BLE001
+        pass
+    real = bool(root) and os.path.isdir(root)
+    made: list[str] = []                 # port paths to delete at the end
+    try:
+        _filesystem_checks(fs, r, claims_atomic, root, real, made)
+    finally:
+        _clean_up(fs, root, real, made)
+    return r
+
+
+def _clean_up(fs: Any, root: str, real: bool, made: list[str]) -> None:
+    for path in made:
+        try:
+            if fs.exists(path):
+                fs.delete(path)
+        except Exception:                                # noqa: BLE001
+            pass
+    if not real:
+        return
+    for folder in ("cc_conformance", ".git"):
+        full = os.path.join(root, folder)
+        if folder in [m.split("/")[0] for m in made]:
+            try:
+                os.rmdir(full)                 # only if now empty
+            except OSError:
+                pass
+
+
+def _filesystem_checks(fs: Any, r: Report, claims_atomic: bool, root: str,
+                       real: bool, made: list[str]) -> None:
+    made += ["cc_conformance/probe.bin", "cc_conformance/eol.txt",
+             "cc_conformance/big.bin"]
     try:
         fs.write_bytes("cc_conformance/probe.bin", b"\x00\x01hello\r\n")
         got = fs.read_bytes("cc_conformance/probe.bin")
@@ -121,26 +165,42 @@ def check_filesystem(fs: Any, report: Report | None = None,
             leaked.append(path)
         except Exception:                                # noqa: BLE001
             pass
+    for path in leaked:                  # a failing host still gets tidied
+        full = path if os.path.isabs(path) else os.path.join(root, path)
+        try:
+            os.remove(os.path.normpath(full))
+        except OSError:
+            pass
     r.add("no write escapes root() — `..` and absolute paths",
           not leaked,
           f"these were WRITTEN outside the root: {leaked}" if leaked else "")
 
-    # Symlink escape, where the platform has symlinks.
-    root = None
+    # Symlink escape, where the platform has symlinks. The link points at
+    # the root's parent, so it is removed the moment the check is done.
     try:
-        root = fs.root()
-        if os.path.isdir(root) and hasattr(os, "symlink"):
+        if real and hasattr(os, "symlink"):
             link = os.path.join(root, "cc_conformance_link")
             target = os.path.dirname(os.path.abspath(root)) or "/"
-            if not os.path.exists(link):
+            victim = os.path.join(target, "escaped.txt")
+            existed = os.path.exists(victim)
+            if not os.path.lexists(link):
                 os.symlink(target, link, target_is_directory=True)
             escaped = False
             try:
                 fs.write_bytes("cc_conformance_link/escaped.txt", b"x")
-                escaped = os.path.exists(
-                    os.path.join(target, "escaped.txt"))
+                escaped = not existed and os.path.exists(victim)
             except Exception:                            # noqa: BLE001
                 escaped = False
+            finally:
+                try:
+                    os.unlink(link)
+                except OSError:
+                    pass
+                if escaped:
+                    try:
+                        os.remove(victim)
+                    except OSError:
+                        pass
             r.add("no write escapes root() — via a symlink", not escaped,
                   "a symlink pointing out of the tree was followed"
                   if escaped else "")
@@ -151,12 +211,17 @@ def check_filesystem(fs: Any, report: Report | None = None,
         r.add("no write escapes root() — via a symlink", True, str(exc),
               skipped=True)
 
-    # .git is excluded from listing (M27).
+    # .git is excluded from listing (M27). An existing `.git/` — a real
+    # repository — is only LISTED; the kit never writes into one, and
+    # never creates `.git/config`, which makes git see a broken repo.
     try:
-        fs.write_bytes(".git/config", b"[core]\n")
+        has_git = real and os.path.isdir(os.path.join(root, ".git"))
+        if not has_git:
+            made.append(".git/cc_conformance_probe")
+            fs.write_bytes(".git/cc_conformance_probe", b"probe\n")
         listed = fs.list("*")
         r.add("list() excludes .git/",
-              not any(str(p).replace("\\", "/").startswith(".git/")
+              not any(str(p).replace("\\", "/").lower().startswith(".git/")
                       for p in listed))
     except Exception:                                    # noqa: BLE001
         r.add("list() excludes .git/", True, "the host refuses .git writes, "
@@ -187,8 +252,6 @@ def check_filesystem(fs: Any, report: Report | None = None,
               not fs.exists("cc_conformance/probe.bin"))
     except Exception as exc:                             # noqa: BLE001
         r.add("delete() removes a file", False, str(exc))
-
-    return r
 
 
 # --------------------------------------------------------------------------

@@ -52,7 +52,17 @@ def parse(text: str, path: str = "") -> tuple[list[Symbol], list[tuple],
     symbols: list[Symbol] = []
     edges: list[tuple] = []
     unresolved: list[tuple] = []
-    module = _module_name(path)
+    # The module is a symbol too, so that module-level calls and imports
+    # have a source the store can bind. Without it, `if __name__ ==
+    # "__main__": main()` produced an edge from a name that existed nowhere,
+    # `callers_of("main")` was empty at "100% resolved", and the CLI entry
+    # point looked dead. Named by PATH, because a dotted module name
+    # collides with the function inside it: main.py's module is "main".
+    module = module_symbol_name(path)
+    symbols.append(Symbol(
+        name=module, kind="module", line=1,
+        end_line=max(1, len(text.splitlines())), path=path,
+        docstring=_first_line(ast.get_docstring(tree)), approximate=False))
 
     # Imports first: they are what a called name might resolve TO, and D4
     # (invented imports and APIs) is the most common small-model error in
@@ -110,15 +120,56 @@ def parse(text: str, path: str = "") -> tuple[list[Symbol], list[tuple],
     for node in top:
         _calls(node, module, edges, unresolved, recurse_defs=False)
 
-    known = {s.name for s in symbols} | {s.name.split(".")[-1]
-                                         for s in symbols}
+    # Bind calls LOCALLY only where Python's own scoping says so. The old
+    # rule — "the short name exists somewhere in this file" — sent a plain
+    # `save()` to a method `Doc.save`, and left `self.save()` for the store
+    # to bind by suffix, where it found the first `%.save` in the PROJECT.
+    kinds = {s.name: s.kind for s in symbols}
+    parents = {s.name: s.parent for s in symbols}
     resolved: list[tuple] = []
     for src, dst, kind in edges:
-        if kind == "calls" and dst not in known:
-            unresolved.append((src, dst, "calls"))
-        else:
+        if kind != "calls":
             resolved.append((src, dst, kind))
+            continue
+        target = _local_target(dst, src, kinds, parents)
+        if target:
+            resolved.append((src, target, "calls"))
+        else:
+            unresolved.append((src, dst, "calls"))
     return symbols, resolved, unresolved
+
+
+def enclosing_class(src: str, kinds: dict, parents: dict) -> str:
+    """The class whose method `src` is (directly or via nested defs)."""
+    scope = parents.get(src, "")
+    while scope:
+        if kinds.get(scope) == "class":
+            return scope
+        scope = parents.get(scope, "")
+    return ""
+
+
+def _local_target(called: str, src: str, kinds: dict,
+                  parents: dict) -> str:
+    """The symbol in THIS file that `called`, made from `src`, refers to.
+
+    `self.x`/`cls.x` → the enclosing class's `x`; a plain name → a def
+    nested in the caller's function scopes, then a top-level def; a dotted
+    name → only an exact match (`Cls.method`). Anything else is left for
+    the store, which knows the other files.
+    """
+    head, _, rest = called.partition(".")
+    if head in ("self", "cls") and rest:
+        cls = enclosing_class(src, kinds, parents)
+        return f"{cls}.{rest}" if cls and f"{cls}.{rest}" in kinds else ""
+    scope = src
+    while scope and kinds.get(scope) != "module":
+        if kinds.get(scope) != "class" and f"{scope}.{called}" in kinds:
+            return f"{scope}.{called}"
+        scope = parents.get(scope, "")
+    if kinds.get(called) not in (None, "module"):
+        return called
+    return ""
 
 
 def _calls(node: ast.AST, src: str, edges: list, unresolved: list,
@@ -131,12 +182,18 @@ def _calls(node: ast.AST, src: str, edges: list, unresolved: list,
 
 
 def _name_of(node: ast.AST) -> str:
-    """`foo`, `mod.foo`, `self.foo` → a dotted name; anything else → ""."""
+    """`foo`, `mod.foo`, `self.foo` → a dotted name; anything else → "".
+
+    An attribute on something that is not a name — `Path(p).read_text`,
+    `"".join`, `rows[0].strip` — is "" too. It used to be the bare
+    attribute, so `Path(p).read_text()` recorded a call to `read_text`, a
+    name nothing defines, and the D4 check reported it as invented.
+    """
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
         base = _name_of(node.value)
-        return f"{base}.{node.attr}" if base else node.attr
+        return f"{base}.{node.attr}" if base else ""
     return ""
 
 
@@ -187,13 +244,10 @@ def _first_line(doc: str | None) -> str:
     return (doc or "").strip().split("\n")[0][:200]
 
 
-def _module_name(path: str) -> str:
-    p = str(path or "").replace("\\", "/")
-    if p.endswith(".py"):
-        p = p[:-3]
-    if p.endswith("/__init__"):
-        p = p[: -len("/__init__")]
-    return p.strip("/").replace("/", ".") or "<module>"
+def module_symbol_name(path: str) -> str:
+    """The module's own symbol: its normalised path (never an identifier)."""
+    p = str(path or "").replace("\\", "/").strip("/")
+    return p or "<module>"
 
 
 def bound_names(text: str) -> set[str]:
@@ -264,9 +318,7 @@ def bound_names(text: str) -> set[str]:
             for tgt in (node.targets if isinstance(node, ast.Assign)
                         else [node.target]):
                 bind(tgt)
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
-            bind(node.target)
-        elif isinstance(node, ast.NamedExpr):
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.NamedExpr)):
             bind(node.target)
         elif isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
@@ -275,7 +327,7 @@ def bound_names(text: str) -> set[str]:
         elif isinstance(node, ast.ExceptHandler):
             if node.name:
                 out.add(node.name)
-        elif isinstance(node, comprehension_types):
+        elif isinstance(node, ast.comprehension):
             bind(node.target)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.add(node.name)
@@ -290,15 +342,53 @@ def bound_names(text: str) -> set[str]:
         elif isinstance(node, ast.ClassDef):
             out.add(node.name)
         elif isinstance(node, ast.Lambda):
-            for a in (list(node.args.posonlyargs) + list(node.args.args)
-                      + list(node.args.kwonlyargs)):
+            args = node.args
+            for a in (list(args.posonlyargs) + list(args.args)
+                      + list(args.kwonlyargs)):
                 out.add(a.arg)
-        elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
+            # `lambda *rest, **kw: rest.count(1)` — these were missed, and
+            # `rest.count` was reported as a name the project lacks.
+            if args.vararg:
+                out.add(args.vararg.arg)
+            if args.kwarg:
+                out.add(args.kwarg.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
             out.update(node.names)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            # `case ['go', direction]:` binds `direction`; `case [x, *more]`
+            # binds `more`.
+            if node.name:
+                out.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                out.add(node.rest)                       # `**others`
     return out
 
 
-comprehension_types = (ast.comprehension,)
+def import_bindings(text: str) -> list[tuple[str, str, str]]:
+    """Every import as (module, name, alias); name is "" for `import m`.
+
+    `imports_of` keeps its list-of-modules shape because the planner
+    derives the dependency order from it. The D4 check needs more: which
+    LOCAL names an import binds (`np` for `import numpy as np`,
+    `OrderedDict` for `from collections import OrderedDict`), and from
+    which module, so that it can tell a standard-library name from an
+    invented one.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out: list[tuple[str, str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out.append((a.name, "", a.asname or ""))
+        elif isinstance(node, ast.ImportFrom):
+            base = "." * (node.level or 0) + (node.module or "")
+            for a in node.names:
+                out.append((base, a.name, a.asname or ""))
+    return out
 
 
 def imports_of(text: str) -> list[str]:

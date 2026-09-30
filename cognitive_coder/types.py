@@ -51,10 +51,18 @@ EVENT_KINDS = ("phase", "token", "status", "diagnostic", "patch", "remote",
 
 #: Journal event names (§6.13). Also public API — a host renders history from
 #: these — and under the same semver rule as EVENT_KINDS.
+#:
+#: `Journal.log` checks names against this and WARNS (never raises) on one
+#: that is missing, because the list had drifted unnoticed: session.py
+#: writes "blocked", which was absent. "audit" is written by a feature
+#: being built alongside this change. "guard", "prefix" and "rollback" are
+#: listed but not currently written; they stay, because removing a name a
+#: host may render is a major version.
 JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "generate", "continuation", "guard", "prefix", "verify",
                   "autofix", "patch", "rollback", "codemap", "review",
-                  "budget", "cancel", "epoch", "error", "skills")
+                  "budget", "cancel", "epoch", "error", "skills",
+                  "blocked", "audit")
 
 
 # --------------------------------------------------------------------------
@@ -147,6 +155,15 @@ class Completion:
     #: Optional and defaulted, so a provider that cannot separate them
     #: reports 0 and nothing downstream changes.
     decode_ms: int = 0
+    #: When ``finish_reason == "error"``: one operator-facing sentence
+    #: saying what went wrong — the HTTP status and the server's own
+    #: (redacted, shortened) message where there was one. Added because the
+    #: status was discarded and llama.cpp rejecting `tools` (a 400 with a
+    #: clear reason) reached the operator as "could not be reached, or
+    #: returned an error". Deliberately NOT carried in ``text``: the loop
+    #: reads any non-empty text as the generated file, and would verify and
+    #: "repair" the sentence as code. Defaulted, so this is a minor version.
+    error: str = ""
 
     def __post_init__(self) -> None:
         if self.finish_reason not in FINISH_REASONS:
@@ -581,16 +598,39 @@ class JournalEvent:
     verify: dict = field(default_factory=dict)
     data: dict = field(default_factory=dict)
 
+    #: Counters whose 0 means "nothing to report" rather than a value.
+    _ZERO_IS_EMPTY = frozenset({"attempt", "tokens_in", "tokens_out",
+                                "prompt_ms", "decode_ms"})
+
     def to_json(self) -> str:
         """One line of JSONL. Empty fields are dropped — a journal that is
-        90% zeros is harder to read, and readability is the point of it."""
+        90% zeros is harder to read, and readability is the point of it.
+
+        "Empty" is decided per field, not by `v in ("", 0, None, …)`: that
+        test is true for `0.0` and `False` too, because `0.0 == 0` and
+        `False == 0`, so `temperature=0.0` (greedy decoding, the most
+        reproducible setting there is) and `seed=0` vanished from the
+        provenance record. Only the counters above treat 0 as empty;
+        `temperature` and `seed` default to None, so any number there was
+        set on purpose and is kept.
+        """
         raw = asdict(self)
         keep = {k: v for k, v in raw.items()
-                if v not in ("", 0, None, {}, [])}
+                if not _empty(k, v, self._ZERO_IS_EMPTY)}
         keep["t"] = self.t
         keep["event"] = self.event
         return json.dumps(keep, ensure_ascii=False, sort_keys=True,
                           default=str)
+
+
+def _empty(key: str, value: Any, zero_is_empty: frozenset) -> bool:
+    if value is None or isinstance(value, bool):
+        return value is None
+    if isinstance(value, (str, dict, list, tuple)):
+        return not value
+    if key in zero_is_empty and isinstance(value, (int, float)):
+        return value == 0
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -625,12 +665,13 @@ class TaskOutcome:
     def summary(self) -> str:
         if self.ok:
             n = len(self.attempts)
-            return (f"{self.path}: done in {n} attempt{'s' * (n != 1)}"
-                    + (" · " + " · ".join(self.caveats) if self.caveats else ""))
+            tail = " · " + " · ".join(self.caveats) if self.caveats else ""
+            return f"{self.path}: done in {n} attempt{'s' * (n != 1)}{tail}"
         why = self.stopped_because or "gave up"
         last = ""
         if self.attempts and self.attempts[-1].diagnostics:
-            last = f" Last real error: {self.attempts[-1].diagnostics[0].one_line()}"
+            first = self.attempts[-1].diagnostics[0]
+            last = f" Last real error: {first.one_line()}"
         return f"{self.path}: {why}.{last}"
 
 

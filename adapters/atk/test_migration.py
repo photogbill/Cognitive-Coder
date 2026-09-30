@@ -28,12 +28,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import tempfile
 
 PASSED = 0
 FAILED = 0
+
+#: Every temporary directory this script makes, removed at the end whatever
+#: happened. It used to leave four behind on every run.
+TEMPS: list[Path] = []
+
+
+def temp_dir(prefix: str = "atk-mig-") -> Path:
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    TEMPS.append(path)
+    return path
 
 
 def check(name: str, condition: object) -> bool:
@@ -51,35 +60,45 @@ def section(title: str) -> None:
     print(f"\n{title}")
 
 
-def build_fake_atk(cc_root: Path) -> Path:
+def empty_atk() -> Path:
+    """An ATK-shaped tree: packages, and a placeholder for each module."""
+    import migrate
+
+    root = temp_dir("fake-atk-")
+    (root / "atk" / "core").mkdir(parents=True)
+    (root / "atk" / "ui").mkdir(parents=True)
+    for package in (root / "atk", root / "atk" / "core", root / "atk" / "ui"):
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    for name in migrate.MODULES:
+        (root / "atk" / "core" / name).write_text(
+            "# placeholder for the migration test\n", encoding="utf-8")
+    return root
+
+
+def build_fake_atk(cc_root: Path) -> tuple[Path, Path | None]:
     """A throwaway ATK tree with the six real modules, then migrated.
 
     A COPY, always. This script must never touch a real checkout — running a
     migration test against somebody's working application is the kind of
     convenience that ends an evening badly.
+
+    Returns the tree and where the real modules came from — None when there
+    was no real ATK to copy, in which case the originals are placeholders
+    and the run SAYS so: a count of passes that were never at risk is not
+    the same evidence as one taken against ATK's own code.
     """
     import migrate
 
-    root = Path(tempfile.mkdtemp(prefix="fake-atk-"))
-    (root / "atk" / "core").mkdir(parents=True)
-    (root / "atk" / "ui").mkdir(parents=True)
-    for package in (root / "atk", root / "atk" / "core", root / "atk" / "ui"):
-        (package / "__init__.py").write_text("", encoding="utf-8")
-
-    # The originals, if a real ATK is available; otherwise the shims are
-    # tested against nothing, which is still the interesting half.
+    root = empty_atk()
     source = _find_atk_core()
     for name in migrate.MODULES:
         if source and (source / name).exists():
             shutil.copy2(source / name, root / "atk" / "core" / name)
-        else:
-            (root / "atk" / "core" / name).write_text(
-                "# placeholder for the migration test\n", encoding="utf-8")
 
     migrate.install_compat(root)
     migrate.install_host(root)
     migrate.apply(migrate.plan(root))
-    return root
+    return root, source
 
 
 def _find_atk_core() -> Path | None:
@@ -114,15 +133,35 @@ def main() -> int:
         print("Install it into this interpreter first.")
         return 3
 
-    fake = build_fake_atk(cc_root)
+    try:
+        return _checks(cc_root)
+    finally:
+        for path in TEMPS:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _checks(cc_root: Path) -> int:
+    fake, real_atk = build_fake_atk(cc_root)
     sys.path.insert(0, str(fake))
-    print(f"Migrated a throwaway copy at {fake}\n")
+    print(f"Migrated a throwaway copy at {fake}")
+    print(f"real ATK modules: "
+          f"{'yes, from ' + str(real_atk) if real_atk else 'no'}"
+          + ("" if real_atk else " — the originals are placeholders, so this "
+             "proves the shims, not ATK's call sites; set ATK_ROOT to "
+             "test against a checkout"))
 
     # ---------------------------------------------------------------
     section("langs — probing took no arguments, and must not start to")
     from atk.core import langs
     check("LANGS is populated", len(langs.LANGS) > 10)
     check("get('python')", langs.get("python") is not None)
+    check("get('python').available() takes NO arguments — the call the "
+          "shim promises", _no_arg_available(langs))
+    check("…and is still an engine Lang (isinstance)",
+          isinstance(langs.get("python"), langs.Lang))
+    check("LANGS[...] and for_extension() probe with no arguments too",
+          isinstance(langs.LANGS["python"].available(), bool)
+          and isinstance(langs.for_extension("a.py").which_run(), str))
     check("available_ids() takes NO arguments",
           isinstance(langs.available_ids(), list))
     check("scaffold_for()", "def main" in langs.scaffold_for("python", "t"))
@@ -165,11 +204,13 @@ def main() -> int:
     check("advisory()", isinstance(codeguard.advisory(findings), str))
     check("clean code is not flagged",
           codeguard.scan("def add(a, b):\n    return a + b\n", "python") == [])
+    check("isinstance(scan()[0], Finding) — Finding is what scan returns",
+          isinstance(findings[0], codeguard.Finding))
 
     # ---------------------------------------------------------------
     section("coderun → runner — a workspace PATH, not a Port")
     from atk.core import coderun
-    workspace = tempfile.mkdtemp()
+    workspace = str(temp_dir())
     good = coderun.build_and_run('print("hi")\n', "python", workspace)
     check("build_and_run(code, lang, WORKSPACE_PATH)", good.ok)
     check("RunResult.stdout is the PROGRAM's output", "hi" in good.stdout)
@@ -194,7 +235,7 @@ def main() -> int:
     # ---------------------------------------------------------------
     section("patcher — apply(edits, ROOT) and undo(ROOT)")
     from atk.core import patcher
-    project = Path(tempfile.mkdtemp())
+    project = temp_dir()
     (project / "m.py").write_text("a = 1\n", encoding="utf-8")
     edits = patcher.parse_edits("```python path=m.py\na = 42\n```")
     check("parse_edits()", len(edits) == 1)
@@ -216,6 +257,11 @@ def main() -> int:
           not patcher.apply(
               [patcher.Edit(path="dup.py", kind="replace", old="x",
                             new="y")], project).ok)
+    patcher.apply(edits, project)
+    from atk.core import ccoder_compat
+    ccoder_compat._PATCHERS.clear()          # what an ATK restart does
+    check("undo(root) still works after a restart — the log is on disk",
+          patcher.undo(project)["ok"])
 
     # ---------------------------------------------------------------
     section("codectx → context — a root PATH everywhere ATK passed one")
@@ -261,15 +307,35 @@ def main() -> int:
     check("the original is kept alongside",
           (fake / "atk" / "core" / "langs.py.pre-ccoder").exists())
 
+    # ---------------------------------------------------------------
+    section("migrate.py itself")
+    import migrate
+    check("it names all nine files it writes, and the six backups",
+          len(migrate.targets(fake)) == 15)
+    looked = empty_atk()
+    check("--dry-run is accepted, and writes nothing",
+          _quiet(migrate.main, ["--atk", str(looked), "--dry-run",
+                                "--python", sys.executable]) == 0
+          and not (looked / "atk" / "core" / "ccoder_compat.py").exists())
+    check("with no ATK .venv and no --python, it refuses rather than "
+          "testing ITS OWN interpreter",
+          _quiet(migrate.main, ["--atk", str(looked)]) == 2)
+    outcome = _symlink_refused(migrate)
+    if outcome is None:
+        print("  [SKIP] symlinked target — this machine cannot make one")
+    else:
+        check("a symlinked target stops the migration; the file it points "
+              "at, outside the tree, is untouched", outcome)
+
     print("\n" + "=" * 62)
-    print(f" {PASSED} passed, {FAILED} failed")
+    print(f" {PASSED} passed, {FAILED} failed · real ATK modules: "
+          f"{'yes' if real_atk else 'no'}")
     print("=" * 62)
     if FAILED:
         print("\nDo NOT migrate a real ATK checkout until these pass.")
     else:
         print("\nATK's old call surface is intact. Migrate, then run ATK's")
         print("own suite — that is the evidence that matters.")
-    shutil.rmtree(fake, ignore_errors=True)
     return 1 if FAILED else 0
 
 
@@ -299,23 +365,64 @@ def _is_mutable(diagnostic: object) -> bool:
 
 
 def _tree_kill_works(ex: object) -> bool:
-    """A parent that spawns a child which outlives it — the Godot case."""
+    """A parent that spawns a child which outlives it — the Godot case.
+
+    Timed as tight as it can be while still proving it: the parent is
+    killed at 1 s, a surviving grandchild would write at ~2 s, and the
+    marker is looked for at ~3.5 s. (It slept 6 s; the conformance kit in
+    adapters/atk/test_adapter.py runs the full-length version.)
+    """
     import time
 
-    workspace = tempfile.mkdtemp()
+    workspace = str(temp_dir())
     marker = os.path.join(workspace, "child-survived.txt")
     child = (
         "import subprocess, sys, time\n"
         "subprocess.Popen([sys.executable, '-c',\n"
-        " \"import time;\\ntime.sleep(5)\\n"
-        "open(r'{m}','w').write('alive')\"])\n"
-        "time.sleep(30)\n").format(m=marker)
+        " \"import time;\\ntime.sleep(2)\\n"
+        f"open(r'{marker}','w').write('alive')\"])\n"
+        "time.sleep(30)\n")
     result = ex.run([sys.executable, "-c", child], cwd=workspace,
-                    timeout=2)                # type: ignore[attr-defined]
+                    timeout=1)                # type: ignore[attr-defined]
     if not result.timed_out:
         return False
-    time.sleep(6)
+    time.sleep(2.5)
     return not os.path.exists(marker)
+
+
+def _no_arg_available(langs: object) -> bool:
+    try:
+        return isinstance(langs.get("python").available(), bool)
+    except TypeError:
+        return False
+
+
+def _quiet(fn, *args):
+    """Run a noisy function with its stdout swallowed; return its value."""
+    import contextlib
+    import io
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*args)
+
+
+def _symlink_refused(migrate: object) -> bool | None:
+    """--apply on a tree whose langs.py links OUTSIDE it. None: no symlinks
+    on this machine (Windows without the privilege)."""
+    root = empty_atk()
+    outside = temp_dir("outside-") / "victim.py"
+    outside.write_text("# not ATK's\n", encoding="utf-8")
+    link = root / "atk" / "core" / "langs.py"
+    link.unlink()
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        return None
+    code = _quiet(migrate.main, ["--atk", str(root), "--apply",
+                                 "--python", sys.executable])
+    return (code == 4
+            and outside.read_text(encoding="utf-8") == "# not ATK's\n"
+            and not (root / "atk" / "core" / "ccoder_compat.py").exists())
 
 
 def _jail_holds(fs: object) -> bool:
@@ -332,7 +439,8 @@ def _storage_is_json_only(storage_class: type) -> bool:
     class Ctx:
         settings: dict = {}
 
-    storage = storage_class(Ctx(), tempfile.mkdtemp())
+    base = str(temp_dir())
+    storage = storage_class(Ctx(), base, base)
     try:
         storage.set("bad", object())
         return False

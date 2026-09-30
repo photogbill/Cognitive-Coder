@@ -96,6 +96,68 @@ def test_resume_is_derived_from_the_journal_on_disk(tmp_path):
     assert "src/beta.py" in remaining
 
 
+def _crash_after_first_file(tmp_path, plan, request, first):
+    host = _host(tmp_path, [plan, first])
+    session = Session(host, config=SessionConfig(attempts=1))
+    with pytest.raises(AssertionError):         # ScriptedLLM runs dry
+        session.start(request)
+        while session.step():
+            pass
+    return session
+
+
+def _shape(plan):
+    return {t.path: (t.purpose, t.persona, t.lang, t.test_path, t.atomic)
+            for t in plan.tasks}
+
+
+def test_resume_rebuilds_the_plan_it_was_given(tmp_path):
+    """The `plan` event recorded paths only, so resume rebuilt every task as
+    "(resumed) part of: …", an engineer, in the session's language, paired
+    with a test of its own: a test file lost its tester, `beta.js` became
+    Python, and a test was told to have tests."""
+    plan = ("src/alpha.py — parse the header line of a CSV\n"
+            "src/beta.js — render the table in the browser\n")
+    request = "Build src/alpha.py and src/beta.js. Tests: tests/test_alpha.py"
+    session = _crash_after_first_file(tmp_path, plan, request, ALPHA)
+    before = _shape(session.plan)
+    assert before["tests/test_alpha.py"][1] == "tester", "fixture changed"
+    session_id = session.id
+    del session
+
+    revived = Session.resume(_host(tmp_path, []), session_id)
+    assert _shape(revived.plan) == before
+
+
+def test_a_kept_file_is_still_kept_after_resume(tmp_path):
+    """Item 7's kept-as-found set must survive a crash, or the first replan
+    after resume marks the operator's file "done" because it has a body."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "util.py").write_text("def util(x):\n    return x\n")
+    session = _crash_after_first_file(
+        tmp_path, "src/new.py — new\nsrc/util.py — extend it\n",
+        "add src/new.py and extend src/util.py", ALPHA)
+    session_id = session.id
+    del session
+    revived = Session.resume(_host(tmp_path, []), session_id)
+    assert revived.planner.kept_as_found == {"src/util.py"}
+
+
+def test_a_preview_is_not_a_session_to_resume(tmp_path):
+    """`preview()` plans and stops. It wrote a journal like any session, so
+    `previous_sessions()` listed it and `resume()` would "resume" a plan
+    that nothing was ever built from."""
+    from cognitive_coder.errors import CognitiveCoderError
+    host = _host(tmp_path, [PLAN])
+    session = Session(host)
+    session.preview("two small modules")
+    assert session.id not in Session.previous_sessions(host)
+    with pytest.raises(CognitiveCoderError) as exc:
+        Session.resume(_host(tmp_path, []), session.id)
+    assert "preview" in str(exc.value)
+    assert "Traceback" not in str(exc.value)
+
+
 def test_previous_sessions_are_listable(tmp_path):
     host = _host(tmp_path, [PLAN, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
@@ -223,6 +285,41 @@ def test_a_git_repository_earns_one_warning_and_no_git_command(tmp_path):
     assert any("never runs git" in m for m in warnings), warnings
 
 
+class _UndecodableExec(SubprocessExec):
+    """An ExecPort whose child printed bytes that are not UTF-8 — a real
+    Port failure, and not one of the engine's own error types."""
+
+    def run(self, argv, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 1,
+                                 "invalid start byte")
+
+
+def test_a_port_failure_reaches_the_host_as_a_sentence(tmp_path):
+    """C6: every failure that reaches a human is a sentence; the traceback
+    goes to the journal. A UnicodeDecodeError from a child's output escaped
+    `Session.run` as a raw traceback, and `CognitiveCoderError.wrap` — the
+    mechanism built for exactly this — was never called."""
+    from cognitive_coder.errors import CognitiveCoderError
+    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host.exec = _UndecodableExec()
+    session = Session(host, config=SessionConfig(attempts=1))
+    with pytest.raises(CognitiveCoderError) as exc:
+        session.run("two small modules")
+    sentence = str(exc.value)
+    assert "Traceback" not in sentence
+    assert "UnicodeDecodeError" not in sentence, "a type name is not a " \
+        "sentence"
+    assert session.journal.path in sentence
+    errors = [(m, d) for k, m, d in host.events.events if k == "error"]
+    assert errors and errors[-1][0] == sentence
+    assert errors[-1][1]["journal"] == session.journal.path
+    logged = [e for e in session.journal.events() if e["event"] == "error"]
+    assert logged, "the journal has no error event"
+    detail = logged[-1]["data"]["detail"]
+    assert "Traceback" in detail and "UnicodeDecodeError" in detail
+    assert session.journal.events()[-1]["event"] == "session_end"
+
+
 def test_the_engine_never_shells_out_to_git():
     """M27 — checked against the AST, because it is a promise.
 
@@ -253,3 +350,72 @@ def test_the_engine_never_shells_out_to_git():
                               "check_output"):
                         offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, offenders
+
+
+def test_a_context_resize_is_an_epoch_boundary_too(tmp_path):
+    """The same model reloaded with a larger n_ctx is a new KV cache: the
+    host reloaded it. Only a NAME change counted, so a host's "raise the
+    context" button left the old prefix snapshot in force."""
+    class Resizing:
+        def __init__(self):
+            self.ctx = 16384
+            self.replies = [PLAN]
+
+        def capabilities(self):
+            return ModelCapabilities(name="devstral-small-2-24b",
+                                     family="mistral",
+                                     context_tokens=self.ctx,
+                                     supports_tools=False)
+
+        def complete(self, messages, **kw):
+            from cognitive_coder.types import Completion
+            text = self.replies.pop(0) if self.replies else ""
+            return Completion(text=text, model="devstral-small-2-24b")
+
+        def stream(self, messages, **kw):
+            yield ""
+
+        def count_tokens(self, text):
+            return max(1, len(text or "") // 4)
+
+    llm = Resizing()
+    host = _host(tmp_path, [], llm=llm)
+    session = Session(host, config=SessionConfig(attempts=1))
+    session.start("two small modules")
+    session._capabilities(boundary="first")
+    before = session.codemap.store.epoch
+
+    session._capabilities(boundary="unchanged")
+    assert session.codemap.store.epoch == before, "no change, no epoch"
+
+    llm.ctx = 32768
+    session._capabilities(boundary="resized")
+    assert session.codemap.store.epoch > before
+    warnings = [m for k, m, _d in host.events.events if k == "warning"]
+    assert any("32,768-token context" in m for m in warnings), warnings
+
+
+def test_a_session_built_on_one_thread_runs_on_another(tmp_path):
+    """ATK's panel builds the Session on the GUI thread and runs it on a
+    worker. The codemap's SQLite connection belonged to the thread that
+    opened it, so every codemap call from the build raised
+    ProgrammingError — observed as tool calls answering "That tool call
+    failed" and an index that silently stopped."""
+    import threading
+    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    session = Session(host, config=SessionConfig(attempts=1))
+    errors: list[BaseException] = []
+
+    def work():
+        try:
+            session.run("two small modules")
+        except BaseException as exc:                     # noqa: BLE001
+            errors.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    worker.join(120)
+    assert not errors, errors
+    assert session.codemap.store.files(), "nothing was indexed"
+    # And the GUI side reads it afterwards, from the thread that built it.
+    assert session.codemap.stats().files >= 1

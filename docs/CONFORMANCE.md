@@ -12,9 +12,14 @@ is deferred.
 Legend: **MET** · **MET, TESTED** (an automated test asserts it).
 Nothing is PARTIAL and nothing is DEFERRED.
 
-As built: **321 tests passing**, 14 skipping for absent toolchains, ruff
-clean, the port conformance kit green on 29 checks, and the ATK migration
-harness green on 56 checks against the real ATK modules.
+**Counts are not written here**, because a count in a document is stale by
+the next commit — run the audit at the end instead. This line used to say
+"321 tests passing … ruff clean … the ATK migration harness green on 56
+checks against the real ATK modules", and when it was read none of the three
+held: the suite had grown, a newer ruff (unpinned then; pinned in `[dev]`
+now) found ten issues, and the harness had been substituting placeholders
+for ATK's modules without saying so. It now prints `real ATK modules:
+yes/no`; only a "yes" run is evidence about ATK's own call sites.
 
 ---
 
@@ -82,10 +87,10 @@ harness green on 56 checks against the real ATK modules.
 | M43 | Every outbound message, including tool results, passes through `redact.py` | **MET, TESTED** | `redact.redact_messages` covers every role and tool-call arguments; `test_redact.py` captures the actual wire payloads of a scripted three-turn session and asserts them clean |
 | M44 | Keys never touch the journal, codemap or any log | **MET, TESTED** | no key is ever passed to the journal; `test_no_network.py` asserts key-shaped variables are scrubbed from child environments |
 | M45 | Installers: non-interactive, idempotent, nothing global, degrading, honest summary, meaningful exit code | **MET** | `install.sh`, `install.bat`; CI runs each twice to prove idempotence |
-| M46 | The installer verifies interpreter version, fetches 3.11 when needed, reports which branch it took | **MET** | both installers probe by `--version`, fetch via `uv` into `.tools/`, and print the provenance |
+| M46 | The installer verifies interpreter version, fetches 3.11 when needed, reports which branch it took | **MET** | both installers probe by `--version`; when nothing fits they fetch a PINNED uv (installer SHA-256 checked before it runs) into `.tools/`, and the Python into `.python/` via `UV_PYTHON_INSTALL_DIR` — before that was set it landed in uv's global directory, and "into the clone" was untrue; the summary says which branch was taken |
 | M47 | `requires-python = ">=3.11"`, no cap; CI on 3.11 for Windows and Linux | **MET** | `pyproject.toml`, `.github/workflows/ci.yml` |
 | M48 | Zero required runtime deps; CI fails on a non-stdlib module-level import in the core | **MET, TESTED** | `test_contract.py::test_core_has_no_module_level_third_party_imports` |
-| M49 | `ccoder doctor` prints the install summary and interpreter provenance | **MET** | `cli.doctor`, `interpreter_provenance` |
+| M49 | `ccoder doctor` prints the install summary and interpreter provenance | **MET, TESTED** | `cli.doctor`, `interpreter_provenance`; `tests/test_cli.py` — the summary's lines, and the provenance of a system Python, a fetched one, and a `.venv` over each (a `.venv` used to be reported as "fetched into this clone") |
 | M50 | Vendored use works: no import-time side effects, no metadata reads, version from `version.py` | **MET, TESTED** | three tests, one of which imports the package in an empty directory and asserts the directory is still empty |
 
 ## Testing (the load-bearing four)
@@ -103,10 +108,12 @@ harness green on 56 checks against the real ATK modules.
 ## Known gaps, stated rather than buried
 
 **The ATK migration is written and tested, not performed.** `migrate.py` is
-dry-run by default, backs up every file it replaces, and refuses to touch
-anything outside the six modules. It has been exercised end to end against a
-throwaway copy of the real ATK tree — 56 checks on the OLD call surface — but
-**the live checkout has not been modified.** That is a decision for the owner
+dry-run by default, backs up every file it replaces, and writes nine files —
+the six shims plus `ccoder_compat.py`, `ccoder_host.py` and
+`ui/ccoder_panel.py` — refusing the whole run if any target is a symlink or
+resolves outside the tree. `adapters/atk/test_migration.py` exercises it
+end to end against a throwaway copy, and prints whether ATK's real modules
+were present for that run; **the live checkout has not been modified.** That is a decision for the owner
 to make with ATK's own suite green either side, which is what §7.3 requires
 and what a script cannot judge.
 
@@ -125,19 +132,20 @@ normalising quietly, and **undo is unaffected** — snapshots hold the original
 bytes. M26 is met; the limitation is in writing new content into an already
 mixed file.
 
-**Coverage — 74% overall, short of §9's ≥85% target.** Stated as a number
-rather than as a claim, because the shortfall is concentrated and worth
-naming:
+**Coverage — short of §9's ≥85% target.** CI's floor (`fail_under` in
+`pyproject.toml`) is set just under the measured total rather than at the
+target: a floor the suite never met made the full-suite step red on every
+run, which teaches everyone to ignore it. The shortfall is concentrated:
 
-| Module | Cover | Why |
-|---|---|---|
-| `cli.py` | 0% | needs a terminal and a live endpoint |
-| `providers/local_llamacpp.py` | 14% | needs `llama-cpp-python` installed |
-| `codemap/parse_treesitter.py` | 21% | needs `tree-sitter` installed |
+| Module | Why |
+|---|---|
+| `providers/local_llamacpp.py` | needs `llama-cpp-python` and a GGUF |
+| `codemap/parse_treesitter.py` | needs the `tree-sitter` wheels |
 
-**Excluding those three, the core is 82%.** They are the modules whose whole
-purpose is to bind to something that is not present on a bare machine, and
-they are the ones an integration run exercises rather than a unit suite.
+`cli.py` used to lead this table at 0%, "needs a terminal and a live
+endpoint". It needed neither: `tests/test_cli.py` swaps the one call that
+turns `--url` into an LLMPort for a scripted model and drives every
+subcommand through `cli.main`.
 
 The modules §9 singles out — *"the parsers and the loop should be near 100%
 because they are where wrongness hides"* — sit at: `redact` 94%, `personas`
@@ -159,9 +167,11 @@ than fail, and they do.
 ## How to re-run this audit
 
 ```bash
-pytest -q                        # the whole suite
+pytest -q                        # the suite, incl. adapters/atk/test_adapter.py
 python tests/port_conformance.py # the kit, against the Null ports
-ruff check cognitive_coder tests examples
+python adapters/atk/test_migration.py  # ATK's old surface; read its
+                                 # "real ATK modules:" line
+ruff check cognitive_coder tests examples adapters   # ruff as pinned in [dev]
 ccoder doctor                    # what this machine can actually do
 ```
 

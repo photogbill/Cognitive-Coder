@@ -242,7 +242,9 @@ def _python_symbols(text: str) -> list[Symbol]:
                                      text, re.M)]
     from .codemap import parse_python
     symbols_found, _edges, _unresolved = parse_python.parse(text)
-    return symbols_found
+    # The parser also emits the module itself as a symbol (the codemap
+    # binds module-level calls to it); an outline lists definitions.
+    return [s for s in symbols_found if s.kind != "module"]
 
 
 def outline(text: str, lang_id: str = "python", path: str = "") -> str:
@@ -336,20 +338,48 @@ def build_context(pieces: Sequence[Piece | tuple], budget: int | Budget,
     `count_tokens` is `LLMPort.count_tokens` when the caller has a port; the
     character estimate is used otherwise, and either way the assumption is
     declared in the output when it is a guess.
+
+    THE BUDGET IS THE WHOLE OUTPUT. Two leaks were observed: a first piece
+    that alone exceeded the budget was emitted WHOLE (10,000 characters
+    against 1,000) while the omissions block claimed the rest "was left out
+    to fit"; and the omissions block itself was never counted, so a long
+    list of dropped labels could double the size. Room for the block is
+    now reserved first, an oversized first piece is CUT (and the cut
+    declared), and the list of labels is shortened to fit.
     """
     limit_chars, declare = _limit(budget)
     items = [p if isinstance(p, Piece) else Piece(*p) for p in pieces]
     ordered = sorted(items, key=lambda p: (0 if p.essential else 1,
                                            p.priority))
 
+    def cost_of(text: str) -> int:
+        return (count_tokens(text) * CHARS_PER_TOKEN if count_tokens
+                else len(text))
+
+    # Reserve room for the block naming EVERY piece, dropped — the names
+    # are what stop a model inventing what it was not shown (M28), so they
+    # outrank the content — capped at three quarters of the budget; past
+    # that the list is shortened to "…, and N more".
+    labels = [p.label for p in ordered]
+    if labels:
+        labels.append(f"the rest of {labels[0]}")
+    worst = len(_omissions(labels, declare, room=10 ** 9))
+    floor = len(_omissions(["x"], declare, room=0))
+    room = max(0, limit_chars - max(floor, min(worst, limit_chars * 3 // 4)))
     kept: list[str] = []
     dropped: list[str] = []
     used = 0
     for piece in ordered:
         block = f"--- {piece.label} ---\n{(piece.text or '').rstrip()}\n"
-        cost = (count_tokens(block) * CHARS_PER_TOKEN if count_tokens
-                else len(block))
-        if used + cost > limit_chars and kept:
+        cost = cost_of(block)
+        if used + cost > room:
+            if not kept:
+                cut = _cut_to_fit(piece, room - used, cost_of)
+                if cut:
+                    kept.append(cut)
+                    used += cost_of(cut)
+                    dropped.append(f"the rest of {piece.label}")
+                    continue
             dropped.append(piece.label)
             continue
         kept.append(block)
@@ -360,17 +390,58 @@ def build_context(pieces: Sequence[Piece | tuple], budget: int | Budget,
     # nothing was dropped, because "nothing was omitted" is itself
     # information the model can rely on, and a block that appears only
     # sometimes is a block the model learns to ignore.
-    out += "\n--- NOT INCLUDED ---\n"
-    if dropped:
-        out += ("The following were left out to fit the context window: "
-                + ", ".join(dropped)
-                + ".\nIf you need any of them, say so or look them up "
-                  "instead of guessing at their contents.\n")
-    else:
-        out += "Nothing was left out; this is everything relevant.\n"
-    if declare:
-        out += declare + "\n"
-    return out
+    return out + _omissions(dropped, declare,
+                            room=max(0, limit_chars - len(out)))
+
+
+def _cut_to_fit(piece: Piece, room: int, cost_of) -> str:
+    """The head of `piece` that fits in `room`, with the cut declared."""
+    text = (piece.text or "").rstrip()
+    head = f"--- {piece.label} (cut to fit) ---\n"
+    note = (f"\n[… {len(piece.text or ''):,} characters in all; the "
+            f"rest was cut to fit]\n")
+    budget = room - cost_of(head) - cost_of(note)
+    # Characters per cost unit, so a token-counted budget cuts in
+    # proportion rather than by characters.
+    ratio = max(1, len(text)) / max(1, cost_of(text))
+    # THE TARGET STAYS FIXED; WHAT IS KEPT SHRINKS. The first version
+    # lowered `room` by each overshoot and compared against the lowered
+    # value. A counter that rounds per call (`len // 4`) makes the joined
+    # block cost a few units more than its parts, so every retry overshot
+    # by the same amount, it gave up after four, and the piece it was
+    # asked to cut was dropped whole — observed on a repair prompt that
+    # lost the entire file it was repairing.
+    for _ in range(8):
+        if budget <= 0:
+            return ""
+        block = head + text[:int(budget * ratio)] + note
+        over = cost_of(block) - room
+        if over <= 0:
+            return block
+        budget -= max(over, 1) * 2
+    return ""
+
+
+def _omissions(dropped: Sequence[str], declare: str, *, room: int) -> str:
+    """The NOT INCLUDED block, its label list shortened to fit `room`."""
+    head = "\n--- NOT INCLUDED ---\n"
+    tail = f"{declare}\n" if declare else ""
+    if not dropped:
+        return (head + "Nothing was left out; this is everything "
+                "relevant.\n" + tail)
+    lead = "The following were left out to fit the context window: "
+    ask = (".\nIf you need any of them, say so or look them up instead of "
+           "guessing at their contents.\n")
+    shown = list(dropped)
+    while True:
+        more = len(dropped) - len(shown)
+        names = ", ".join(shown) or f"{len(dropped)} item(s)"
+        if more and shown:
+            names += f", and {more} more"
+        block = head + lead + names + ask + tail
+        if len(block) <= room or not shown:
+            return block
+        shown.pop()
 
 
 def _limit(budget: int | Budget) -> tuple[int, str]:
@@ -388,9 +459,8 @@ def project_map(fs: Any, max_files: int = 200) -> str:
     principle, applied to a smaller thing).
     """
     from . import langs
-    skip = {".git", "__pycache__", "node_modules", "target", "build", "dist",
-            ".venv", "venv", "envs", ".cc_snapshots", ".atk_snapshots",
-            ".idea", ".vscode", "obj", "bin", ".python", ".tools"}
+    from .codemap import SKIP_DIRS
+    skip = set(SKIP_DIRS) | {"envs", ".idea", ".vscode", "obj", "bin"}
     rows: list[str] = []
     total = 0
     try:
@@ -448,8 +518,8 @@ def relevant_files(fs: Any, query: str, limit: int = 6) -> list[str]:
     words -= _STOPWORDS
     if not words:
         return []
-    skip = {".git", "__pycache__", "node_modules", "target", ".venv", "venv",
-            "envs", ".cc_snapshots", "build", "dist"}
+    from .codemap import SKIP_DIRS
+    skip = set(SKIP_DIRS) | {"envs"}
     scored: list[tuple[int, str]] = []
     try:
         paths = fs.list("*")

@@ -42,9 +42,9 @@ import re
 from typing import Any
 
 from . import diagnostics as dx
-from . import langs, personas
+from . import langs, personas, runner
 from .personas import PERSONAS, PromptBuilder, strip_think
-from .providers.base import repair_json
+from .providers.base import find_json_object
 from .types import Diagnostic
 
 # A function longer than this is not necessarily wrong, but it is worth a
@@ -84,6 +84,11 @@ class ReviewResult:
     findings: list[Finding] = field(default_factory=list)
     scanners_run: list[str] = field(default_factory=list)
     scanners_absent: list[str] = field(default_factory=list)
+    #: Installed, started, and produced no usable result (timed out, or
+    #: output that was not what it was asked for). Kept apart from both
+    #: lists above: it did not run in any sense that supports "no
+    #: findings", and it is not absent either.
+    scanners_failed: list[str] = field(default_factory=list)
     model_reviewed: bool = False
     same_model: bool = True
     model_name: str = ""
@@ -356,10 +361,18 @@ def scan_untested(text: str, test_source: str, lang_id: str = "",
 # ==========================================================================
 
 #: name → (argv template, languages, what its absence costs)
+#:
+#: semgrep is a DESIGN CHANGE: it used to run with `--config=auto`, which
+#: downloads rules from the semgrep registry and sends usage metrics —
+#: network traffic from a stage this engine promises is offline (C3). It
+#: now runs only against a LOCAL rules file (see `SEMGREP_CONFIGS`), with
+#: metrics and the version check off; without one it is reported as not
+#: run, and why.
 SCANNERS: dict[str, tuple[list[str], tuple[str, ...], str]] = {
     "bandit": (["{tool}", "-f", "json", "-q", "{src}"], ("python",),
                "Python security scanning is limited to the built-in checks"),
-    "semgrep": (["{tool}", "--json", "--quiet", "--config=auto", "{src}"],
+    "semgrep": (["{tool}", "--json", "--quiet", "--metrics=off",
+                 "--disable-version-check", "--config={config}", "{src}"],
                 (), "cross-language rule scanning is unavailable"),
     "cppcheck": (["{tool}", "--enable=warning,performance,portability",
                   "--quiet", "--template={file}:{line}:{severity}:{message}",
@@ -372,16 +385,32 @@ SCANNERS: dict[str, tuple[list[str], tuple[str, ...], str]] = {
 }
 
 
+#: Local semgrep rules files, looked for in the project root, in order.
+SEMGREP_CONFIGS = (".semgrep.yml", ".semgrep.yaml", ".semgrep")
+
+#: Seconds a scanner may take. A scanner is a program being verified
+#: against, not the model, so it gets a clock.
+SCANNER_TIMEOUT = 120
+
+
 def run_scanners(path: str, lang_id: str, *, fs: Any, ex: Any,
-                 workdir: str = "") -> tuple[list[Finding], list[str],
-                                             list[str]]:
-    """Run whatever is installed. Returns (findings, ran, absent)."""
+                 workdir: str = "", failed: list[str] | None = None
+                 ) -> tuple[list[Finding], list[str], list[str]]:
+    """Run whatever is installed. Returns (findings, ran, absent).
+
+    A scanner is listed as RUN only when it produced a result that was
+    read. One that timed out, or whose output was not the JSON it was
+    asked for, is appended to `failed` instead: it used to be listed as
+    run, which let "No security findings" stand on a check that never
+    completed.
+    """
     import json
 
     root = workdir or fs.root()
     findings: list[Finding] = []
     ran: list[str] = []
     absent: list[str] = []
+    failed = failed if failed is not None else []
 
     for name, (template, langs_for, cost) in SCANNERS.items():
         if langs_for and lang_id not in langs_for:
@@ -390,31 +419,60 @@ def run_scanners(path: str, lang_id: str, *, fs: Any, ex: Any,
         if not tool:
             absent.append(f"{name} — {cost}")
             continue
-        argv = [p.format(tool=tool, src=_join(root, path)) for p in template]
+        config = ""
+        if name == "semgrep":
+            config = next((c for c in SEMGREP_CONFIGS if _exists(fs, c)), "")
+            if not config:
+                absent.append(
+                    f"{name} — installed, but there are no local rules "
+                    f"({' or '.join(SEMGREP_CONFIGS[:2])}) in the project, "
+                    f"and this engine does not fetch rules from the "
+                    f"registry")
+                continue
+        argv = [p.format(tool=tool, src=_join(root, path),
+                         config=_join(root, config)) for p in template]
         try:
-            proc = ex.run(argv, cwd=root, timeout=120)
+            # An explicit scrubbed environment: a host's ExecPort may
+            # treat `env=None` as "inherit", and a scanner needs no
+            # tokens and no proxy (C3).
+            proc = ex.run(argv, cwd=root, timeout=SCANNER_TIMEOUT,
+                          env=runner.scrubbed_env(root, root))
         except Exception:                                # noqa: BLE001
             absent.append(f"{name} — it is installed but would not run")
             continue
-        ran.append(name)
-        text = proc.output
-        if name == "cppcheck":
-            findings.extend(_from_cppcheck(text, path))
+        if getattr(proc, "timed_out", False):
+            failed.append(f"{name} — installed, but it timed out after "
+                          f"{SCANNER_TIMEOUT} s and did not produce a "
+                          f"result")
             continue
+        if name == "cppcheck":
+            # cppcheck writes its --template lines to stderr; it is the one
+            # scanner whose findings are not on stdout.
+            ran.append(name)
+            findings.extend(_from_cppcheck(proc.output, path))
+            continue
+        # STDOUT ONLY. `proc.output` joins stderr, so one warning line
+        # beside valid JSON ("could not load plugin foo") made the parse
+        # fail, the findings vanish, and bandit still count as run.
+        text = getattr(proc, "stdout", "") or ""
         try:
             data = json.loads(text)
         except (ValueError, TypeError):
-            # A scanner that produced nothing parseable has still told us
-            # something, and dropping it silently is M29's mistake in a
-            # different module.
-            if proc.exit_code not in (0, 1) and text.strip():
-                findings.append(Finding(
-                    severity="note", category="quality",
-                    title=f"{name} ran but its output could not be read",
-                    detail=text.strip()[-300:], path=path, source=name))
+            failed.append(f"{name} — installed, but its output could not "
+                          f"be read as the JSON it was asked for (exit "
+                          f"{proc.exit_code}), so it did not produce a "
+                          f"result")
             continue
+        ran.append(name)
         findings.extend(_from_json(name, data, path))
     return findings, ran, absent
+
+
+def _exists(fs: Any, path: str) -> bool:
+    try:
+        return bool(fs.exists(path))
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def _from_json(name: str, data: Any, path: str) -> list[Finding]:
@@ -569,33 +627,98 @@ def model_review(code: str, path: str, *, llm: Any, prompts: PromptBuilder,
         return [], "", False
 
     text = strip_think(completion.text)
-    data, repaired = repair_json(text)
-    if not data:
+    # The LAST object carrying the schema's keys, not the first balanced
+    # one: a reasoning model restates the schema before answering, and the
+    # first object was taken — findings titled "one line" with severity
+    # "high|medium|low", the real high finding lost, and the document
+    # saying nothing should stop the code being used.
+    data = find_json_object(text, keys=("security", "performance"))
+    empty_answer = not data and bool(re.search(r"\{\s*\}", text))
+    if not data and not empty_answer:
         return [], "", False
+    if data and "security" not in data and "performance" not in data:
+        # Valid JSON with the wrong keys (`{"findings": [...]}`) used to
+        # count as a review that found nothing: fail-open. It is not an
+        # answer to the question that was asked.
+        return [], "", False
+    repaired = not _is_bare_json_object(text)
 
     findings: list[Finding] = []
     for category in ("security", "performance"):
-        for row in data.get(category, []) or []:
+        rows = data.get(category) or []
+        for row in rows if isinstance(rows, list) else ():
             if not isinstance(row, dict):
                 continue
             title = str(row.get("title", "")).strip()
             if not title:
                 continue
             findings.append(Finding(
-                severity=str(row.get("severity", "low")).lower(),
+                severity=normalise_severity(row.get("severity")),
                 category=category, title=title[:160],
-                detail=str(row.get("detail", "")),
-                path=path, line=int(row.get("line", 0) or 0),
-                fix=str(row.get("fix", "")), source="model"))
-    overall = str(data.get("overall", "")).strip()
+                detail=str(row.get("detail", "") or ""),
+                path=path, line=_line_number(row.get("line")),
+                fix=str(row.get("fix", "") or ""), source="model"))
+    overall = str(data.get("overall", "") or "").strip()
+    if not findings and not overall:
+        # `{}` is a complete answer: "nothing". It used to be reported as
+        # "did not produce a usable answer", which says the opposite.
+        overall = ("The model review found nothing further to report "
+                   "beyond the automated checks.")
     if repaired:
         overall += ("  (The model's answer needed repairing before it could "
                     "be read, which usually means grammar-constrained "
                     "decoding is available and switched off.)")
-    return findings, overall, True
+    return findings, overall.strip(), True
 
 
-def _numbered(code: str, limit: int = 400) -> str:
+#: Model severities → ours. Anything not listed is HIGH: an unknown word
+#: is a finding nobody has triaged, and ranking it low is how "CRITICAL"
+#: (lower-cased, never normalised) ended up sorted below the style notes.
+_SEVERITY = {
+    "critical": "high", "high": "high", "severe": "high", "blocker": "high",
+    "major": "high", "error": "high",
+    "medium": "medium", "moderate": "medium", "med": "medium",
+    "warning": "medium",
+    "low": "low", "minor": "low", "info": "low", "informational": "low",
+    "note": "low", "trivial": "low",
+}
+
+
+def normalise_severity(value: Any) -> str:
+    """One of high/medium/low; unknown or missing fails CLOSED to high."""
+    return _SEVERITY.get(str(value or "").strip().lower(), "high")
+
+
+def _line_number(value: Any) -> int:
+    """The first integer in `value`, or 0.
+
+    `int(row.get("line"))` raised ValueError on "3-4" — a perfectly
+    reasonable answer — straight through `session.review()` as a traceback.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    m = re.search(r"\d+", str(value or ""))
+    return int(m.group(0)) if m else 0
+
+
+def _is_bare_json_object(text: str) -> bool:
+    import json
+    try:
+        return isinstance(json.loads((text or "").strip()), dict)
+    except ValueError:
+        return False
+
+
+#: Lines of a file the model is shown. The deterministic scans see all of
+#: it; the document says so when the model did not.
+REVIEW_WINDOW = 400
+
+
+def _numbered(code: str, limit: int = REVIEW_WINDOW) -> str:
     lines = code.splitlines()[:limit]
     body = "\n".join(f"{n:>4} | {line}" for n, line in enumerate(lines, 1))
     if len(code.splitlines()) > limit:
@@ -622,11 +745,19 @@ def review(code: str, path: str, *, lang_id: str = "python",
         result.findings.extend(scan_untested(code, test_source, lang_id, path))
 
     if fs is not None and ex is not None:
+        failed: list[str] = []
         found, ran, absent = run_scanners(path, lang_id, fs=fs, ex=ex,
-                                          workdir=workdir)
+                                          workdir=workdir, failed=failed)
         result.findings.extend(found)
         result.scanners_run = ran
         result.scanners_absent = absent
+        result.scanners_failed = failed
+        # Also as a NOTE, which every caller that merges results carries
+        # into the document — a scanner that silently did not finish is
+        # exactly what "no findings" must not be allowed to hide.
+        for entry in failed:
+            result.notes.append(f"Scanner {entry}; its checks are "
+                                f"missing from this review.")
 
     if use_model and llm is not None:
         caps = _capabilities(llm)
@@ -639,6 +770,12 @@ def review(code: str, path: str, *, lang_id: str = "python",
             result.findings.extend(model_findings)
             if overall:
                 result.notes.append(overall)
+            total = len(code.splitlines())
+            if total > REVIEW_WINDOW:
+                result.notes.append(
+                    f"The model reviewed only the first {REVIEW_WINDOW} "
+                    f"lines of `{path}` ({total} in all); the rest was "
+                    f"checked by the automated scans alone.")
         else:
             result.notes.append(
                 "The model review did not produce a usable answer, so only "
@@ -646,6 +783,10 @@ def review(code: str, path: str, *, lang_id: str = "python",
         # M41: two personas from one model are one opinion expressed twice.
         result.same_model = True
     return result
+
+
+#: A caveat or summary that says no test ran.
+_NO_TESTS = re.compile(r"(?i)\b(?:zero|0|no)\s+tests?\b")
 
 
 def _capabilities(llm: Any):
@@ -665,7 +806,9 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
                             skill_level: str = "intermediate",
                             build_summary: str = "",
                             unfinished: Sequence[str] = (),
-                            caveats: Sequence[str] = ()) -> str:
+                            caveats: Sequence[str] = (),
+                            tests_ran: bool | None = None,
+                            untested: Sequence[str] = ()) -> str:
     """The deliverable. Four sections, and the honesty line near the top.
 
     Pitched at `skill_level` because a deployment guide that assumes
@@ -680,12 +823,9 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
         else "intermediate"
     lines: list[str] = ["# Recommendation Document", ""]
 
-    if request:
-        lines += [f"**What was asked for:** {request}", ""]
-    if files:
-        lines += [f"**Files reviewed:** {', '.join(files)}", ""]
-
-    # M41 — one line, near the top, where it cannot be missed.
+    # M41 — one line, near the top, where it cannot be missed. ABOVE the
+    # request: with a pasted spec as the request, this line landed 75% of
+    # the way down the page, after the reader had decided what to believe.
     if result.model_reviewed and result.same_model:
         lines += [
             "> **These perspectives are not independent.** The security and "
@@ -695,6 +835,18 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
               "than two reviewers agreeing. Treat agreement between them as "
               "no evidence at all.",
             ""]
+
+    if request:
+        lines += [f"**What was asked for:** {request}", ""]
+    if files:
+        lines += [f"**Files reviewed:** {', '.join(files)}", ""]
+
+    # Whether any test actually ran. The caller knows best; when it does
+    # not say, the evidence caveats do — the all-clear used to print
+    # directly above "the test command ran ZERO tests".
+    if tests_ran is None:
+        tests_ran = not any(_NO_TESTS.search(str(c))
+                            for c in (*caveats, build_summary))
 
     # -- 1. Executive Summary -------------------------------------------
     #
@@ -744,6 +896,20 @@ def recommendation_document(result: ReviewResult, *, request: str = "",
             lines.append(f"- {f.title}"
                          + (f" — `{f.path}:{f.line}`" if f.line else ""))
         lines.append("")
+    elif not unfinished and not tests_ran:
+        lines += ["No blocking issue was found, but no tests ran, so "
+                  "nothing here shows that the program works — see the "
+                  "caveats below.", ""]
+    elif not unfinished and untested:
+        # Some files were tested and some were not. The all-clear would
+        # speak for the untested ones too, and it has no evidence about
+        # them; "no tests ran" would be false about the others.
+        names = ", ".join(f"`{p}`" for p in list(untested)[:5])
+        more = (f" and {len(untested) - 5} more"
+                if len(untested) > 5 else "")
+        lines += [f"No blocking issue was found, but {len(untested)} "
+                  f"file(s) have no tests ({names}{more}), so for those "
+                  f"nothing here shows that they work.", ""]
     elif not unfinished:
         lines += ["Nothing was found that should stop this being used.", ""]
     else:
@@ -824,12 +990,19 @@ def _scanner_coverage(result: ReviewResult) -> list[str]:
     lines: list[str] = []
     if result.scanners_run:
         lines.append(f"*Scanners run:* {', '.join(result.scanners_run)}.")
+    if result.scanners_failed:
+        lines.append("")
+        lines.append("*Installed, but did not produce a result:*")
+        for note in result.scanners_failed:
+            lines.append(f"- {note}")
     if result.scanners_absent:
         lines.append("")
-        lines.append("*Not checked, because these are not installed:*")
+        lines.append("*Not checked, because these are not installed "
+                     "(or not set up to run offline):*")
         for note in result.scanners_absent:
             lines.append(f"- {note}")
-    if not result.scanners_run and not result.scanners_absent:
+    if not (result.scanners_run or result.scanners_absent
+            or result.scanners_failed):
         lines.append("*Only the built-in checks ran; no external scanner was "
                      "available.*")
     lines.append("")

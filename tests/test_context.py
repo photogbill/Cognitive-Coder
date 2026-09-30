@@ -213,3 +213,74 @@ def test_the_budget_survives_a_port_that_raises():
     budget = ctx.measure_budget(Broken())
     assert budget.prompt_tokens > 0
     assert "could not be asked" in budget.note
+
+
+# --------------------------------------------------------------------------
+# the budget is the WHOLE output (item 17)
+# --------------------------------------------------------------------------
+
+def test_a_first_piece_bigger_than_the_budget_is_cut_not_emitted_whole():
+    """It was emitted whole — 10,000 characters against a 1,000 budget —
+    while the omissions block said the rest "was left out to fit"."""
+    from cognitive_coder import context as ctx
+    out = ctx.build_context([ctx.Piece("huge file", "x" * 10_000, priority=1),
+                             ctx.Piece("small", "y" * 10, priority=2)],
+                            1_000)
+    assert len(out) <= 1_000, len(out)
+    assert "x" * 2_000 not in out
+    assert "huge file" in out.split("NOT INCLUDED")[1]
+
+
+def test_the_omissions_block_is_inside_the_budget():
+    from cognitive_coder import context as ctx
+    pieces = [ctx.Piece(f"file number {i} with a long label", "z" * 90,
+                        priority=i) for i in range(40)]
+    out = ctx.build_context(pieces, 1_200)
+    assert len(out) <= 1_200, len(out)
+    assert "NOT INCLUDED" in out
+
+
+def test_an_outline_lists_definitions_not_the_module_row():
+    """The codemap's parser emits a `module` symbol for binding; the ATK
+    adapter reads `symbols(source)[0].name` and must get the function."""
+    from cognitive_coder import context as ctx
+    syms = ctx.symbols('def load(p):\n    """Load."""\n    return []\n',
+                       "python")
+    assert [s.name for s in syms] == ["load"]
+
+
+def test_engine_working_directories_are_never_offered_as_source():
+    """Autofix's scratch copies and compiled test harnesses now live under
+    `.cc_state/`. The codemap's skip list and context.py's two private
+    copies of it all lacked that directory, so the project map and the
+    relevance search would have handed the model the engine's own debris
+    as if it were the project."""
+    from cognitive_coder.codemap import CodeMap
+    from cognitive_coder.context import project_map, relevant_files
+    from cognitive_coder.ports import MemoryFileSystem, MemoryStorage
+    fs = MemoryFileSystem({
+        "src/parser.py": b"def parse_readings(text):\n    return text\n",
+        ".cc_state/scratch/parser.py":
+            b"def parse_readings(text):\n    return None\n",
+        ".cc_state/build/test_parser.py": b"parse_readings = 1\n",
+    })
+    assert ".cc_state" not in project_map(fs)
+    assert all(".cc_state" not in p
+               for p in relevant_files(fs, "parse readings"))
+    cm = CodeMap(fs, MemoryStorage())
+    cm.index_project()
+    assert all(not f["path"].startswith(".cc_state")
+               for f in cm.store.files())
+
+
+def test_an_oversized_piece_is_cut_even_with_a_rounding_token_counter():
+    """`_cut_to_fit` lowered its target by each overshoot and compared
+    against the lowered target. With a counter that rounds per call
+    (`len // 4`, the documented estimate) every retry overshot by the same
+    few units, it gave up, and the essential piece was dropped whole."""
+    from cognitive_coder.context import Piece, build_context
+    big = "".join(f"value_{i} = {i}\n" for i in range(3000))
+    out = build_context([Piece("THE FILE", big, essential=True)], 10_000,
+                        count_tokens=lambda t: max(1, len(t) // 4))
+    assert "value_0 = 0" in out and "cut to fit" in out
+    assert len(out) <= 10_000

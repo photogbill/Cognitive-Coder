@@ -32,16 +32,22 @@ destroys.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 import time
 from typing import Any
 import uuid
 
 from . import journal as journal_mod
-from . import personas
+from . import langs, personas
 from . import skills as skills_mod
 from .codemap import CodeMap
-from .errors import BudgetExceeded, Cancelled, NoModelLoadedError
+from .errors import (
+    BudgetExceeded,
+    Cancelled,
+    CognitiveCoderError,
+    NoModelLoadedError,
+)
 from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
 from .patcher import Patcher
@@ -83,6 +89,12 @@ class SessionConfig:
     #: arbitrary for a four-section design document, which is the case the
     #: --spec flag exists to serve.
     max_files: int = 12
+    #: Pair every source file with a planned tester task (M39). Off by
+    #: default only because it adds a generation per file and the committed
+    #: golden trace scripts its replies for the unpaired plan — see
+    #: `Planner.pair_tests`. Without it, a file with no test file is "built
+    #: and ran", and the session summary counts how many are in that state.
+    pair_tests: bool = False
     conventions: str = ""
     #: Deployed skills (F3). Discovered once, at Session construction, from
     #: `skills_dir` — never re-read mid-session, because the prefix must not
@@ -113,8 +125,13 @@ class Session:
                                directory=self.config.journal_dir)
         #: The readable half. The JSONL defends a change; this explains a
         #: behaviour — see SessionLog for the line that made the difference.
+        # `events` so a build log that stops being writable says so. Without
+        # it the log's write failures were counted and never reported —
+        # BUILD_LOG.txt is the file an operator reads, so its silence is
+        # the one silence that matters.
         self.log = SessionLog(host.fs, self.id,
-                              directory=self.config.journal_dir)
+                              directory=self.config.journal_dir,
+                              events=host.events)
         # One gate per session, never global and never persisted: a gate
         # that survives a restart is a gate that turns itself on while
         # nobody is looking (C3).
@@ -141,7 +158,9 @@ class Session:
         self.planner = Planner(host, codemap=self.codemap,
                                journal=self.journal, prompts=self.prompts,
                                lang=self.config.lang,
-                               max_files=self.config.max_files)
+                               max_files=self.config.max_files,
+                               patcher=self.patcher,
+                               pair_tests=self.config.pair_tests)
         self.loop = Loop(
             host, codemap=self.codemap, patcher=self.patcher,
             journal=self.journal, prompts=self.prompts,
@@ -162,9 +181,17 @@ class Session:
 
         self.plan: Plan | None = None
         self.outcomes: list[TaskOutcome] = []
+        #: Modules to repair against a test that failed on them:
+        #: (module task, test task, the test's failing diagnostics). One
+        #: pass per module per session — a second would be a loop.
+        self._repairs: list[tuple[Task, Task, tuple]] = []
+        self._repaired: set[str] = set()
+        #: What the session was doing, for the sentence a failure earns.
+        self._where = ""
         self.profile: dict = {}
         self.last_review: Any = None
         self._model: str = ""
+        self._context: int = 0
         self._started = 0.0
         self._finished = False
 
@@ -180,6 +207,7 @@ class Session:
         profile must work, and does.
         """
         self._started = time.monotonic()
+        self._where = "planning"
         self.profile = dict(profile or {})
         caps = self._capabilities(boundary="session start")
         self.journal.log("session_start", request=request,
@@ -227,6 +255,18 @@ class Session:
             #: and ended three failed attempts later.
             self.plan = self.planner.derive_order(self.plan)
             result = self.planner.skeleton(self.plan)
+            if result.get("kept"):
+                # Visible in the plan, not only in an event that scrolled
+                # past: the operator should be able to see that the engine
+                # declined to stub over their file, and that the file's task
+                # will still change it — through a transaction they can undo.
+                kept = ", ".join(result["kept"])
+                self.plan = dataclasses.replace(
+                    self.plan, caveats=self.plan.caveats + (
+                        f"{kept} already had real work in it and was kept "
+                        f"as found — no stub was written over it; its task "
+                        f"will change it in place, as an undoable "
+                        f"transaction",))
             if not result["ok"]:
                 # An architecturally wrong skeleton is caught HERE, in
                 # seconds, which is the entire point of §4.2. It is a
@@ -238,6 +278,13 @@ class Session:
                                f"watch the first file.",
                                {"phase": "skeleton"})
             self.plan = self.planner.derive_order(self.plan)
+            # The epoch snapshot was taken at start, BEFORE the skeleton
+            # existed. The planner indexes each stub as it writes it, but
+            # the cached prefix serves the snapshot — so the first file was
+            # generated against a project with no architecture in it, which
+            # is the one thing skeleton-first exists to provide. A new plan
+            # is an epoch boundary (G.7.2); this is that boundary.
+            self.codemap.maybe_bump_epoch(replanned=True)
         return self.plan
 
     def preview(self, request: str, profile: dict | None = None) -> dict:
@@ -271,6 +318,11 @@ class Session:
         """
         from . import spec as spec_mod
 
+        #: Marked FIRST, so the journal this writes is never mistaken for a
+        #: session that was building: `previous_sessions()` skips it and
+        #: `resume()` refuses it.
+        self.journal.log("preview", request=request,
+                         note="planned only; nothing was built")
         described = spec_mod.from_text(request)
         self.plan = self.planner.plan(request, profile)
         if self.config.skeleton_first:
@@ -308,6 +360,8 @@ class Session:
         if self.plan is None:
             raise RuntimeError("start() before step()")
         self._check_budget()
+        if self._repairs:
+            return self._repair_step()
         task = self.plan.next_ready()
         if task is None:
             return None
@@ -318,8 +372,22 @@ class Session:
                 "capabilities() reports no model at a task boundary")
 
         self.plan = self.plan.replace(task.with_status("active"))
-        outcome = self.loop.run_task(task, request=self.plan.request)
+        self._where = task.path
+        covers = self._covered_module(task)
+        outcome = self.loop.run_task(task, request=self.plan.request,
+                                     covers=covers.path if covers else "")
         self.outcomes.append(outcome)
+        blamed = self.loop.blamed.pop(task.path, None)
+        if blamed and covers is not None and covers.path not in self._repaired:
+            # The test disagreed with its module and was NOT rewritten.
+            # The module is what changes: one repair pass, against the
+            # test's own failing output, and then the test is run again.
+            self._repaired.add(covers.path)
+            self._repairs.append((covers, task, tuple(blamed[1])))
+            self.host.emit("status",
+                           f"{covers.path} will be repaired against "
+                           f"{task.path}, which it fails",
+                           {"task": covers.path, "test": task.path})
         # M31: a model without tool calling gets a summary that may not lag,
         # because it cannot look anything up to correct one that does. Read
         # from capabilities at the task boundary, so a mid-session model swap
@@ -347,6 +415,80 @@ class Session:
         self.codemap.maybe_bump_epoch(target=task.path)
         return outcome
 
+    def _repair_step(self) -> TaskOutcome:
+        """Repair a module against the test it failed, then re-run the test.
+
+        The fix task has the module's path and purpose and the test as its
+        `test_path`; its first attempt is a REPAIR seeded with the test's
+        failing output, and its prompt carries the test itself as the
+        specification. If it verifies, the test task is verified again —
+        without generating anything — and that verdict is what the session
+        reports for the test.
+        """
+        module, test, failing = self._repairs.pop(0)
+        self._where = f"the repair of {module.path}"
+        caps = self._capabilities(boundary=f"repair of {module.path}")
+        if not caps.loaded:
+            raise NoModelLoadedError(
+                "capabilities() reports no model at a task boundary")
+        fix = Task(id=f"{module.id}-fix", path=module.path,
+                   purpose=module.purpose, test_path=test.path,
+                   persona=module.persona, lang=module.lang, atomic=False)
+        outcome = self.loop.run_task(fix, request=self.plan.request,
+                                     seed=failing)
+        self._record(fix, outcome, label="REPAIRED" if outcome.ok
+                     else "NOT REPAIRED")
+        if not outcome.ok:
+            return outcome
+        again = self.loop.reverify(
+            test, because=f"{module.path} was repaired against it")
+        self._record(test, again, label="DONE" if again.ok else "FAILED")
+        self.plan = self.plan.replace(test.with_status(
+            "done" if again.ok else "failed"))
+        return again
+
+    def _record(self, task: Task, outcome: TaskOutcome, *,
+                label: str) -> None:
+        self.outcomes.append(outcome)
+        self.log.event(f"{label} {task.path}",
+                       f"{len(outcome.attempts)} attempt(s)"
+                       + (f" — {outcome.stopped_because}"
+                          if outcome.stopped_because else ""))
+        self.journal.log("verify", task=task.path,
+                         verify={"ok": outcome.ok,
+                                 "attempts": len(outcome.attempts),
+                                 "caveats": list(outcome.caveats)},
+                         stopped_because=outcome.stopped_because)
+
+    def _covered_module(self, task: Task) -> Task | None:
+        """For a test task, the planned module it tests; else None."""
+        if self.plan is None or not (task.persona == "tester"
+                                     or _looks_like_test(task.path)):
+            return None
+        for other in self.plan.tasks:
+            if other.id != task.id and other.test_path == task.path:
+                return other
+        stem = task.path.replace("\\", "/").rsplit("/", 1)[-1]
+        stem = stem.rsplit(".", 1)[0].removeprefix("test_")
+        stem = stem.removesuffix("_test")
+        for other in self.plan.tasks:
+            name = other.path.replace("\\", "/").rsplit("/", 1)[-1]
+            if other.id != task.id and not _looks_like_test(other.path) \
+                    and name.rsplit(".", 1)[0] == stem:
+                return other
+        return None
+
+    def _final_outcomes(self) -> list[TaskOutcome]:
+        """The LAST outcome per file, in the order files were first built.
+
+        A module repaired against its test, and a test verified again
+        afterwards, each have two outcomes; the later one is the verdict.
+        """
+        final: dict[str, TaskOutcome] = {}
+        for o in self.outcomes:
+            final[o.path] = o
+        return list(final.values())
+
     def run(self, request: str = "", profile: dict | None = None
             ) -> list[TaskOutcome]:
         """Plan and build everything. The one-call path for a CLI.
@@ -354,10 +496,34 @@ class Session:
         Cancellation and budget exhaustion both leave resumable state and
         end with a session_end event — a stop is a finished session with an
         honest ending, not an absence of one.
+
+        ANYTHING ELSE THAT GOES WRONG REACHES THE HOST AS A SENTENCE (C6).
+        A Port can raise what it likes — a child's output that is not
+        UTF-8 escaped from here as a UnicodeDecodeError traceback, and
+        `CognitiveCoderError.wrap`, built for exactly this, was never
+        called. Now the traceback goes to the journal, an `error` event
+        carries the sentence and the journal's path (docs/PORTS.md), the
+        session still ends with `session_end`, and what is raised is a
+        CognitiveCoderError whose text is the sentence.
         """
-        if request:
-            self.start(request, profile)
         try:
+            self._run(request, profile)
+        except CognitiveCoderError as exc:
+            self._report_failure(exc)
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            wrapped = CognitiveCoderError.wrap(
+                exc, self._unexpected_sentence(exc))
+            self._report_failure(wrapped)
+            raise wrapped from None
+        finally:
+            self.finish()
+        return self.outcomes
+
+    def _run(self, request: str, profile: dict | None) -> None:
+        try:
+            if request:
+                self.start(request, profile)
             while True:
                 outcome = self.step()
                 if outcome is None:
@@ -398,13 +564,33 @@ class Session:
             # reads as authoritative and is not.
             if self.config.review_after_build and any(o.ok
                                                       for o in self.outcomes):
+                self._where = "the review"
                 try:
                     self.review()
                 except Cancelled:
                     self.journal.log("cancel", where="review")
-        finally:
-            self.finish()
-        return self.outcomes
+
+    def _unexpected_sentence(self, exc: BaseException) -> str:
+        """What happened, where, and where the details are — no type names."""
+        where = f" while working on {self._where}" if self._where else ""
+        return (f"The session stopped unexpectedly{where}: "
+                f"{_plain_cause(exc)}. Work already verified has been kept "
+                f"and anything half-applied was rolled back. The details are "
+                f"in the journal at {self.journal.path}.")
+
+    def _report_failure(self, exc: CognitiveCoderError) -> None:
+        """Journal the traceback; hand the host the sentence and a pointer.
+
+        Never raises: this runs on the way out of a failure, and a second
+        failure here would replace the sentence with a traceback.
+        """
+        try:
+            self.journal.error(exc.sentence, exc.detail,
+                               journal=self.journal.path, where=self._where)
+        except Exception:                                 # noqa: BLE001
+            pass
+        self.host.emit("error", exc.sentence,
+                       {"journal": self.journal.path, "where": self._where})
 
     def review(self, *, use_model: bool = True) -> str:
         """The review stage, AFTER everything builds and its tests pass (§4.3).
@@ -416,7 +602,8 @@ class Session:
         """
         from . import review as review_mod
 
-        done = [o for o in self.outcomes if o.ok]
+        final = self._final_outcomes()
+        done = [o for o in final if o.ok]
         if not done:
             self.host.emit("warning",
                            "Nothing verified, so there is nothing to review. "
@@ -455,10 +642,36 @@ class Session:
             for name in one.scanners_absent:
                 if name not in merged.scanners_absent:
                     merged.scanners_absent.append(name)
+            # A scanner that was installed but timed out or printed
+            # something unreadable. Dropped here, it vanished from the
+            # merged result and the document said "No security findings"
+            # on the strength of a tool that never produced an answer.
+            for note in one.scanners_failed:
+                if note not in merged.scanners_failed:
+                    merged.scanners_failed.append(note)
+
+        # What the tests actually covered. The build line used to read
+        # "N of M file(s) built and their tests ran" whatever the tests
+        # did, and the all-clear was printed on the strength of it.
+        untested = [p for p in self._untested(final) if p in
+                    {o.path for o in done}]
+        zero = self._unverified(final)
+        sources = [o.path for o in done if not _looks_like_test(o.path)]
+        no_evidence = sorted(set(untested) | set(zero))
+        tests_ran = bool(sources) and len(no_evidence) < len(sources)
+        verification = f"{len(done)} of {len(final)} file(s) built"
+        if not no_evidence:
+            verification += " and their tests ran"
+        elif not tests_ran:
+            verification += ", and no tests ran for any of them"
+        else:
+            verification += (f"; {len(no_evidence)} of them have no tests "
+                             f"that ran")
 
         self.journal.log("review", findings=len(merged.findings),
                          high=len(merged.high),
                          scanners=merged.scanners_run,
+                         scanners_failed=merged.scanners_failed,
                          model_reviewed=merged.model_reviewed,
                          same_model=merged.same_model)
         for finding in merged.high:
@@ -472,12 +685,13 @@ class Session:
             files=[o.path for o in done],
             skill_level=str(self.profile.get("skill_level",
                                              "intermediate")),
-            build_summary=f"{len(done)} of {len(self.outcomes)} file(s) "
-                          f"built and their tests ran",
+            build_summary=verification,
+            tests_ran=tests_ran,
+            untested=no_evidence if tests_ran else (),
             #: The reviewer only ever sees committed files, so without this it
             #: cannot tell a clean build from a collapsed one — and reports the
             #: second as the first.
-            unfinished=[o.path for o in self.outcomes if not o.ok],
+            unfinished=[o.path for o in final if not o.ok],
             caveats=sorted({c for o in done for c in o.caveats}))
         self.host.fs.write(self.config.recommendation_path, document)
         self.host.emit("status",
@@ -492,11 +706,18 @@ class Session:
             return self.report()
         self._finished = True
         stats = self.codemap.stats()
+        final = self._final_outcomes()
+        unverified = self._unverified(final)
+        untested = self._untested(final)
         self.journal.log(
             "session_end",
-            ok=all(o.ok for o in self.outcomes) and bool(self.outcomes),
-            files=[o.path for o in self.outcomes if o.ok],
-            failed=[o.path for o in self.outcomes if not o.ok],
+            #: "ok" means VERIFIED. A file whose test file exists and ran
+            #: nothing is not, however green its build was.
+            ok=bool(final) and all(o.ok for o in final) and not unverified,
+            files=[o.path for o in final if o.ok],
+            failed=[o.path for o in final if not o.ok],
+            unverified=unverified,
+            untested=untested,
             seconds=round(time.monotonic() - self._started, 1),
             codemap=stats.one_line(),
             remote=self.gate.active,
@@ -513,6 +734,28 @@ class Session:
                  "redactions": self.gate.redactions})
         self.host.emit("status", self.journal.summary())
         return self.report()
+
+    def _unverified(self, final: list[TaskOutcome]) -> list[str]:
+        return [o.path for o in final
+                if o.ok and o.path in self.loop.unverified]
+
+    def _untested(self, final: list[TaskOutcome]) -> list[str]:
+        """Built-and-ran files with no test file: a weaker claim, counted.
+
+        Not a failure — some files genuinely have no tests — but "verified"
+        cannot be said of them, and the summary says how many there are
+        rather than letting a green line imply otherwise.
+        """
+        out = []
+        for o in final:
+            if not o.ok or _looks_like_test(o.path):
+                continue
+            task = self.plan.task(o.task_id.removesuffix("-fix")) \
+                if self.plan else None
+            test_path = task.test_path if task else ""
+            if not test_path or not self.host.fs.exists(test_path):
+                out.append(o.path)
+        return out
 
     def _check_cancel(self) -> None:
         if self.cancel_token.is_set():
@@ -556,30 +799,36 @@ class Session:
         says what is on disk; between them the remaining work is a fact
         rather than a guess.
         """
-        session = cls(host, config=config, session_id=session_id)
-        state = journal_mod.resume_state(
-            host.fs, session_id, (config or SessionConfig()).journal_dir)
+        directory = (config or SessionConfig()).journal_dir
+        state = journal_mod.resume_state(host.fs, session_id, directory)
         if not state["events"]:
             raise FileNotFoundError(
                 f"There is no journal for session {session_id}, so there is "
                 f"nothing to resume. Start a new session instead.")
+        rows = list(journal_mod.read_jsonl(
+            host.fs, f"{directory}/{session_id}.jsonl"))
+        if _is_preview(rows):
+            raise CognitiveCoderError(
+                f"Session {session_id} was a preview — it planned and "
+                f"stopped, and nothing was built from it, so there is "
+                f"nothing to resume. Start a new session with the same "
+                f"request instead.")
+        session = cls(host, config=config, session_id=session_id)
         session.codemap.index_project()
 
         plan_data = state.get("plan") or {}
         files = list(plan_data.get("files") or [])
         if files:
-            done = set(state["done"])
-            tasks = []
-            for i, path in enumerate(files):
-                status = "done" if path in done else "pending"
-                tasks.append(Task(
-                    id=f"t{i + 1}", path=path,
-                    purpose=f"(resumed) part of: {state['request']}",
-                    test_path=session.planner.test_path_for(path),
-                    lang=session.config.lang, status=status,
-                    attempts=state["attempts"].get(path, 0)))
-            session.plan = session.planner.derive_order(
-                Plan(request=state["request"], tasks=tuple(tasks)))
+            session.plan = session.planner.derive_order(Plan(
+                request=state["request"],
+                tasks=tuple(session._resumed_tasks(plan_data, state))))
+        #: Files the skeleton declined to stub over. Without this the first
+        #: replan after a resume would mark the operator's own file "done"
+        #: because it has a body — the body that was there all along.
+        for row in rows:
+            if row.get("event") == "skeleton":
+                kept = (row.get("data") or {}).get("kept") or []
+                session.planner.kept_as_found = set(kept)
         session.journal.log("session_start", resumed_from=session_id,
                             request=state["request"],
                             done=state["done"], remaining=[
@@ -595,10 +844,57 @@ class Session:
         session.codemap.maybe_bump_epoch(operator_asked=True)
         return session
 
+    def _resumed_tasks(self, plan_data: dict, state: dict) -> list[Task]:
+        """The plan as it was journaled — purpose, persona, language, test
+        pairing and atomicity — with the status the journal proves.
+
+        A journal written before the `plan` event carried `tasks` has only
+        paths. For those the rest is INFERRED from the path, and the
+        inference is the conservative one: a test file is a tester's, the
+        language is the extension's, and a test path is kept only when that
+        file is planned or on disk.
+        """
+        files = list(plan_data.get("files") or [])
+        recorded = {d.get("path"): d for d in plan_data.get("tasks") or []
+                    if isinstance(d, dict)}
+        done = set(state["done"])
+        planned = {p.replace("\\", "/").lower() for p in files}
+        tasks = []
+        for i, path in enumerate(files):
+            meta = recorded.get(path) or {}
+            is_test = _looks_like_test(path)
+            if meta:
+                test_path = str(meta.get("test_path") or "")
+            else:
+                guess = "" if is_test else self.planner.test_path_for(path)
+                keep = guess and (guess.lower() in planned
+                                  or self.host.fs.exists(guess))
+                test_path = guess if keep else ""
+            tasks.append(Task(
+                id=f"t{i + 1}", path=path,
+                purpose=str(meta.get("purpose")
+                            or f"(resumed) part of: {state['request']}"),
+                test_path=test_path,
+                persona=str(meta.get("persona")
+                            or ("tester" if is_test else "engineer")),
+                lang=str(meta.get("lang") or langs.id_for_path(path)
+                         or self.config.lang),
+                atomic=bool(meta.get("atomic", False)),
+                status="done" if path in done else "pending",
+                attempts=state["attempts"].get(path, 0)))
+        return tasks
+
     @staticmethod
     def previous_sessions(host: Host,
                           directory: str = ".cc_journal") -> list[str]:
-        return journal_mod.sessions(host.fs, directory)
+        """Sessions that can be resumed — which excludes previews."""
+        out = []
+        for session_id in journal_mod.sessions(host.fs, directory):
+            rows = journal_mod.read_jsonl(
+                host.fs, f"{directory}/{session_id}.jsonl")
+            if not _is_preview(rows):
+                out.append(session_id)
+        return out
 
     # ------------------------------------------------------------------
     # reporting
@@ -631,6 +927,18 @@ class Session:
             for caveat in o.caveats:
                 lines.append(f"   CAVEAT: {caveat}")
             lines.append(f"   {mark}")
+        final = self._final_outcomes()
+        unverified = self._unverified(final)
+        if unverified:
+            lines.append(f"[verify]    {len(unverified)} file(s) NOT "
+                         f"verified — their test file ran no tests: "
+                         f"{', '.join(unverified)}")
+        built = [o for o in final if o.ok and not _looks_like_test(o.path)]
+        untested = self._untested(final)
+        if untested:
+            lines.append(f"[tests]     {len(untested)} of {len(built)} "
+                         f"file(s) have no tests — built and run, not "
+                         f"tested: {', '.join(untested)}")
         lines.append(f"[codemap]   {self.codemap.stats().one_line()}")
         lines.append(f"[journal]   {self.journal.summary()}")
         lines.append(f"            {self.journal.cache_health()}")
@@ -652,24 +960,37 @@ class Session:
                                "loaded.", str(exc))
             return ModelCapabilities(name="", family="unknown",
                                      context_tokens=0)
-        if caps.name != self._model:
+        # The same model reloaded with a different context size is a new
+        # KV cache too — the host reloaded it — so it is the same epoch
+        # boundary as a swap. Only the name used to count, and a host's
+        # "raise n_ctx" button left the old prefix snapshot in force.
+        resized = (caps.name == self._model and bool(self._model)
+                   and caps.context_tokens != self._context)
+        if caps.name != self._model or resized:
             if self._model:
                 # The model changed under us. The KV cache and any
                 # prompt-prefix state died with the old model, so the cached
                 # prefix is rebuilt — that is the whole of the core's
                 # involvement in a swap (§0.1 consequence 2).
+                what = (f"{caps.name} was reloaded with a "
+                        f"{caps.context_tokens:,}-token context (it was "
+                        f"{self._context:,})" if resized else
+                        f"The loaded model changed from "
+                        f"{self._model or 'none'} to {caps.name or 'none'}")
                 self.host.emit(
                     "warning",
-                    f"The loaded model changed from {self._model or 'none'} "
-                    f"to {caps.name or 'none'}. The cached prompt prefix has "
-                    f"been rebuilt; the next call will be slower.",
-                    {"was": self._model, "now": caps.name})
+                    f"{what}. The cached prompt prefix has been rebuilt; "
+                    f"the next call will be slower.",
+                    {"was": self._model, "now": caps.name,
+                     "context_was": self._context,
+                     "context_now": caps.context_tokens})
                 self.codemap.maybe_bump_epoch(model_changed=True)
             self.journal.log("epoch", model=caps.name, boundary=boundary,
                              context_tokens=caps.context_tokens,
                              supports_tools=caps.supports_tools,
                              is_remote=caps.is_remote)
             self._model = caps.name
+            self._context = caps.context_tokens
         if caps.is_remote:
             self.host.emit("remote",
                            "REMOTE MODE — data leaves this machine.",
@@ -720,6 +1041,27 @@ class Session:
             "are untouched — but you may want a clean working tree before "
             "letting it write.",
             {"git": True})
+
+
+def _plain_cause(exc: BaseException) -> str:
+    """An exception, described in words an operator can use (C6)."""
+    if isinstance(exc, UnicodeError):
+        return ("a program produced output that is not valid text in the "
+                "expected encoding")
+    if isinstance(exc, MemoryError):
+        return "the machine ran out of memory"
+    if isinstance(exc, RecursionError):
+        return "something was nested too deeply to process"
+    if isinstance(exc, OSError):
+        why = getattr(exc, "strerror", "") or "no reason was given"
+        return f"the operating system refused an operation ({why})"
+    return "the engine hit a failure it did not expect"
+
+
+def _is_preview(rows) -> bool:
+    """Was this journal written by `preview()` — a plan nothing was built
+    from?"""
+    return any(row.get("event") == "preview" for row in rows)
 
 
 def _new_id() -> str:

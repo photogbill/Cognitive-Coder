@@ -106,31 +106,78 @@ def strip_think(text: str) -> str:
 # commentary; the word "why" in a sentence is not. Requiring the decoration
 # is what keeps the false-positive rate at zero, and a detector with false
 # positives is a detector somebody switches off.
-_COMMENTARY = re.compile(
-    # The decoration must be UNAMBIGUOUS. `**Bold:**` and `## Heading` are
-    # prose furniture; a single `#` is a Python, shell, Ruby or GDScript
-    # comment, and `# explanation of the rationale` is a perfectly good
-    # comment in code we asked for. Requiring two hashes removes that entire
-    # collision — nobody writes `## rationale` as a code comment — and a
-    # detector with false positives is a detector somebody switches off,
-    # which leaves you with no detector at all.
-    r"^[ \t]*(?:\*\*|__|#{2,4}[ \t]+|\d+\.[ \t]*\*\*)[ \t]*"
-    r"(improved\s+(?:reply|version|code|answer)|changes?\s+made|"
-    r"what\s+(?:i\s+)?changed|rationale|explanation|reasoning|why[\s?]|"
+_HEADING_WORDS = (
+    r"(?:improved\s+(?:reply|version|code|answer)|changes?\s+made|"
+    r"what\s+(?:i\s+)?changed|rationale|explanation|reasoning|why|"
     r"summary\s+of\s+changes|notes?\s+on|here'?s?\s+(?:the|your)|"
-    r"key\s+(?:changes|improvements)|analysis)\b",
-    re.I | re.M)
+    r"key\s+(?:changes|improvements)|analysis)(?!\w)")
+
+#: A WHOLE LINE that is commentary, and nothing less than a whole line.
+#:
+#: The first version matched a decorated PREFIX and `re.sub`bed it out,
+#: which left the rest of the line behind as code. Three files it mangled,
+#: all from the review of this module:
+#:
+#:   * bash `## Why this exists: CI needs a runner` became the command
+#:     `this exists: CI needs a runner`;
+#:   * Python `__analysis = {}` became `= {}` — `__` was read as markdown
+#:     bold although nothing closed it;
+#:   * a docstring's `## Notes on tuning` became ` tuning`.
+#:
+#: So: markdown bold must CLOSE on the same line (`**…**`, `__…__`), and
+#: what follows the close must be nothing, a colon, or prose — never `=`
+#: or `(`, which is how `__analysis__ = {}` stays an assignment. A `##`
+#: heading is a heading only as the whole line. And the caller decides
+#: whether the line is removed at all: see `_is_code_comment`.
+_COMMENTARY_LINE = re.compile(
+    r"^[ \t]*(?:\d+\.[ \t]*)?"
+    r"(?:"
+    r"(?P<d>\*\*|__)[ \t]*" + _HEADING_WORDS + r"[^\n]*?(?P=d)"
+    r"[ \t]*:?(?:[ \t]*$|[ \t]+[A-Za-z(`\"'-][^\n]*$)"
+    r"|#{2,4}[ \t]+" + _HEADING_WORDS + r"[^\n]*$"
+    r")",
+    re.I)
 
 _PREAMBLE = re.compile(
     r"^\s*(?:sure|certainly|of\s+course|here'?s|here\s+is|i'?ll|i\s+will|"
     r"let\s+me|below\s+is|the\s+following)\b[^\n]{0,120}[:.]\s*$",
-    re.I | re.M)
+    re.I)
 
 
-def detect_commentary(text: str) -> bool:
-    """Did the model write ABOUT the answer instead of writing the answer?"""
+def _comment_marker(lang_id: str) -> str:
+    if not lang_id:
+        return ""
+    # Local: langs imports nothing from this package, but personas is
+    # imported by nearly everything, and a top-level import here is how an
+    # innocent cycle starts.
+    from . import langs
+    lang = langs.get(lang_id)
+    return lang.comment if lang else ""
+
+
+def _is_code_comment(line: str, marker: str) -> bool:
+    """A line the target language reads as a comment, or a shebang.
+
+    Such a line is harmless where it stands — it compiles either way — and
+    `## Why this exists` in a shell script is the author's comment, not the
+    model talking about its answer. Leaving it is the only safe choice.
+    """
+    head = line.lstrip()
+    return head.startswith("#!") or bool(marker and head.startswith(marker))
+
+
+def detect_commentary(text: str, lang_id: str = "") -> bool:
+    """Did the model write ABOUT the answer instead of writing the answer?
+
+    With a language, a line that is a comment in that language is not
+    counted: `## Rationale` in a Python reply is a comment the build will
+    ignore, and warning about it is a false positive.
+    """
     body = strip_think(text or "")
-    return bool(_COMMENTARY.search(body))
+    marker = _comment_marker(lang_id)
+    return any(_COMMENTARY_LINE.match(line)
+               and not (lang_id and _is_code_comment(line, marker))
+               for line in body.split("\n"))
 
 
 def strip_commentary(text: str, lang_id: str = "") -> str:
@@ -140,6 +187,17 @@ def strip_commentary(text: str, lang_id: str = "") -> str:
     is returned. Handing back an empty string because a heuristic was too
     keen is a worse failure than handing back a reply with a heading in it,
     since the caller can still extract code from the latter.
+
+    Two rules keep it off legitimate code:
+
+      * **whole lines only.** A line goes when the WHOLE line is a
+        decorated heading, and never loses part of itself;
+      * **preamble only before the code.** "The following values were
+        measured:" inside a docstring and "Here is the nightly report:" in
+        a heredoc are the program, not the model introducing it. Once the
+        first line of code has been kept, nothing after it is a preamble.
+
+    A reply with nothing to remove comes back exactly as it arrived.
     """
     body = strip_think(text or "")
     fenced = re.findall(r"```[\w+#.-]*\n(.*?)```", body, re.S)
@@ -147,8 +205,25 @@ def strip_commentary(text: str, lang_id: str = "") -> str:
         best = max(fenced, key=len).strip("\n")
         if best.strip():
             return best
-    cleaned = _COMMENTARY.sub("", body)
-    cleaned = _PREAMBLE.sub("", cleaned).strip()
+    marker = _comment_marker(lang_id)
+    kept: list[str] = []
+    in_code = False
+    removed = False
+    for line in body.split("\n"):
+        if _is_code_comment(line, marker):
+            kept.append(line)
+            in_code = True
+            continue
+        if _COMMENTARY_LINE.match(line) or (
+                not in_code and _PREAMBLE.match(line)):
+            removed = True
+            continue
+        kept.append(line)
+        if line.strip():
+            in_code = True
+    if not removed:
+        return body
+    cleaned = "\n".join(kept).strip()
     return cleaned or body.strip()
 
 
@@ -414,8 +489,14 @@ class PromptBuilder:
 # the repair prompt (D11, M33)
 # --------------------------------------------------------------------------
 
+#: How much of the request a repair prompt repeats. Enough for any typed
+#: request and the constraints section of most specifications; a whole
+#: design document would crowd out the diagnostics, which are the point.
+REPAIR_REQUEST_CHARS = 2000
+
+
 def repair_task(path: str, purpose: str, diagnostics: str = "",
-                autofixes: Sequence[str] = ()) -> str:
+                autofixes: Sequence[str] = (), request: str = "") -> str:
     """The task text for a repair attempt.
 
     **The broken code is NOT included** (D11, M33). Attempt 3's prompt
@@ -430,12 +511,26 @@ def repair_task(path: str, purpose: str, diagnostics: str = "",
     (D7) — so the loop passes it there and leaves this empty rather than
     stating the same errors twice. An argument that is silently ignored is a
     bug waiting for someone to trust it.
+
+    ``request`` is repeated because the repairer otherwise never sees it.
+    From attempt 2 the prompt carried the file's purpose and its errors and
+    nothing else, so a constraint like "MUST NOT import pygame" was absent
+    at exactly the moment the model was rewriting the file. It is capped at
+    REPAIR_REQUEST_CHARS, and a cut request says it was cut.
     """
-    lines = [f"The file `{path}` does not work yet. Its purpose: {purpose}",
-             "",
-             "Fix the errors reported below and return the complete "
-             "corrected file. Change nothing the errors did not force you to "
-             "change."]
+    lines = [f"The file `{path}` does not work yet. Its purpose: {purpose}"]
+    if request.strip():
+        text = request.strip()
+        if len(text) > REPAIR_REQUEST_CHARS:
+            text = (text[:REPAIR_REQUEST_CHARS].rstrip()
+                    + f"… (the request continues; only its first "
+                      f"{REPAIR_REQUEST_CHARS:,} characters are repeated "
+                      f"here)")
+        lines += ["", f"It is part of this request: {text}"]
+    lines += ["",
+              "Fix the errors reported below and return the complete "
+              "corrected file. Change nothing the errors did not force you "
+              "to change."]
     if diagnostics:
         lines += ["", diagnostics]
     if autofixes:

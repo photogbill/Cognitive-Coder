@@ -24,15 +24,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognitive_coder import spec as spec_mod                  # noqa: E402
-from cognitive_coder.ports import (                           # noqa: E402
+from cognitive_coder import spec as spec_mod  # noqa: E402
+from cognitive_coder.ports import (  # noqa: E402
+    Host,  # noqa: E402
     LocalFileSystem,
     MemoryStorage,
     ScriptedLLM,
     SubprocessExec,
 )
-from cognitive_coder.ports import Host                        # noqa: E402
-from cognitive_coder.session import Session, SessionConfig    # noqa: E402
+from cognitive_coder.session import Session, SessionConfig  # noqa: E402
 
 #: Bill's specification, trimmed to the parts that carry structure.
 RACING = """Build Specification: Pseudo-3D Racing Game (Pole Position Style)

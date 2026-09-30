@@ -18,9 +18,15 @@ REM      they stay tracked, producing diff noise on every machine, until they
 REM      are explicitly untracked. `git rm -r --cached .` followed by
 REM      `git add -A` is the idiom: it unstages everything, then re-adds only
 REM      what the ignore rules now allow. Nothing is deleted from disk.
+REM    * the message file OUTLIVES its commit. `git commit -F` read it and
+REM      left it in place, so the next /go committed new work under the old
+REM      message - or under the template's "Your commit message here",
+REM      which is how a commit with exactly that subject reached HEAD. So
+REM      the file is refused when it is empty, still the template, or older
+REM      than the newest change, and is renamed away once it has been used.
 REM ============================================================================
 setlocal EnableDelayedExpansion
-set "SCRIPT_VERSION=2026-08-07.1"
+set "SCRIPT_VERSION=2026-09-30.1"
 cd /d "%~dp0"
 
 set "GO="
@@ -49,6 +55,31 @@ if not exist ".git-commit-message.txt" (
     endlocal
     exit /b 1
 )
+
+REM ---- 0. is the message for THIS change? --------------------------------
+set "MSG_PROBLEM="
+findstr /r /c:"[A-Za-z0-9]" ".git-commit-message.txt" >nul 2>&1
+if errorlevel 1 set "MSG_PROBLEM=it is empty"
+findstr /i /c:"Your commit message here" ".git-commit-message.txt" >nul 2>&1
+if not errorlevel 1 set "MSG_PROBLEM=it still says Your commit message here - the template, not a message"
+if defined MSG_PROBLEM goto msg_checked
+REM Older than the newest changed file means it was written for an earlier
+REM commit. Outside any bracketed block, and with no double quote inside the
+REM PowerShell text, so cmd cannot split it: [char]34 is the quote git puts
+REM around a path with spaces.
+powershell -NoProfile -Command "$m=(Get-Item -LiteralPath '.git-commit-message.txt').LastWriteTimeUtc; $new=@(git status --porcelain --untracked-files=all | ForEach-Object { ($_.Substring(3) -split ' -> ')[-1].Trim([char]34) } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } | Sort-Object -Descending); if ($new.Count -and $new[0] -gt $m) { exit 1 }; exit 0" >nul 2>&1
+if errorlevel 1 set "MSG_PROBLEM=it is older than the newest change, so it was written for an earlier commit"
+:msg_checked
+if not defined MSG_PROBLEM goto msg_ok
+echo [ERR] .git-commit-message.txt cannot be used: %MSG_PROBLEM%.
+echo       Write the message for THIS change, then run push.bat /go again.
+if defined GO (
+    endlocal
+    exit /b 1
+)
+echo       This is a dry run, so it carries on and shows what would be staged.
+echo(
+:msg_ok
 
 REM ---- 1. the stale lock -----------------------------------------------
 if exist ".git\index.lock" (
@@ -107,6 +138,11 @@ if errorlevel 1 (
     endlocal
     exit /b 1
 )
+REM Used once, then retired, so the next /go cannot commit under it again.
+REM Renamed rather than deleted: the text is still there if it is wanted.
+move /y ".git-commit-message.txt" ".git-commit-message.last.txt" >nul 2>&1
+echo   The message file is now .git-commit-message.last.txt - write a new
+echo   .git-commit-message.txt for the next commit.
 echo(
 echo   pushing to origin/main ...
 git push

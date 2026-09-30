@@ -34,9 +34,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognitive_coder.journal import SessionLog                 # noqa: E402
-from cognitive_coder.types import (                            # noqa: E402
-    PhaseResult, ProcResult, RunResult)
+from cognitive_coder.journal import SessionLog  # noqa: E402
+from cognitive_coder.types import (  # noqa: E402
+    PhaseResult,
+    ProcResult,
+    RunResult,
+)
 
 
 class _FS:

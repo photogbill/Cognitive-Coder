@@ -129,16 +129,35 @@ def test_the_prefix_changes_when_the_epoch_changes():
 
     A new epoch means the architecture was deliberately rebuilt, so
     discarding the cache is the correct trade rather than an accident.
+    (This test used to assert the prefix changed after `index_file` with NO
+    epoch bump — pinning the defect: the "epoch-scoped" block was live.)
     """
     cm = _codemap()
+    cm.store.bump_epoch("start")
     before = cm.prefix_block("src/stats.py")
-    cm.store.put_file("src/extra.py", "python", "def added():\n    pass\n",
-                      [], [], [])
     cm.index_file("src/extra.py", "def added():\n    pass\n", force=True)
+    cm.store.bump_epoch("test")
     after = cm.prefix_block("src/stats.py")
     assert before != after, ("a new file should change the architecture "
-                            "block — otherwise the model never learns it "
-                            "exists")
+                            "block at the next epoch — otherwise the model "
+                            "never learns it exists")
+    assert "src/extra.py" in after
+
+
+def test_the_prefix_does_not_change_within_an_epoch():
+    """G.7.2: the injected architecture updates BY EPOCH. Every patch
+    re-indexes its file, and the prefix bytes used to change with it while
+    `should_bump_epoch` said no — a cache miss on every write."""
+    cm = _codemap()
+    cm.store.bump_epoch("start")
+    before = cm.prefix_block("src/stats.py")
+    cm.index_file("src/extra.py", "def added():\n    pass\n", force=True)
+    cm.index_file("src/cli.py", "def main():\n    pass\n\n\n"
+                  "def more():\n    pass\n", force=True)
+    assert zoom.should_bump_epoch(cm.store) == (False, "")
+    assert cm.prefix_block("src/stats.py") == before
+    # The query interface stays live all the same (M30).
+    assert cm.store.symbols_in("src/extra.py")
 
 
 def test_epoch_bumps_only_for_the_reasons_G7_lists():
@@ -181,3 +200,29 @@ def test_prompt_messages_keep_the_cache_boundary_as_a_message_boundary():
     assert [m.role for m in messages] == ["system", "system", "user"]
     assert messages[1].content == prompt.prefix
     assert messages[2].content == prompt.tail
+
+
+def test_the_first_file_sees_the_skeleton_in_the_cached_prefix(tmp_path):
+    """The epoch snapshot was taken at session start, before the skeleton
+    existed, so the first file was generated against a prefix with no
+    architecture in it — the one thing skeleton-first is for."""
+    from cognitive_coder import (
+        AutoApprove,
+        Host,
+        LocalFileSystem,
+        RecordingEvents,
+        ScriptedLLM,
+        Session,
+        SessionConfig,
+        SubprocessExec,
+    )
+    host = Host(llm=ScriptedLLM(["src/alpha.py — parse the input\n"
+                                 "src/beta.py — report on it\n"]),
+                fs=LocalFileSystem(str(tmp_path)), exec=SubprocessExec(),
+                storage=MemoryStorage(str(tmp_path / ".s")),
+                events=RecordingEvents(), approval=AutoApprove())
+    session = Session(host, config=SessionConfig(skeleton_first=True))
+    session.start("a parser and a report")
+    assert (tmp_path / "src" / "beta.py").exists(), "no skeleton written"
+    prefix = session.codemap.prefix_block()
+    assert "src/beta.py" in prefix, prefix

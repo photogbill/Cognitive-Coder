@@ -39,13 +39,14 @@ part of the record as the history of what stuck.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+import contextlib
 import hashlib
 import json
 import time
 from typing import Any
 
-from .types import Completion, JournalEvent
+from .types import JOURNAL_EVENTS, Completion, JournalEvent
 
 
 def now_iso() -> str:
@@ -69,10 +70,105 @@ def prompt_hash(messages: Sequence[Any] | str) -> str:
     if isinstance(messages, str):
         payload = messages
     else:
-        payload = "\n".join(
-            f"{getattr(m, 'role', '?')}:{getattr(m, 'content', str(m))}"
-            for m in messages)
+        payload = "\n".join(_hash_line(m) for m in messages)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _hash_line(m: Any) -> str:
+    """One message's contribution to `prompt_hash`.
+
+    Role and content alone used to be the identity, so two prompts that
+    differed only in a tool call's arguments, the id a tool result answers,
+    or an attached image hashed alike — and the journal could not tell
+    which `apply_patch` arguments a generation had seen. Those parts are
+    appended now, and ONLY when present, so every message without them
+    hashes exactly as before and existing journals still match.
+    """
+    line = f"{getattr(m, 'role', '?')}:{getattr(m, 'content', str(m))}"
+    calls = getattr(m, "tool_calls", ()) or ()
+    if calls:
+        line += "\x1ftool_calls:" + json.dumps(
+            [{"id": getattr(c, "id", ""), "name": getattr(c, "name", ""),
+              "arguments": getattr(c, "arguments", {})} for c in calls],
+            sort_keys=True, ensure_ascii=False, default=str)
+    call_id = getattr(m, "tool_call_id", None)
+    if call_id:
+        line += f"\x1ftool_call_id:{call_id}"
+    for blob, media in getattr(m, "images", ()) or ():
+        line += (f"\x1fimage:{media}:"
+                 f"{hashlib.sha256(bytes(blob)).hexdigest()}")
+    return line
+
+
+def _num(value: Any) -> float:
+    """A journal number, tolerating what other writers put there.
+
+    `int(r.get("prompt_ms", 0))` raised on an explicit `null` (a hand-edited
+    row, or another writer's), and `stats()` — and with it `summary()` and
+    `cache_health()` — went down with it.
+    """
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+#: A write that keeps failing warns again after this many further failures,
+#: so a disk that fills mid-session is announced — and re-announced while it
+#: stays full — without a warning per event drowning everything else.
+WARN_EVERY = 25
+
+
+def append_to(fs: Any, path: str, data: bytes) -> None:
+    """Append `data` to `path` through the FileSystemPort. Raises on failure.
+
+    `FileSystemPort` has no append, so this was read-modify-write for every
+    event: 500 events of a 172 KB journal cost 43 MB read and 43 MB
+    written, quadratic in the session's length. A host's fs MAY offer an
+    optional `append_bytes(path, data)` (see docs/PORTS.md); it is used when
+    present, and the old path remains for a port without it.
+    """
+    append = getattr(fs, "append_bytes", None)
+    if callable(append):
+        append(path, data)
+        return
+    prior = fs.read_bytes(path) if fs.exists(path) else b""
+    fs.write_bytes(path, prior + data)
+
+
+class _WriteFailures:
+    """Warn on the first failed write, then every `WARN_EVERY`, and again
+    at once after a recovery. Only the very FIRST write's failure used to
+    warn, so a journal that stopped being writable later said nothing."""
+
+    def __init__(self, events: Any, what: str) -> None:
+        self.events = events
+        self.what = what
+        self.failures = 0
+
+    def ok(self) -> None:
+        self.failures = 0
+
+    def failed(self) -> None:
+        self.failures += 1
+        if self.events is None:
+            return
+        if self.failures != 1 and self.failures % WARN_EVERY:
+            return
+        if self.failures == 1:
+            sentence = (f"The {self.what} could not be written, so this run "
+                        f"will not leave a complete record on disk. "
+                        f"Everything else continues normally.")
+        else:
+            sentence = (f"The {self.what} still cannot be written: "
+                        f"{self.failures} writes in a row have failed. Is "
+                        f"the disk full?")
+        try:
+            self.events.event("warning", sentence)
+        except Exception:                                # noqa: BLE001
+            pass
 
 
 #: How much of one command's output the readable log keeps. Generous, because
@@ -141,7 +237,7 @@ class SessionLog:
 
     def __init__(self, fs: Any, session_id: str, *,
                  directory: str = ".cc_journal",
-                 path: str = "") -> None:
+                 path: str = "", events: Any = None) -> None:
         self.fs = fs
         self.session_id = session_id
         #: `directory` is kept for callers that want it filed with the JSONL;
@@ -149,31 +245,59 @@ class SessionLog:
         self.path = path or self.FILENAME
         self._started = time.time()
         self._opened = False
+        self._pending: list[str] | None = None
+        self._failures = _WriteFailures(events, f"build log ({self.path})")
 
     # -- writing ----------------------------------------------------------
     def _append(self, text: str) -> None:
         try:
-            prior = (self.fs.read_bytes(self.path)
-                     if self.fs.exists(self.path) else b"")
-            self.fs.write_bytes(self.path, prior + text.encode("utf-8"))
+            append_to(self.fs, self.path, text.encode("utf-8"))
         except Exception:                                # noqa: BLE001
-            pass          # a log must never be the thing that fails a build
+            # A log must never be the thing that fails a build — but it may
+            # say that it has stopped being written.
+            self._failures.failed()
+        else:
+            self._failures.ok()
+
+    @contextlib.contextmanager
+    def _batch(self) -> Iterator[None]:
+        """Collect the lines written inside, then append them ONCE.
+
+        `block()` used to append per line, and every append rewrote the
+        whole file: one 200-line block was 200 whole-file rewrites.
+        """
+        if self._pending is not None:                    # already batching
+            yield
+            return
+        self._pending = []
+        try:
+            yield
+        finally:
+            text = "".join(self._pending)
+            self._pending = None
+            if text:
+                self._append(text)
 
     def _stamp(self) -> str:
         return f"[{time.time() - self._started:7.1f}s]"
 
     def line(self, text: str = "") -> None:
-        self._append(f"{text}\n")
+        if self._pending is not None:
+            self._pending.append(f"{text}\n")
+        else:
+            self._append(f"{text}\n")
 
     def rule(self, title: str = "") -> None:
-        self.line()
-        self.line(f"{'=' * 74}")
-        if title:
-            self.line(title)
+        with self._batch():
+            self.line()
             self.line(f"{'=' * 74}")
+            if title:
+                self.line(title)
+                self.line(f"{'=' * 74}")
 
     def event(self, what: str, detail: str = "") -> None:
-        self.line(f"{self._stamp()} {what}" + (f" — {detail}" if detail else ""))
+        self.line(f"{self._stamp()} {what}"
+                  + (f" — {detail}" if detail else ""))
 
     def block(self, title: str, body: str, limit: int = LOG_OUTPUT_CHARS
               ) -> None:
@@ -191,11 +315,12 @@ class SessionLog:
             cut = (f"\n    … {len(body) - limit:,} more characters not "
                    f"logged")
             body = body[:limit]
-        self.line(f"  {title}")
-        for row in body.splitlines():
-            self.line(f"    {row}")
-        if cut:
-            self.line(cut.strip("\n"))
+        with self._batch():
+            self.line(f"  {title}")
+            for row in body.splitlines():
+                self.line(f"    {row}")
+            if cut:
+                self.line(cut.strip("\n"))
 
     # -- the shapes the engine actually produces --------------------------
     def start(self, request: str, model: str, config: dict) -> None:
@@ -204,77 +329,83 @@ class SessionLog:
         #: run against the previous one is most of what the file is for.
         #: Sessions are separated by a rule and stamped with an id, so a long
         #: file is still navigable.
-        first = not self.fs.exists(self.path)
-        if first:
-            self.line("COGNITIVE CODER — BUILD LOG")
-            self.line()
-            self.line("Everything this engine did, in order, with the "
-                      "commands it ran and")
-            self.line("what they printed. Append-only: each build adds a "
-                      "session below.")
-            self.line()
-            self.line("Alongside this file:")
-            self.line("  BUILD_SPEC.md      what was asked for")
-            self.line("  Recommendation.md  the review of what was built")
-            self.line("  .cc_journal/*.jsonl  the machine-readable "
-                      "provenance record")
-            self.line("  .cc_snapshots/     every version of every file")
-        self.rule(f"SESSION {self.session_id}")
-        self.line(f"started   {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self.line(f"model     {model or '(none reported)'}")
-        self.line(f"config    " + ", ".join(f"{k}={v}"
-                                            for k, v in sorted(config.items())))
-        self.block("request", request)
-        self._opened = True
+        with self._batch():
+            if not self.fs.exists(self.path):
+                self.line("COGNITIVE CODER — BUILD LOG")
+                self.line()
+                self.line("Everything this engine did, in order, with the "
+                          "commands it ran and")
+                self.line("what they printed. Append-only: each build adds "
+                          "a session below.")
+                self.line()
+                self.line("Alongside this file:")
+                self.line("  BUILD_SPEC.md      what was asked for")
+                self.line("  Recommendation.md  the review of what was "
+                          "built")
+                self.line("  .cc_journal/*.jsonl  the machine-readable "
+                          "provenance record")
+                self.line("  .cc_snapshots/     every version of every "
+                          "file")
+            self.rule(f"SESSION {self.session_id}")
+            self.line(f"started   {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.line(f"model     {model or '(none reported)'}")
+            self.line("config    " + ", ".join(
+                f"{k}={v}" for k, v in sorted(config.items())))
+            self.block("request", request)
+            self._opened = True
 
     def phases(self, task: str, attempt: int, result: Any) -> None:
         """Every phase of one verification, with its command and output.
 
         This is the method the whole file exists for.
         """
-        self.line()
-        self.event(f"verify {task}", f"attempt {attempt}")
-        for phase in getattr(result, "phases", ()) or ():
-            argv = " ".join(getattr(phase, "argv", ()) or ())
-            ok = "ok" if getattr(phase, "ok", False) else "FAILED"
-            self.line(f"  [{getattr(phase, 'name', '?')}] {ok}"
-                      + (f"  ({phase.note})" if getattr(phase, "note", "")
-                         else ""))
-            if argv:
-                self.line(f"    $ {argv}")
-            self.block("output", getattr(phase, "output", ""))
-        for caveat in getattr(result, "caveats", ()) or ():
-            self.line(f"  CAVEAT: {caveat}")
-        for diag in (getattr(result, "diagnostics", ()) or ())[:10]:
-            self.line(f"  diagnostic: {diag}")
+        with self._batch():
+            self.line()
+            self.event(f"verify {task}", f"attempt {attempt}")
+            for phase in getattr(result, "phases", ()) or ():
+                argv = " ".join(getattr(phase, "argv", ()) or ())
+                ok = "ok" if getattr(phase, "ok", False) else "FAILED"
+                note = getattr(phase, "note", "")
+                self.line(f"  [{getattr(phase, 'name', '?')}] {ok}"
+                          + (f"  ({note})" if note else ""))
+                if argv:
+                    self.line(f"    $ {argv}")
+                self.block("output", getattr(phase, "output", ""))
+            for caveat in getattr(result, "caveats", ()) or ():
+                self.line(f"  CAVEAT: {caveat}")
+            for diag in (getattr(result, "diagnostics", ()) or ())[:10]:
+                self.line(f"  diagnostic: {diag}")
 
     def generation(self, task: str, attempt: int, *, temperature: float,
                    seed: Any, tokens_in: int, tokens_out: int,
                    prompt_ms: int, decode_ms: int, text: str = "") -> None:
-        rate = (round(tokens_out / (decode_ms / 1000), 1)
-                if decode_ms > 0 and tokens_out else 0)
-        self.line()
-        self.event(f"generate {task}", f"attempt {attempt}")
-        self.line(f"  temperature={temperature} seed={seed} "
-                  f"in={tokens_in} out={tokens_out} "
-                  f"prefill={prompt_ms}ms decode={decode_ms}ms"
-                  + (f" ({rate} tok/s)" if rate else ""))
-        self.block("produced", text)
+        with self._batch():
+            rate = (round(tokens_out / (decode_ms / 1000), 1)
+                    if decode_ms > 0 and tokens_out else 0)
+            self.line()
+            self.event(f"generate {task}", f"attempt {attempt}")
+            self.line(f"  temperature={temperature} seed={seed} "
+                      f"in={tokens_in} out={tokens_out} "
+                      f"prefill={prompt_ms}ms decode={decode_ms}ms"
+                      + (f" ({rate} tok/s)" if rate else ""))
+            self.block("produced", text)
 
     def close(self, summary: str) -> None:
-        self.rule("SUMMARY")
-        self.line(summary)
-        self.line(f"finished  {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                  f"after {time.time() - self._started:.0f}s")
+        with self._batch():
+            self.rule("SUMMARY")
+            self.line(summary)
+            self.line(f"finished  {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                      f"after {time.time() - self._started:.0f}s")
 
 
 class Journal:
     """Append-only JSONL through the FileSystemPort (C2).
 
-    Writes are read-modify-append rather than held open: a host may be a GUI
+    Writes are appends rather than a held-open handle: a host may be a GUI
     that crashes, and a journal that only exists in a file handle is a journal
-    that isn't there when it is needed. The cost is real and accepted — this
-    is not a hot path, and durability is the entire point.
+    that isn't there when it is needed. With an fs that offers the optional
+    `append_bytes`, an event costs what it adds; without one it is the old
+    read-modify-write, quadratic over a long session (see `append_to`).
     """
 
     def __init__(self, fs: Any, session_id: str, *, events: Any = None,
@@ -285,32 +416,38 @@ class Journal:
         self.path = f"{directory}/{session_id}.jsonl"
         self._events = events
         self._buffer: list[JournalEvent] = []
+        self._unknown: set[str] = set()
+        self._write_failures = _WriteFailures(
+            events, "session journal (the provenance record)")
 
     # -- writing ----------------------------------------------------------
     def write(self, event: JournalEvent) -> JournalEvent:
         self._buffer.append(event)
         line = event.to_json() + "\n"
         try:
-            prior = (self.fs.read_bytes(self.path)
-                     if self.fs.exists(self.path) else b"")
-            self.fs.write_bytes(self.path, prior + line.encode("utf-8"))
+            append_to(self.fs, self.path, line.encode("utf-8"))
         except Exception:                                # noqa: BLE001
             # A journal that cannot be written must not take the build down
             # with it. The in-memory buffer still holds the record, and the
-            # operator is told once rather than on every event.
-            if self._events is not None and len(self._buffer) == 1:
-                try:
-                    self._events.event(
-                        "warning",
-                        "The session journal could not be written, so this "
-                        "run will not leave a provenance record on disk. "
-                        "Everything else continues normally.")
-                except Exception:                        # noqa: BLE001
-                    pass
+            # operator is told — on the first failure, again every
+            # WARN_EVERY, and at once after a recovery.
+            self._write_failures.failed()
+        else:
+            self._write_failures.ok()
         return event
 
     def log(self, event: str, **fields: Any) -> JournalEvent:
-        """Record one event. Unknown fields go into `data`."""
+        """Record one event. Unknown fields go into `data`.
+
+        An event name outside `JOURNAL_EVENTS` is still written — a record
+        is never refused over its label — but warned about once per name,
+        so the vocabulary hosts render from cannot drift silently again.
+        """
+        if event not in JOURNAL_EVENTS and event not in self._unknown:
+            self._unknown.add(event)
+            self._warn(f"The journal recorded an event called {event!r}, "
+                       f"which is not in the published list of journal "
+                       f"events; a host may not know how to show it.")
         known = {"task", "attempt", "provider", "model", "prompt_sha256",
                  "temperature", "seed", "tokens_in", "tokens_out",
                  "prompt_ms", "decode_ms", "verify"}
@@ -319,6 +456,14 @@ class Journal:
         return self.write(JournalEvent(
             t=now_iso(), event=event, session=self.session_id,
             data=_jsonable(rest), **head))
+
+    def _warn(self, sentence: str) -> None:
+        if self._events is None:
+            return
+        try:
+            self._events.event("warning", sentence)
+        except Exception:                                # noqa: BLE001
+            pass
 
     def generation(self, *, task: str, attempt: int, provider: str,
                    completion: Completion, prompt: Sequence[Any] | str,
@@ -374,25 +519,27 @@ class Journal:
         """
         rows = self.events()
         gens = [r for r in rows if r.get("event") == "generate"]
-        prompt_times = [int(r.get("prompt_ms", 0)) for r in gens
-                        if r.get("prompt_ms")]
+        prompt_times = [int(_num(r.get("prompt_ms"))) for r in gens
+                        if _num(r.get("prompt_ms")) > 0]
         #: Decode is reported separately, and its useful form is a RATE.
         #: Milliseconds of decode mean nothing without the token count beside
         #: them — 120 s is fast for 1,200 tokens and catastrophic for 40.
-        rates = [round(int(r.get("tokens_out", 0))
-                       / (int(r.get("decode_ms", 0)) / 1000), 1)
+        rates = [round(_num(r.get("tokens_out"))
+                       / (_num(r.get("decode_ms")) / 1000), 1)
                  for r in gens
-                 if int(r.get("decode_ms", 0)) > 0 and r.get("tokens_out")]
-        first_try = sum(1 for r in gens if int(r.get("attempt", 1)) == 1
-                        and (r.get("verify") or {}).get("test") == "ok")
+                 if _num(r.get("decode_ms")) > 0
+                 and _num(r.get("tokens_out")) > 0]
+        first_try = sum(1 for r in gens
+                        if _num(r.get("attempt") or 1) == 1
+                        and _verify(r).get("test") == "ok")
         return {
             "events": len(rows),
             "generations": len(gens),
             "continuations": sum(1 for r in rows
                                  if r.get("event") == "continuation"),
-            "repairs": sum(1 for r in gens if int(r.get("attempt", 1)) > 1),
-            "tokens_in": sum(int(r.get("tokens_in", 0)) for r in gens),
-            "tokens_out": sum(int(r.get("tokens_out", 0)) for r in gens),
+            "repairs": sum(1 for r in gens if _num(r.get("attempt")) > 1),
+            "tokens_in": sum(int(_num(r.get("tokens_in"))) for r in gens),
+            "tokens_out": sum(int(_num(r.get("tokens_out"))) for r in gens),
             "models": sorted({r.get("model", "") for r in gens if
                               r.get("model")}),
             "first_attempt_successes": first_try,
@@ -411,8 +558,8 @@ class Journal:
             # an operator who sees a spurious REMOTE stops trusting the one
             # that matters.
             "remote_calls": sum(1 for r in gens
-                                if (r.get("data") or {}).get("remote")),
-            "redactions": sum(int((r.get("data") or {}).get("redactions", 0))
+                                if _data(r).get("remote")),
+            "redactions": sum(int(_num(_data(r).get("redactions")))
                               for r in rows),
         }
 
@@ -436,7 +583,7 @@ class Journal:
         # then tracks output length rather than prompt size, and a verdict on
         # the prefix cache drawn from it is not a weak claim, it is an
         # unfounded one. Say what is missing instead of guessing.
-        if not rate and not any(int(r.get("decode_ms", 0)) > 0
+        if not rate and not any(_num(r.get("decode_ms")) > 0
                                 for r in self.events()
                                 if r.get("event") == "generate"):
             return (f"prompt timings recorded, median {med} ms and worst "
@@ -561,6 +708,16 @@ def resume_state(fs: Any, session_id: str,
             "done": done, "failed": [t for t in failed if t not in done],
             "attempts": attempts, "events": len(rows),
             "complete": bool(rows and rows[-1].get("event") == "session_end")}
+
+
+def _data(row: dict) -> dict:
+    data = row.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _verify(row: dict) -> dict:
+    verify = row.get("verify")
+    return verify if isinstance(verify, dict) else {}
 
 
 def _to_event(row: dict) -> JournalEvent:

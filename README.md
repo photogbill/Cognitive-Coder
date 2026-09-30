@@ -39,19 +39,28 @@ installers are part of the product, not an afterthought.
 
 ## Ten lines of embedding
 
-Runs anywhere. No model, no network, no host application.
+Runs anywhere, as it stands. No model, no network, no host application.
 
 ```python
-from cognitive_coder import (AutoApprove, Host, LocalFileSystem,
-                             ScriptedLLM, Session)
+import tempfile
 
-host = Host(llm=ScriptedLLM(['```python\ndef greet(n):\n    return f"hi {n}"\n```']),
-            fs=LocalFileSystem("/path/to/project"),
-            approval=AutoApprove())
-session = Session(host)
+from cognitive_coder import (AutoApprove, Host, LocalFileSystem, ScriptedLLM,
+                             Session, SessionConfig)
+
+# A scripted model answers each call in order: the plan, then the file.
+replies = ["greet.py — say hello to a named person\n",
+           '```python\ndef greet(name):\n    return f"hi {name}"\n```']
+host = Host(llm=ScriptedLLM(replies, supports_tools=False),
+            fs=LocalFileSystem(tempfile.mkdtemp()), approval=AutoApprove())
+session = Session(host, config=SessionConfig(attempts=1))
 session.run("a greet function")
 print(session.report())
 ```
+
+Two replies, because a session asks twice: once to **plan**, once per
+**file**. (The example this replaced gave one, which the planner consumed,
+and then stopped with "ScriptedLLM ran out of replies" — in the first code
+most readers run. `tests/test_cli.py` now executes this block.)
 
 `examples/tiny_host.py` is that grown just enough to prove the embedding
 story end to end. It is the first thing to read if you are writing a host.
@@ -109,7 +118,8 @@ one, the convenience loses.
 3. **Offline is the default; the network is an explicit, visible choice.**
    No remote call happens unless you enabled a remote provider *for this
    session*, and remote mode is shown whenever it is on. There is no
-   "helpfully falls back to the cloud".
+   "helpfully falls back to the cloud". From the CLI that choice is
+   `--remote PROVIDER`, for one run; nothing else turns it on.
 4. **Nothing is "done" until it builds and the tests run.** A file that parses
    is not finished. A test suite that collected zero tests is not evidence.
 5. **Deterministic first, model second, human last.**
@@ -193,6 +203,25 @@ truncated mid-rule. The journal records each active skill's content hash at
 session start, so a generated line is traceable to the exact revision of
 the guidance that shaped it.
 
+## Improving what already exists
+
+`ccoder build` makes something from a request; `ccoder audit` looks at a
+project that already exists and says what is wrong and what could be
+better, ranked, with file and line — then writes a plan `build` can carry
+out, and the next audit says what was fixed.
+
+```
+ccoder audit game/ --focus "collisions feel wrong"
+ccoder build -p game/ --spec game/.cc_state/audit/plan.md
+ccoder audit game/        # N findings gone, M remain, K new
+```
+
+Tools first (scanners, undefined names, unused code, untested modules,
+does it compile, do its tests run), then one bounded model read per file
+for the files most worth reading. It never runs the program, never writes
+a source file, and never asks for approval — changing code stays `build`'s
+job, through the snapshot and the approval gate. See `docs/AUDIT.md`.
+
 ## Languages
 
 Python, C, C++, Rust, Java, Go, C#, JavaScript, TypeScript, **GDScript**,
@@ -209,6 +238,7 @@ never reported as unqualified success.**
   guarantee
 - `docs/EMBEDDING.md` — how to host it, including vendoring as a git submodule
 - `docs/PROVIDERS.md` — models, endpoints, and the offline default
+- `docs/AUDIT.md` — auditing an existing project, and the fix loop
 - `COGNITIVE_CODER_BUILD_SPEC_v1.1.md` — the full specification this
   implements, including the reasoning behind every constraint
 

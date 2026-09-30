@@ -3,18 +3,40 @@
 
 **Dry run by default.** This edits a real, substantial, working application,
 and the integration must not disturb it. Nothing is written unless you pass
-`--apply`, and even then every replaced file is backed up first.
+`--apply`, and even then every replaced file is backed up first. `--dry-run`
+says the default out loud, for scripts and for the instructions that name it.
 
     python adapters/atk/migrate.py --atk D:/Analyst_Toolkit/ATK          # look
     python adapters/atk/migrate.py --atk D:/Analyst_Toolkit/ATK --apply  # do
 
+WHAT IT WRITES — nine files, plus a backup beside each of the first six:
+
+    atk/core/langs.py, diagnostics.py, codeguard.py,   replaced by shims
+      coderun.py, patcher.py, codectx.py               (originals kept as
+                                                        <name>.py.pre-ccoder)
+    atk/core/ccoder_compat.py                          new: ATK's OLD
+                                                        signatures
+    atk/core/ccoder_host.py                            new: the six Ports
+    atk/ui/ccoder_panel.py                             new: the workspace tab
+
+(It used to say "six". The three new modules are the ones a reader most
+needs to know about, because deleting the shims later does not remove them.)
+
+Every one of those paths is checked BEFORE anything is written: a target
+that is a symbolic link, or that resolves outside the ATK tree, stops the
+whole migration. A symlinked `langs.py` was once written THROUGH, changing a
+file outside the checkout that the operator never pointed this script at.
+
 WHAT IT DOES, and why in this order (§7.3):
 
-    1. Check that Cognitive Coder is importable from ATK's interpreter.
-       If it is not, nothing else can work and stopping now is cheap.
+    1. Check that Cognitive Coder is importable from ATK's interpreter —
+       ATK's own `.venv`, unless `--python` names another. If it is not,
+       nothing else can work and stopping now is cheap. (The default used
+       to be the interpreter running THIS script, which proves nothing
+       about ATK's.)
     2. Back up each of the six modules to `<name>.py.pre-ccoder`.
     3. Replace each body with a re-export shim plus a comment saying where
-       it went and why.
+       it went and why, and install the three new modules.
     4. Tell you to run ATK's full suite. **It must stay green** — those six
        modules have around two hundred checks between them, and they are the
        reason this migration is safe to attempt at all.
@@ -31,17 +53,18 @@ THE RENAMES, which are the one thing that cannot be done mechanically:
 Those three shims re-export under the OLD name, so `from atk.core.codeguard
 import scan` keeps working. The other three keep their names.
 
-WHAT IT WILL NOT DO. It will not touch anything outside the six files, it
-will not edit ATK's imports, and it will not run ATK's tests for you — a
-migration script that reports its own success is not evidence.
+WHAT IT WILL NOT DO. It will not touch anything but the nine files and six
+backups above, it will not edit ATK's imports, and it will not run ATK's
+tests for you — a migration script that reports its own success is not
+evidence.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
-import sys
 
 #: ATK module → the Cognitive Coder module that now owns it.
 MODULES: dict[str, str] = {
@@ -120,6 +143,70 @@ EXPORTS: dict[str, list[str]] = {
 }
 
 
+#: The three modules installed beside the shims: (source here, destination
+#: relative to the ATK root).
+INSTALLED: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("atk_compat.py", ("atk", "core", "ccoder_compat.py")),
+    ("ccoder_host.py", ("atk", "core", "ccoder_host.py")),
+    ("ccoder_panel.py", ("atk", "ui", "ccoder_panel.py")),
+)
+
+
+class MigrationRefused(Exception):
+    """A target this script will not write to. The message is a sentence."""
+
+
+def targets(atk_root: Path) -> list[Path]:
+    """Every path the migration writes: nine files and six backups."""
+    core = atk_root / "atk" / "core"
+    out: list[Path] = []
+    for name in MODULES:
+        out += [core / name, (core / name).with_suffix(".py.pre-ccoder")]
+    out += [atk_root.joinpath(*dest) for _src, dest in INSTALLED]
+    return out
+
+
+def _refusal(path: Path, atk_root: Path) -> str:
+    """Why `path` must not be written, or "" if it may."""
+    root = atk_root.resolve()
+    if path.is_symlink():
+        return (f"{path} is a symbolic link (to {os.readlink(path)}); "
+                f"writing it would change a file outside the ATK tree.")
+    try:
+        parent = path.parent.resolve()
+    except OSError as exc:
+        return f"{path.parent} cannot be resolved ({exc})."
+    if parent != root and root not in parent.parents:
+        return (f"{path} resolves to {parent / path.name}, outside the ATK "
+                f"tree at {root}.")
+    return ""
+
+
+def unsafe_targets(atk_root: Path) -> list[str]:
+    """Every refusal among the targets — checked before ANY write."""
+    return [why for why in (_refusal(p, atk_root) for p in targets(atk_root))
+            if why]
+
+
+def _write(path: Path, data: bytes, atk_root: Path) -> None:
+    """The one way this script writes. Refuses per `_refusal`, always."""
+    why = _refusal(path, atk_root)
+    if why:
+        raise MigrationRefused(f"{why} Nothing more was written.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def atk_python(atk_root: Path) -> str:
+    """ATK's own interpreter, if its `.venv` is where ATK's installer puts
+    it; "" otherwise."""
+    for candidate in (atk_root / ".venv" / "Scripts" / "python.exe",
+                      atk_root / ".venv" / "bin" / "python"):
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
 def check_importable(python: str) -> tuple[bool, str]:
     """Can ATK's interpreter import the engine? Nothing works if not."""
     code = ("import cognitive_coder as cc; "
@@ -164,7 +251,7 @@ def install_compat(atk_root: Path) -> str:
     """
     source = Path(__file__).with_name("atk_compat.py")
     target = atk_root / "atk" / "core" / "ccoder_compat.py"
-    target.write_bytes(source.read_bytes())
+    _write(target, source.read_bytes(), atk_root)
     return str(target)
 
 
@@ -172,15 +259,11 @@ def install_host(atk_root: Path) -> list[str]:
     """The Port implementations and the panel."""
     here = Path(__file__).parent
     out: list[str] = []
-    for source, destination in (
-            (here / "ccoder_host.py", atk_root / "atk" / "core" /
-             "ccoder_host.py"),
-            (here / "ccoder_panel.py", atk_root / "atk" / "ui" /
-             "ccoder_panel.py")):
+    for name, dest in INSTALLED[1:]:
+        source, destination = here / name, atk_root.joinpath(*dest)
         if not source.exists():
             continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(source.read_bytes())
+        _write(destination, source.read_bytes(), atk_root)
         out.append(str(destination))
     return out
 
@@ -190,12 +273,13 @@ def apply(rows: list[tuple[Path, str, str]]) -> list[str]:
     for path, target, status in rows:
         if not path.exists() or status == "already a shim":
             continue
+        atk_root = path.parent.parent.parent          # <root>/atk/core/x.py
         backup = path.with_suffix(".py.pre-ccoder")
         if not backup.exists():
-            backup.write_bytes(path.read_bytes())
-        path.write_text(SHIM.format(target=target, name=path.name,
-                                    exports=EXPORTS.get(path.name, [])),
-                        encoding="utf-8")
+            _write(backup, path.read_bytes(), atk_root)
+        _write(path, SHIM.format(target=target, name=path.name,
+                                 exports=EXPORTS.get(path.name, []))
+               .encode("utf-8"), atk_root)
         done.append(f"{path.name} → cognitive_coder.{target} "
                     f"(original kept as {backup.name})")
     return done
@@ -206,10 +290,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Migrate ATK's six coding modules onto Cognitive Coder.")
     parser.add_argument("--atk", required=True,
                         help="the ATK repository root")
-    parser.add_argument("--python", default=sys.executable,
-                        help="ATK's interpreter (default: this one)")
-    parser.add_argument("--apply", action="store_true",
-                        help="actually write. Without this it only looks.")
+    parser.add_argument("--python", default="",
+                        help="ATK's interpreter (default: the python in "
+                             "ATK's own .venv; required if there is none)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true",
+                      help="actually write. Without this it only looks.")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="only look — the default, said out loud")
     args = parser.parse_args(argv)
 
     atk_root = Path(args.atk).expanduser().resolve()
@@ -218,36 +306,52 @@ def main(argv: list[str] | None = None) -> int:
               f"atk/core directory under it.")
         return 2
 
-    ok, detail = check_importable(args.python)
-    print(f"Cognitive Coder importable from {args.python}: "
+    python = args.python or atk_python(atk_root)
+    if not python:
+        print(f"There is no .venv under {atk_root}, so ATK's interpreter is "
+              f"unknown. Pass --python with the python ATK runs on — this "
+              f"script's own interpreter would prove nothing about it.")
+        return 2
+    ok, detail = check_importable(python)
+    print(f"Cognitive Coder importable from {python}: "
           f"{'yes, v' + detail if ok else 'NO'}")
     if not ok:
         print(detail)
         return 3
+
+    refusals = unsafe_targets(atk_root)
+    if refusals:
+        print("\nRefusing to migrate, and nothing was written:")
+        for why in refusals:
+            print(f"  {why}")
+        return 4
 
     rows = plan(atk_root)
     print(f"\nSix modules under {atk_root / 'atk' / 'core'}:\n")
     for path, target, status in rows:
         print(f"  {path.name:<18} → cognitive_coder.{target:<12} {status}")
 
-    print("\nAlso installed:")
-    print(f"  atk/core/ccoder_compat.py   ATK's OLD signatures on the new "
-          f"engine")
-    print(f"  atk/core/ccoder_host.py     the six Port implementations")
-    print(f"  atk/ui/ccoder_panel.py      the workspace tab")
-
     if not args.apply:
+        print("\nWould also write three new modules:")
+        for _src, dest in INSTALLED:
+            print(f"  {'/'.join(dest)}")
         print("\nThis was a DRY RUN. Nothing was written.")
         print("Re-run with --apply when you are ready, then:")
         print("  1. run ATK's full suite — it MUST stay green")
         print("  2. only then update ATK's imports and delete the shims")
         return 0
 
-    print(f"\n  compatibility layer → {install_compat(atk_root)}")
-    for written in install_host(atk_root):
+    try:
+        compat = install_compat(atk_root)
+        installed = install_host(atk_root)
+        done = apply(rows)
+    except MigrationRefused as exc:
+        print(f"\n{exc}")
+        return 4
+    print("\nAlso installed:")
+    print(f"  compatibility layer → {compat}")
+    for written in installed:
         print(f"  adapter             → {written}")
-
-    done = apply(rows)
     if not done:
         print("\nNothing needed changing.")
         return 0

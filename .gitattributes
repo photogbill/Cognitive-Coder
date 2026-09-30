@@ -42,6 +42,11 @@
 *.ps1   text eol=crlf
 
 # ---- MUST be LF ------------------------------------------------------------
+# The mirror image of the .bat rule: sh reads a CR as part of the command,
+# and a CRLF install.sh fails with "not found" on its first line. It had no
+# rule, so a Windows checkout with core.autocrlf=true wrote it CRLF.
+*.sh    text eol=lf
+
 # Python does not care, but a mixed repository produces diffs that are
 # entirely line endings, which buries the change that actually matters.
 *.py    text eol=lf

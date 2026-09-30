@@ -57,6 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+import difflib
 import hashlib
 import re
 import time
@@ -64,6 +65,7 @@ from typing import Any
 
 from . import diagnostics as dx
 from . import guard, langs, personas, runner, textio
+from .context import CHARS_PER_TOKEN, Piece, build_context
 from .errors import Cancelled
 from .personas import (
     CONTRACT_FILE,
@@ -74,6 +76,7 @@ from .personas import (
     strip_commentary,
     strip_think,
 )
+from .planner import _is_our_stub, _looks_like_test, strip_stub_sentinel
 from .ports import NeverCancelled
 from .types import (
     AttemptRecord,
@@ -81,6 +84,7 @@ from .types import (
     Diagnostic,
     Edit,
     Message,
+    ModelCapabilities,
     RunResult,
     Task,
     TaskOutcome,
@@ -116,9 +120,16 @@ class LoopConfig:
 
 @dataclass
 class _Signature:
-    """One attempt's identity: normalised code AND sorted diagnostics."""
+    """One attempt's identity: normalised code AND sorted diagnostics.
+
+    `text` is the normalised code itself, kept unhashed so the cosmetic
+    check can measure HOW different two attempts are, not merely whether
+    they differ. Built by `_signature`; see there for what "normalised"
+    has to mean for each language.
+    """
     code: str
     diags: str
+    text: str = ""
 
     @property
     def pair(self) -> tuple[str, str]:
@@ -136,17 +147,34 @@ class Loop:
     prompts: PromptBuilder = field(default_factory=PromptBuilder)
     config: LoopConfig = field(default_factory=LoopConfig)
     cancel: Any = field(default_factory=NeverCancelled)
+    #: Test tasks stopped because the test disagrees with the code it tests:
+    #: {test path: (module path, failing diagnostics)}. The Session reads
+    #: this to queue the MODULE for a repair against the test.
+    blamed: dict = field(default_factory=dict)
+    #: Files whose test file exists but whose test run collected nothing.
+    #: Never sealed as verified; the session end names them.
+    unverified: set = field(default_factory=set)
+    #: Set by `_fit_to_context` when the file being repaired cannot be shown
+    #: whole: the sentence the attempt stops with. Consumed at once.
+    _too_big: str = field(default="", repr=False)
 
     # ------------------------------------------------------------------
-    def run_task(self, task: Task, *, request: str = "") -> TaskOutcome:
+    def run_task(self, task: Task, *, request: str = "", covers: str = "",
+                 seed: Sequence[Diagnostic] = ()) -> TaskOutcome:
         """Generate, verify and repair one file until it works or it stops.
 
         Every phase boundary checks the cancel token (M21). A cancelled task
         leaves resumable state and rolls back any open transaction — that is
         a guarantee made here, not a hope held elsewhere.
+
+        ``covers`` is, for a test task, the module it tests. ``seed`` makes
+        attempt 1 a REPAIR against diagnostics that already exist — the
+        failing output of a test this file must now pass (see
+        `_test_disagrees_with_code`).
         """
         lang = task.lang or langs.id_for_path(task.path) or "python"
         persona = PERSONAS.get(task.persona, personas.ENGINEER)
+        is_test = task.persona == "tester" or _looks_like_test(task.path)
         attempts: list[AttemptRecord] = []
         seen: set[tuple[str, str]] = set()
         history: list[_Signature] = []
@@ -169,28 +197,63 @@ class Loop:
 
                 diag_text = ""
                 autofixed: tuple[str, ...] = ()
-                if attempts and attempts[-1].diagnostics:
+                last = attempts[-1] if attempts else None
+                if last is not None and last.diagnostics:
+                    carried = last.diagnostics
+                elif last is None or not last.code_sha:
+                    carried = tuple(seed)      # nothing newer to go on
+                else:
+                    carried = ()
+                if carried:
                     # M33: the DIAGNOSTICS carry forward, not the broken code.
                     lang_obj = langs.get(lang)
                     diag_text = dx.feedback(
-                        attempts[-1].diagnostics,
+                        carried,
                         lang_obj.feedback_cap if lang_obj else 3,
                         extra_context=bool(lang_obj and lang_obj.cascades))
-                    autofixed = attempts[-1].autofixes
+                    autofixed = last.autofixes if last is not None else ()
 
-                code, completion, continued = self._generate(
+                # A REPAIR needs something to repair: code the previous
+                # attempt wrote, or errors it produced. After an empty
+                # reply there is neither, and attempt 2 used to be told
+                # "Fix the errors reported below" with no errors below and
+                # no file — by the repairer. That attempt is a first
+                # attempt again, with the first attempt's prompt. A seeded
+                # task is always a repair: the file exists and the failing
+                # test is the error.
+                repair = bool(seed) or bool(
+                    last is not None and (last.code_sha or last.diagnostics))
+                code, completion, continued, sent = self._generate(
                     task, persona, lang, request=request,
-                    diagnostics=diag_text, autofixes=autofixed, attempt=n)
+                    diagnostics=diag_text, autofixes=autofixed, attempt=n,
+                    repair=repair, against_test=bool(seed))
 
                 if completion.finish_reason == "cancelled":
                     raise Cancelled(f"generating {task.path}")
 
                 if not code.strip():
+                    note = ("the model used every tool round looking things "
+                            "up and never wrote the file"
+                            if completion.finish_reason == "tool_calls"
+                            else "the model returned nothing")
                     attempts.append(AttemptRecord(
                         n=n, finish_reason=completion.finish_reason,
-                        note="the model returned nothing"))
+                        note=note))
+                    # §6.9: EVERY attempt is journaled. This one cost a
+                    # model call and its tokens, and it used to `continue`
+                    # without a `generate` event — a journal showing one
+                    # attempt where two were paid for.
+                    self._journal_attempt(task, n, completion, sent,
+                                          {"ok": False, "empty": True,
+                                           "note": note})
                     if completion.finish_reason == "error":
-                        stopped = ("the model could not be reached, or it "
+                        # The provider says WHICH error when it knows —
+                        # HTTP status and the server's own message. The
+                        # generic sentence made "llama.cpp was started
+                        # without --jinja and refused `tools`" look
+                        # exactly like "the server is down".
+                        stopped = (completion.error or
+                                   "the model could not be reached, or it "
                                    "returned an error")
                         break
                     continue
@@ -207,13 +270,29 @@ class Loop:
                     diags = (Diagnostic(file=task.path, severity="error",
                                         message=guard.explain_to_model(findings),
                                         code="guard", tool="guard"),)
+                    sig = _signature(code, lang, diags)
                     attempts.append(AttemptRecord(
-                        n=n, code_sha=_sha(textio.canonical(code)),
+                        n=n, code_sha=sig.code, diag_sha=sig.diags,
                         diagnostics=diags, autofixes=tuple(fixes),
                         finish_reason=completion.finish_reason,
                         continued=continued, note=f"refused: {blocked}"))
-                    self._journal_attempt(task, n, completion, request,
+                    self._journal_attempt(task, n, completion, sent,
                                           {"guard": "blocked"})
+                    # A refused attempt is still an attempt, and it still
+                    # joins the stagnation record. It used to `continue`
+                    # before the signature was kept, so a model returning
+                    # the same refused file burned every attempt and ended
+                    # "gave up after 6 attempts" — never "that was the same
+                    # code each time".
+                    stopped = self._stagnation(sig, seen, history, attempts,
+                                               error_counts, diags)
+                    seen.add(sig.pair)
+                    history.append(sig)
+                    error_counts.append(1)
+                    if stopped:
+                        stopped += (f" (each time it was refused before it "
+                                    f"ran: {blocked})")
+                        break
                     continue
 
                 # -- write, then verify (C4, M4) -------------------------
@@ -223,6 +302,13 @@ class Loop:
                     stopped = ("the change was not approved, so nothing was "
                                "written")
                     break
+                # Reindex after EVERY write, not only a passing one (M30).
+                # It used to wait for `result.ok`, so after a failed attempt
+                # the query tools contradicted `[THE FILE AS IT STANDS]` in
+                # the very next prompt: search said `parse` existed nowhere
+                # while the quoted file defined it.
+                if self.codemap is not None:
+                    self.codemap.reindex_after_write(task.path)
 
                 self._check_cancel(f"verifying {task.path}")
                 self._emit("phase", f"{task.path}: verifying",
@@ -232,9 +318,7 @@ class Loop:
                 self._log_verify(task, n, result)
                 diags = tuple(result.diagnostics)
 
-                sig = _Signature(code=_sha(textio.canonical(
-                    code, _comment_for(lang))), diags=_sha("\n".join(
-                        dx.signature(diags))))
+                sig = _signature(code, lang, diags)
                 record = AttemptRecord(
                     n=n, code_sha=sig.code, diag_sha=sig.diags,
                     diagnostics=diags, autofixes=tuple(fixes),
@@ -242,7 +326,7 @@ class Loop:
                     continued=continued,
                     note=result.summary())
                 attempts.append(record)
-                self._journal_attempt(task, n, completion, request,
+                self._journal_attempt(task, n, completion, sent,
                                       _verify_dict(result))
 
                 if result.blocked:
@@ -258,8 +342,6 @@ class Loop:
                     break
 
                 if result.ok:
-                    if self.codemap is not None:
-                        self.codemap.reindex_after_write(task.path)
                     if self.journal is not None:
                         # A `patch` event with its task is what the journal
                         # counts files from, and what a host renders history
@@ -272,6 +354,15 @@ class Loop:
                                              code.splitlines()))
                     # Remember what worked, for next time (F10).
                     self._remember(attempts, diags)
+                    break
+
+                # -- a test that disagrees with the code is not bent (C4) --
+                if is_test and _test_disagrees_with_code(task.path, diags):
+                    stopped = _disagreement_sentence(task.path, covers,
+                                                     diags)
+                    self.blamed[task.path] = (covers, diags)
+                    self._emit("warning", f"{task.path}: {stopped}",
+                               {"task": task.path, "covers": covers})
                     break
 
                 # -- stagnation and cycles (M34) -------------------------
@@ -291,9 +382,17 @@ class Loop:
                     break
 
             ok = bool(result and result.ok)
+            unverified = self._ran_no_tests(task, is_test, result) if ok \
+                else ""
+            if unverified:
+                self.unverified.add(task.path)
+                self._emit("warning", f"{task.path}: {unverified}",
+                           {"task": task.path, "verified": False})
             if tx is not None:
                 if ok:
-                    tx.commit(verified=True)     # committed AND verified: SEALED
+                    # committed AND verified: SEALED — unless the tests that
+                    # were meant to verify it never ran.
+                    tx.commit(verified=not unverified)
                 elif tx.state == "open":
                     # A and B are one change and B failed → both revert. When
                     # the task is not atomic the planner said so, and the
@@ -315,24 +414,95 @@ class Loop:
         if not stopped and not (result and result.ok):
             stopped = self._give_up_sentence(attempts)
 
+        caveats = tuple(result.caveats) if result else ()
+        if unverified:
+            caveats += (unverified,)
         outcome = TaskOutcome(
             task_id=task.id, path=task.path,
             ok=bool(result and result.ok), attempts=tuple(attempts),
-            result=result, stopped_because=stopped,
-            caveats=tuple(result.caveats) if result else ())
+            result=result, stopped_because=stopped, caveats=caveats)
         self._emit("status", outcome.summary(),
                    {"task": task.path, "ok": outcome.ok})
         return outcome
+
+    def reverify(self, task: Task, *, because: str = "") -> TaskOutcome:
+        """Verify a file again WITHOUT generating anything.
+
+        Used after the module a test covers has been repaired against that
+        test: the test's own verdict is the evidence, and asking a model to
+        regenerate a test that may now pass would be paying to risk it.
+        """
+        lang = task.lang or langs.id_for_path(task.path) or "python"
+        is_test = task.persona == "tester" or _looks_like_test(task.path)
+        self._check_cancel(f"verifying {task.path} again")
+        self._emit("phase", f"{task.path}: verifying again",
+                   {"phase": "verify", "task": task.path, "attempt": 0})
+        result = self._verify(task, lang)
+        self._log_verify(task, 0, result)
+        caveats = tuple(result.caveats)
+        if because:
+            caveats += (f"verified again after {because}; no new code was "
+                        f"generated for it",)
+        unverified = self._ran_no_tests(task, is_test, result) \
+            if result.ok else ""
+        if unverified:
+            self.unverified.add(task.path)
+            caveats += (unverified,)
+        stopped = ""
+        if not result.ok:
+            first = next((d for d in result.diagnostics if d.is_error), None)
+            stopped = (f"it still fails after {because or 'the repair'}"
+                       + (f": {first.one_line()}" if first else ""))
+        outcome = TaskOutcome(task_id=task.id, path=task.path, ok=result.ok,
+                              result=result, stopped_because=stopped,
+                              caveats=caveats)
+        self._emit("status", outcome.summary(),
+                   {"task": task.path, "ok": outcome.ok})
+        return outcome
+
+    def _ran_no_tests(self, task: Task, is_test: bool,
+                      result: RunResult | None) -> str:
+        """The not-verified sentence, when a test file exists and ran nothing.
+
+        A green run with ZERO tests collected is the most dangerous green
+        there is (runner.zero_tests), and it sealed files as verified: the
+        test file was right there, and discovery never reached it. A file
+        with no test file at all is a different, weaker claim — "built and
+        ran" — and the session summary counts those separately.
+        """
+        test_file = task.test_path or (task.path if is_test else "")
+        if not (result and test_file and self._read(test_file)):
+            return ""
+        if not runner.zero_tests(result.output):
+            return ""
+        return (f"{test_file} exists, but the test run collected none of its "
+                f"tests, so {task.path} is NOT verified — check that the "
+                f"test folder is a package and the test names match what "
+                f"the runner discovers")
 
     # ------------------------------------------------------------------
     # generation, with tool round-trips and continuation
     # ------------------------------------------------------------------
     def _generate(self, task: Task, persona: Persona, lang: str, *,
                   request: str, diagnostics: str, autofixes: Sequence[str],
-                  attempt: int) -> tuple[str, Completion, bool]:
+                  attempt: int, repair: bool | None = None,
+                  against_test: bool = False
+                  ) -> tuple[str, Completion, bool, list[Message]]:
+        """(code, completion, continued, the messages actually sent).
+
+        The messages come back so the journal can hash THEM (C8). Hashing
+        the request instead gave every attempt of every task the same
+        `prompt_sha256`, which is a provenance field that cannot tell two
+        prompts apart.
+        """
+        if repair is None:
+            repair = attempt > 1
         caps = self.host.llm.capabilities()
         arch = ""
         tail_extra: list[str] = []
+        #: The same tail blocks as (label, text), so they can be put back
+        #: together under a budget when the whole prompt would not fit.
+        tail_pieces: list[tuple[str, str]] = []
         interfaces = examples = staleness = ""
         if self.codemap is not None:
             arch = self.codemap.prefix_block(task.path)
@@ -346,7 +516,21 @@ class Loop:
                 else:
                     staleness = b
 
-        if attempt == 1:
+        current = "" if repair else self._read(task.path)
+        if current and _is_our_stub(current):
+            current = ""
+        if not repair and current.strip():
+            # THE FILE ALREADY EXISTS AND IS REAL. The first attempt used to
+            # say "Write the complete contents of `x`" and never show `x`,
+            # so "improve this" or "extend src/util.py" regenerated a
+            # working file blind — and with auto-apply on, replaced it.
+            # The model is shown the file and asked for a CHANGE, and the
+            # same context check as a repair applies: a file too large to
+            # show whole is refused, never rewritten from its first half.
+            body = _change_task_text(task, request, lang)
+            tail_extra.append(f"[THE FILE AS IT STANDS]\n{current}")
+            tail_pieces.append(("THE FILE AS IT STANDS", current))
+        elif not repair:
             body = _first_task_text(task, request, lang)
         else:
             # Diagnostics go in the TAIL, not here — tail_for puts them
@@ -354,11 +538,33 @@ class Loop:
             # most (D7). Repeating them in the task body would spend
             # context restating the same errors twice.
             body = personas.repair_task(task.path, task.purpose,
-                                        autofixes=autofixes)
+                                        autofixes=autofixes,
+                                        request=request)
             persona = PERSONAS["repairer"]
             existing = self._read(task.path)
             if existing:
                 tail_extra.append(f"[THE FILE AS IT STANDS]\n{existing}")
+                tail_pieces.append(("THE FILE AS IT STANDS", existing))
+            test_source = self._read(task.test_path) if (
+                against_test and task.test_path) else ""
+            if test_source:
+                # The test is the specification this repair answers to. The
+                # escape hatch matters: a model that believes the test is
+                # wrong should say so by changing nothing, which the
+                # stagnation check turns into an honest stop, rather than
+                # bend the code into agreement with a mistake.
+                tail_extra.append(
+                    f"[THE TEST THIS FILE MUST PASS — {task.test_path}]\n"
+                    f"{test_source}\n\n"
+                    f"The test is the specification. Change this file so "
+                    f"the test passes. If you are certain the test itself "
+                    f"is wrong, return this file unchanged.")
+                tail_pieces.append(
+                    (f"THE TEST THIS FILE MUST PASS — {task.test_path}",
+                     f"{test_source}\n\nThe test is the specification. "
+                     f"Change this file so the test passes. If you are "
+                     f"certain the test itself is wrong, return this file "
+                     f"unchanged."))
 
         prompt = self.prompts.build(
             persona, body, architecture=arch,
@@ -367,6 +573,27 @@ class Loop:
             diagnostics=diagnostics, contract=CONTRACT_FILE,
             extra=tail_extra)
         messages = prompt.messages()
+        messages = self._fit_to_context(
+            messages, caps, task, attempt,
+            rebuild=lambda extra: self.prompts.build(
+                persona, body, architecture=arch,
+                epoch=(self.codemap.store.epoch if self.codemap else 0),
+                staleness=staleness, diagnostics=diagnostics,
+                contract=CONTRACT_FILE, extra=extra).messages(),
+            pieces=[*tail_pieces,
+                    *([("INTERFACES OF WHAT THIS FILE USES", interfaces)]
+                      if interfaces else []),
+                    *([("HOW THIS CODEBASE DOES THINGS", examples)]
+                      if examples else [])])
+        if self._too_big:
+            # No model call: the answer could only be a truncated file.
+            # Returned as an error completion so the attempt is journaled
+            # and the loop stops with this sentence, like any provider
+            # error (the same path, so the same guarantees).
+            why, self._too_big = self._too_big, ""
+            return "", Completion(text="", finish_reason="error",
+                                  error=why, model=caps.name), False, \
+                messages
 
         tools = ()
         if (self.config.use_tools and caps.supports_tools
@@ -411,7 +638,7 @@ class Loop:
         # -- truncation: CONTINUE, do not regenerate (D1, M32) ----------
         continued = False
         continuations = 0
-        while (_is_truncated(completion, text)
+        while (_is_truncated(completion, text, lang)
                and continuations < MAX_CONTINUATIONS):
             self._check_cancel(f"continuing {task.path}")
             continuations += 1
@@ -444,15 +671,111 @@ class Loop:
                 prompt_ms=more.prompt_ms or completion.prompt_ms)
 
         # -- commentary detector at the CONSUMING call site (M36) -------
-        if detect_commentary(text):
+        if detect_commentary(text, lang):
             self._emit("warning",
                        f"{task.path}: the model wrote commentary as well as "
                        f"code; the code has been extracted from it.",
                        {"task": task.path})
             text = strip_commentary(text, lang)
 
-        code = _extract(text, lang)
-        return code, completion, continued
+        # A copied stub marker would make a finished file read as a stub.
+        code = strip_stub_sentinel(_extract(text, lang))
+        # The prompt that produced the answer: after tool round-trips and
+        # the text-lookup fallback, before any continuation (a continuation
+        # is derived from this prompt, not a different one).
+        return code, completion, continued, list(messages)
+
+    def _fit_to_context(self, messages: list[Message],
+                        caps: ModelCapabilities, task: Task, attempt: int,
+                        *, rebuild, pieces: list[tuple[str, str]]
+                        ) -> list[Message]:
+        """The prompt, made to fit the model's context — or said not to.
+
+        NOTHING MEASURED THE ASSEMBLED PROMPT. `measure_budget` and
+        `build_context` existed and only the ATK adapter called them, so a
+        repair of a large file sent `[THE FILE AS IT STANDS]` whole. On a
+        local server that is not an error anyone sees: llama.cpp shifts the
+        context, the SYSTEM PROMPT is what falls off the front, and the
+        model answers a prompt with no instructions in it. On a small model
+        that is the likeliest single cause of a repair that "ignores" the
+        diagnostics.
+
+        Only the volatile tail is re-assembled — the file as it stands, the
+        test, the interfaces, the examples — through `build_context`, which
+        cuts the largest essential piece to fit and names what it left out
+        (M28). The cached prefix is never touched (M52).
+        """
+        total = int(getattr(caps, "context_tokens", 0) or 0)
+        if total <= 0:
+            return messages
+        count = self.host.llm.count_tokens
+        # The reply is part of the same window; a margin covers the chat
+        # template's own tokens, which no count of the text includes.
+        margin = max(64, total // 50)
+        limit = total - int(self.config.max_tokens) - margin
+        used = sum(count(m.content) for m in messages)
+        if used <= limit:
+            return messages
+        movable = sum(count(text) for _label, text in pieces)
+        fixed = used - movable
+        room = limit - fixed
+        whole = [text for label, text in pieces
+                 if label == "THE FILE AS IT STANDS"]
+        # The file being repaired is the one piece that may NOT be cut: the
+        # contract asks for the complete corrected file, and a model shown
+        # its first half returns its first half — the rest of the file
+        # deleted in a diff that may well still verify. Refuse instead,
+        # before a model call is spent on it.
+        if whole and count(whole[0]) + 128 > room:
+            self._too_big = (
+                f"{task.path} is about {count(whole[0]):,} tokens and the "
+                f"repair prompt has room for about {max(0, room):,} (a "
+                f"{total:,}-token context, less {self.config.max_tokens:,} "
+                f"for the reply and {fixed:,} for the instructions and "
+                f"errors). A whole-file repair cannot be done at this "
+                f"size without showing the model part of the file, and a "
+                f"model shown part of a file returns part of a file. Load "
+                f"the model with a larger context, split the file, or fix "
+                f"the reported error by hand")
+            if self.journal is not None:
+                self.journal.log("budget", what="context", task=task.path,
+                                 attempt=attempt, fitted=False,
+                                 refused=True, tokens_before=used,
+                                 limit=limit)
+            return messages
+        if pieces and room > 256:
+            tail = build_context(
+                [Piece(label, text, priority=i,
+                       essential=label.startswith(("THE FILE", "THE TEST")))
+                 for i, (label, text) in enumerate(pieces)],
+                room * CHARS_PER_TOKEN, count_tokens=count)
+            fitted = rebuild([tail])
+            now = sum(count(m.content) for m in fitted)
+            self._emit("warning",
+                       f"{task.path}: the prompt was about {used:,} tokens "
+                       f"against {limit:,} available (a {total:,}-token "
+                       f"context, less {self.config.max_tokens:,} for the "
+                       f"reply), so the file, test and interfaces were cut "
+                       f"to fit and the cut is named in the prompt.",
+                       {"task": task.path, "tokens_before": used,
+                        "tokens_after": now, "limit": limit})
+            if self.journal is not None:
+                self.journal.log("budget", what="context", task=task.path,
+                                 attempt=attempt, fitted=True, tokens_before=used,
+                                 tokens_after=now, limit=limit)
+            return fitted
+        self._emit("warning",
+                   f"{task.path}: the prompt is about {used:,} tokens "
+                   f"against {limit:,} available, and the part that cannot "
+                   f"be cut — instructions, request and diagnostics — is "
+                   f"{fixed:,} of them. The server may drop the start of "
+                   f"the prompt. A larger context, a smaller reply budget "
+                   f"or a shorter request will help.",
+                   {"task": task.path, "tokens": used, "limit": limit})
+        if self.journal is not None:
+            self.journal.log("budget", what="context", task=task.path,
+                             attempt=attempt, fitted=False, tokens_before=used, limit=limit)
+        return messages
 
     def _complete(self, messages: Sequence[Message], *, tools=(),
                   temperature: float = 0.15) -> Completion:
@@ -514,17 +837,23 @@ class Loop:
                     "vague to fix by retrying; narrow it, or fix the last "
                     "error by hand")
 
-        if history and _cosmetic(history[-1], sig, attempts):
-            return ("the model only rearranged whitespace between attempts — "
-                    "it is not changing anything that matters")
+        if history and _cosmetic(history[-1], sig):
+            return (f"the model changed under "
+                    f"{COSMETIC_THRESHOLD:.0%} of the file between attempts "
+                    f"and the errors did not move — it is tinkering, not "
+                    f"fixing. The error is probably somewhere it is not "
+                    f"looking; fix it by hand or narrow the task")
 
         if sig.pair in seen:
-            where = [a.n for a in attempts
+            # EARLIER attempts only. The current one is named once, at the
+            # end; it used to be in both places and the sentence read
+            # "attempts 1, 3 and 3".
+            where = [a.n for a in attempts[:-1]
                      if (a.code_sha, a.diag_sha) == sig.pair]
             cycle = _describe_cycle(diags)
-            return (f"attempts {', '.join(map(str, where))} and "
-                    f"{attempts[-1].n} produced the same code and the same "
-                    f"errors — it is going round in a circle{cycle}")
+            return (f"attempts {_and_list(where + [attempts[-1].n])} "
+                    f"produced the same code and the same errors — it is "
+                    f"going round in a circle{cycle}")
 
         if history and sig.diags == history[-1].diags:
             return ("two attempts in a row produced exactly the same errors, "
@@ -594,7 +923,7 @@ class Loop:
             self._read(task.path) or "", lang, fs=self.host.fs,
             ex=self.host.exec, stem=_stem(task.path), path=task.path,
             project_mode=self.config.project_mode, test_source=test_source,
-            timeouts=self.config.timeouts,
+            timeouts=self.config.timeouts, test_path=task.test_path,
             skip_guard=True)      # already screened above; don't pay twice
 
     def _write(self, tx: Any, task: Task, code: str) -> bool:
@@ -644,7 +973,13 @@ class Loop:
             pass          # a log must never fail a build
 
     def _journal_attempt(self, task: Task, n: int, completion: Completion,
-                         request: str, verify: dict) -> None:
+                         sent: Sequence[Message], verify: dict) -> None:
+        """One `generate` event, hashing the messages actually SENT (C8).
+
+        It hashed `request or task.purpose`, so every attempt of every task
+        in a session carried the same `prompt_sha256`. A hash that cannot
+        tell a first attempt from a repair is not provenance.
+        """
         if self.journal is None:
             return
         try:
@@ -673,7 +1008,7 @@ class Loop:
         self.journal.generation(
             task=task.path, attempt=n,
             provider=getattr(self.host.llm, "name", "host"),
-            completion=completion, prompt=request or task.purpose,
+            completion=completion, prompt=list(sent) or task.purpose,
             temperature=self.config.temperature, seed=self.config.seed,
             verify=verify, remote=remote)
 
@@ -700,35 +1035,115 @@ def _stem(path: str) -> str:
 
 
 _OPENERS = {"(": ")", "[": "]", "{": "}"}
+_CLOSERS = {v: k for k, v in _OPENERS.items()}
+_FENCE_LINE = re.compile(r"^[ \t]*```[\w+#.-]*[ \t]*$")
 
 
-def _is_truncated(completion: Completion, text: str) -> bool:
+def _is_truncated(completion: Completion, text: str, lang: str = "") -> bool:
     """`finish_reason == "length"` is the SIGNAL; delimiters are the backstop.
 
     D1 is explicit that truncation is detected structurally rather than
     inferred. The delimiter check exists for providers that report "stop"
     when they mean "length", which several do.
+
+    THE BACKSTOP HAS TO BE RIGHT, because being wrong is not free. A false
+    positive on a complete file costs up to MAX_CONTINUATIONS model calls
+    and then appends the model's "The file is complete as written." to a
+    correct file, which then fails to parse. The first scanner did that on
+    `['\\\\', 'x']` (it read the backslash as escaping the closing quote),
+    on `os.path.join("C:\\\\", "x")` for the same reason, and on
+    `# note: dict[` because it counted brackets inside comments. So:
+
+      * for Python, the tokenizer decides. `TokenError` means "EOF in
+        multi-line statement/string" — that IS truncation — and a clean
+        tokenize means the file is whole whatever a bracket count says;
+      * for everything else, a backslash escapes the following character
+        (including another backslash) and comments are skipped using the
+        language's own markers.
     """
     if completion.finish_reason == "length":
         return True
     if not text.strip():
         return False
+    body = _unfenced(text)
+    if lang == "python":
+        verdict = _python_truncated(body)
+        if verdict is not None:
+            return verdict
+    lang_obj = langs.get(lang) if lang else None
+    line_comment = lang_obj.comment if lang_obj else "#"
+    block = tuple(lang_obj.block_comment) if (
+        lang_obj and lang_obj.block_comment) else ()
+    return _unbalanced(body, line_comment, block)
+
+
+def _unfenced(text: str) -> str:
+    """The reply without an opening fence line or a closing one.
+
+    The check runs on the RAW reply, and a fenced file that is complete
+    must read as complete; the closing fence is what a truncated one lacks.
+    """
+    lines = text.split("\n")
+    if lines and _FENCE_LINE.match(lines[0]):
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and _FENCE_LINE.match(lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def _python_truncated(code: str) -> bool | None:
+    """The tokenizer's verdict, or None when it cannot give one.
+
+    `IndentationError` and the other `SyntaxError`s are real errors in a
+    file that may well be complete — the loop's verify step will report
+    them properly — so they fall through to the delimiter scan rather than
+    being read as truncation.
+    """
+    import io
+    import tokenize
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(code).readline):
+            pass
+    except tokenize.TokenError:
+        return True
+    except (SyntaxError, ValueError):
+        return None
+    return False
+
+
+def _unbalanced(text: str, line_comment: str, block: tuple) -> bool:
     depth = dict.fromkeys(_OPENERS, 0)
     in_str: str | None = None
-    prev = ""
-    for ch in text:
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
         if in_str:
-            if ch == in_str and prev != "\\":
+            if ch == "\\":
+                i += 2              # the escaped character, whatever it is
+                continue
+            if ch == in_str:
                 in_str = None
-        elif ch in "\"'":
+            elif ch == "\n" and in_str != "`":
+                in_str = None       # an unterminated single-line string
+            i += 1
+            continue
+        if line_comment and text.startswith(line_comment, i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end + 1
+            continue
+        if block and text.startswith(block[0], i):
+            end = text.find(block[1], i + len(block[0]))
+            i = n if end == -1 else end + len(block[1])
+            continue
+        if ch in "\"'`":
             in_str = ch
         elif ch in _OPENERS:
             depth[ch] += 1
-        elif ch in _OPENERS.values():
-            for opener, closer in _OPENERS.items():
-                if ch == closer:
-                    depth[opener] -= 1
-        prev = ch
+        elif ch in _CLOSERS:
+            depth[_CLOSERS[ch]] -= 1
+        i += 1
     return any(v > 0 for v in depth.values())
 
 
@@ -738,12 +1153,81 @@ def _join_continuation(head: str, tail: str) -> str:
     Models told "do not repeat anything" repeat the last line about a third
     of the time. Detecting the overlap is cheap; a duplicated line in the
     middle of a file is a syntax error that looks like a model failure.
+
+    Three seams the whole-line overlap check could not see, each observed:
+
+      * the cut was MID-LINE and the model re-emitted the full last line,
+        so the join read `return tuple(    return tuple(...)`. If the
+        head's partial last line is a prefix of the continuation's first
+        line, the partial line goes;
+      * the model re-opened a code fence at the top of the continuation
+        (and sometimes closed one at the end of the head), which put a
+        fence mid-file and made `_extract` pick the first fence body — the
+        truncated head — as the whole file;
+      * the model ignored "do not start again" and re-emitted the file
+        from line one. Appending that duplicates every definition; the
+        longer copy is the file.
     """
+    head_body, opened, closed = _strip_head_fence(head)
+    tail_body = _strip_tail_fence(tail)
+    if closed:
+        # The head ended on a closing fence, so its last code line was a
+        # WHOLE line: the cut was at a line boundary, not mid-token, and
+        # the "no joiner" rule below does not apply.
+        head_body = head_body.rstrip("\n") + "\n"
+    joined = _join_bodies(head_body, tail_body)
+    if opened and not _FENCE_LINE.match(joined.rstrip("\n").rsplit(
+            "\n", 1)[-1]):
+        joined = joined.rstrip("\n") + "\n```"
+    return (opened + "\n" + joined) if opened else joined
+
+
+def _strip_head_fence(head: str) -> tuple[str, str, bool]:
+    """(body, opening fence line or "", whether a closing fence was cut).
+
+    A trailing fence is dropped: a continuation follows it, so it was the
+    model closing a block it had not finished.
+    """
+    lines = head.split("\n")
+    opened = ""
+    closed = False
+    if lines and _FENCE_LINE.match(lines[0]):
+        opened = lines[0]
+        lines = lines[1:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and _FENCE_LINE.match(lines[-1]):
+        lines = lines[:-1]
+        closed = True
+    return "\n".join(lines), opened, closed
+
+
+def _strip_tail_fence(tail: str) -> str:
+    lines = tail.lstrip("\n").split("\n")
+    if lines and _FENCE_LINE.match(lines[0]):
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def _join_bodies(head: str, tail: str) -> str:
+    ends_whole = head.endswith("\n")
     head_lines = head.rstrip("\n").split("\n")
     tail_lines = tail.lstrip("\n").split("\n")
+    # Re-emitted from the top: the continuation starts with the head's
+    # complete lines. The head's LAST line is excluded from the comparison
+    # because it is usually the partial one the cut landed in.
+    whole = head_lines if ends_whole else head_lines[:-1]
+    lead = [ln for ln in whole if ln.strip()][:3]
+    if (len(lead) >= 2 and len(tail_lines) >= len(whole)
+            and [ln for ln in tail_lines if ln.strip()][:len(lead)] == lead):
+        return tail if len(tail) >= len(head) else head
     for overlap in range(min(8, len(head_lines), len(tail_lines)), 0, -1):
         if head_lines[-overlap:] == tail_lines[:overlap]:
             return "\n".join(head_lines + tail_lines[overlap:])
+    last = head_lines[-1]
+    if (last.strip() and tail_lines and tail_lines[0] != last
+            and tail_lines[0].startswith(last)):
+        return "\n".join(head_lines[:-1] + tail_lines)
     # No joiner, ever. `finish_reason == "length"` means the model was cut
     # off mid-TOKEN — `    parts = ` — and the continuation resumes at the
     # very next character. Inserting a newline here produces
@@ -753,16 +1237,96 @@ def _join_continuation(head: str, tail: str) -> str:
     return head + tail.lstrip("\n")
 
 
-def _cosmetic(previous: _Signature, current: _Signature,
-              attempts: Sequence[AttemptRecord]) -> bool:
-    """Whitespace churn looks like change to a naive hash. It isn't (M34).
+def _signature(code: str, lang: str,
+               diags: Sequence[Diagnostic]) -> _Signature:
+    """One attempt's stagnation identity (M34)."""
+    digest, text = _code_identity(code, lang)
+    return _Signature(code=digest, diags=_diag_identity(diags), text=text)
 
-    `textio.canonical` already collapses whitespace and strips comments
-    before hashing, so an identical canonical hash IS the cosmetic case —
-    this is the second line of defence for languages where the canonical
-    form still differs (indentation-significant ones).
+
+def _code_identity(code: str, lang: str) -> tuple[str, str]:
+    """(hash, normalised text) of one attempt's code.
+
+    For Python the normal form is the AST, unparsed. `textio.canonical`
+    collapses LEADING whitespace along with the rest, and in Python leading
+    whitespace is semantics: a `return` inside a loop and the same `return`
+    after it hashed identically, and a real change was stopped as
+    "identical code twice" one attempt before the fix that would have
+    passed. The AST ignores what canonical() was for — spacing, blank
+    lines, comments — and keeps what it lost.
+
+    A file that does not parse falls back to canonical(), which is exactly
+    when stagnation is most likely and a parse is least available. The two
+    forms are prefixed so they can never collide with each other.
     """
-    return previous.code == current.code and previous.diags == current.diags
+    if lang == "python":
+        try:
+            import ast
+            text = "ast:" + ast.unparse(ast.parse(code))
+            return _sha(text), text
+        except (SyntaxError, ValueError, RecursionError):
+            pass
+    text = "txt:" + textio.canonical(code, _comment_for(lang))
+    return _sha(text), text
+
+
+def _diag_identity(diags: Sequence[Diagnostic]) -> str:
+    """Sorted (file, message, offending source) — deliberately NOT the line.
+
+    `diagnostics.signature` keys on the line number, which is right for
+    regression memory and wrong here: a model that adds one line above the
+    error each attempt moves the SAME NameError one line down every time,
+    and with the line in the key that read as progress until the slow-
+    oscillation check caught it at attempt 4 instead of attempt 2.
+    """
+    rows = sorted(f"{d.file}|{(d.message or '')[:80]}|"
+                  f"{_offending(d.source_excerpt)}" for d in diags)
+    return _sha("\n".join(rows))
+
+
+def _offending(excerpt: str) -> str:
+    """The quoted offending line(s), without the numbers the quote carries.
+
+    `attach_source` marks the offending line `>>  NNNN | text` among its
+    context lines. The number and the context both drift when lines are
+    added above; the offending text does not.
+    """
+    return " / ".join(line.split("|", 1)[-1].strip()
+                      for line in (excerpt or "").splitlines()
+                      if line.startswith(">>"))
+
+
+def _cosmetic(previous: _Signature, current: _Signature) -> bool:
+    """Churn: under COSMETIC_THRESHOLD of the file changed, errors unmoved.
+
+    The first version compared the same two hashes the identical-code check
+    had just compared, so it could never be True and the threshold was
+    never read. This measures the difference instead — at LINE granularity,
+    weighted by characters, because a character-level SequenceMatcher on a
+    large file is quadratic and a stagnation check must never be the slow
+    part of an attempt. A changed line counts as wholly changed, which errs
+    towards "not cosmetic": the safe direction for a check that stops work.
+    """
+    if previous.diags != current.diags or not previous.text \
+            or not current.text:
+        return False
+    a = previous.text.split("\n")
+    b = current.text.split("\n")
+    total = sum(map(len, a)) + sum(map(len, b))
+    if not total:
+        return False
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    same = sum(sum(len(line) for line in a[m.a:m.a + m.size])
+               for m in matcher.get_matching_blocks())
+    return 2 * same / total >= 1.0 - COSMETIC_THRESHOLD
+
+
+def _and_list(numbers: Sequence[int]) -> str:
+    """1 → "1"; 1, 3 → "1 and 3"; 1, 3, 5 → "1, 3 and 5"."""
+    words = [str(n) for n in numbers]
+    if len(words) <= 1:
+        return "".join(words)
+    return f"{', '.join(words[:-1])} and {words[-1]}"
 
 
 def _describe_cycle(diags: Sequence[Diagnostic]) -> str:
@@ -791,6 +1355,67 @@ def _describe_cycle(diags: Sequence[Diagnostic]) -> str:
     return f". The error it keeps producing is {kinds[0]}"
 
 
+#: A test file's OWN mistakes: it does not parse, or it names something that
+#: does not exist. Those are the test's to fix, and fixing them does not
+#: change what the test claims about the code.
+_TEST_OWN_FAULT = re.compile(
+    r"SyntaxError|IndentationError|TabError|ImportError|ModuleNotFoundError|"
+    r"cannot import name|NameError|is not defined", re.I)
+
+
+def _same_file(diag_file: str, path: str) -> bool:
+    f = (diag_file or "").replace("\\", "/")
+    p = path.replace("\\", "/")
+    return f == p or f.endswith("/" + p) or (
+        "/" not in p and f.rsplit("/", 1)[-1] == p)
+
+
+def _test_disagrees_with_code(test_path: str,
+                              diags: Sequence[Diagnostic]) -> bool:
+    """Does this failing test run say the CODE is wrong, not the test?
+
+    WHY THIS EXISTS. When a correct test failed against a wrong module, the
+    repairer was pointed at the test — and bent it. `add` returned `a - b`,
+    the repaired test asserted `add(1, 1) == 0`, and both were committed
+    green: the exact thing the tester persona says a bad test does, which is
+    "manufacture confidence".
+
+    An assertion failure is located IN the test file, so "the diagnostic
+    points somewhere else" cannot be the rule. It is:
+
+      * the test's own breakage (it does not parse, or it imports or names
+        something that does not exist) — the test's fault, repair the test;
+      * otherwise, an assertion failure, or an error raised in another file
+        — the test and the code disagree about BEHAVIOUR, and a disagreement
+        is never settled by editing the test until it agrees.
+    """
+    errors = [d for d in diags if d.is_error]
+    for d in errors:
+        if d.file and _same_file(d.file, test_path) and \
+                _TEST_OWN_FAULT.search(d.message or ""):
+            return False
+    for d in errors:
+        message = (d.message or "").lower()
+        if "assert" in message or (d.severity or "").lower() == "failure":
+            return True
+        if d.file and not _same_file(d.file, test_path) and \
+                "site-packages" not in d.file:
+            return True
+    return False
+
+
+def _disagreement_sentence(test_path: str, covers: str,
+                           diags: Sequence[Diagnostic]) -> str:
+    target = f"`{covers}`" if covers else "the code it tests"
+    first = next((d for d in diags if d.is_error and d.file), None) or \
+        next((d for d in diags if d.is_error), None)
+    detail = f" ({first.one_line()})" if first else ""
+    return (f"the tests in {test_path} fail against {target}{detail}. The "
+            f"test was not rewritten to agree with the code — that would "
+            f"make a wrong {covers or 'module'} look verified. It is "
+            f"{covers or 'the code under test'} that has to change")
+
+
 def _first_task_text(task: Task, request: str, lang: str) -> str:
     lang_obj = langs.get(lang)
     label = lang_obj.label if lang_obj else lang
@@ -799,6 +1424,25 @@ def _first_task_text(task: Task, request: str, lang: str) -> str:
         lines += [f"It is part of this request: {request}", ""]
     lines += [f"Purpose of this file: {task.purpose}",
               f"Language: {label}"]
+    if task.test_path:
+        lines.append(f"Its tests live in `{task.test_path}` and must pass.")
+    if lang_obj and lang_obj.notes:
+        lines.append(f"Note for this language: {lang_obj.notes}")
+    return "\n".join(lines)
+
+
+def _change_task_text(task: Task, request: str, lang: str) -> str:
+    """The first attempt on a file that already has real work in it."""
+    lang_obj = langs.get(lang)
+    label = lang_obj.label if lang_obj else lang
+    lines = [f"`{task.path}` already exists; its current contents are "
+             f"below. Change it as this request asks, and keep everything "
+             f"the request does not mention exactly as it is.", ""]
+    if request:
+        lines += [f"The request: {request}", ""]
+    lines += [f"What this file is for: {task.purpose}",
+              f"Language: {label}",
+              "Return the complete updated file."]
     if task.test_path:
         lines.append(f"Its tests live in `{task.test_path}` and must pass.")
     if lang_obj and lang_obj.notes:

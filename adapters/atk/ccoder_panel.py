@@ -7,9 +7,10 @@
 ATK's UI doctrine, honoured rather than reinvented (§7.1):
 
   * **One tab per function, no pop-ups to go hunting for.** This is a
-    workspace tab with sub-tabs, not a dialog. The single justified modal is
-    the diff approval, and the owner has chosen auto-apply, so in practice
-    even that does not appear.
+    workspace tab with sub-tabs, not a dialog. The two justified modals are
+    the diff approval — which does not appear once auto-apply is turned on
+    in Setup → System & Resources → Advanced — and the remote-send
+    question, which always does (C3).
   * **Detachable panes.** The console, the diff view and the CodeMap tree
     register with `atk/ui/detach.py` so they can be popped to another
     monitor — which is how anyone actually watches a build.
@@ -17,6 +18,10 @@ ATK's UI doctrine, honoured rather than reinvented (§7.1):
     via `atk/core/workers.py`; `EventPort` calls arrive on the worker thread
     and are marshalled back with signals. `Session.cancel()` is the ONE
     cross-thread call (§5.2), and it is what the Stop button does.
+  * **Widgets are only ever built on the GUI thread.** The approval
+    questions arrive on the worker thread; `_Bridge.ask` carries each one
+    to the GUI thread with a BLOCKING queued connection, so the worker
+    waits for the answer instead of building a dialog where it stands.
 
 **"Attach a screenshot" is here on purpose** (§7.2). Devstral is multimodal
 and the owner habitually debugs by screenshot — the clipped Setup page, the
@@ -30,14 +35,16 @@ panel surfaces rather than silently dropping the image.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QFont, QTextCursor
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -45,7 +52,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -54,7 +60,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ccoder_host import ATK_CONVENTIONS, build_host, build_session, preflight
+from .ccoder_host import (
+    ATK_CONVENTIONS,
+    AskOnGuiThread,
+    build_host,
+    build_session,
+    change_log,
+    failure_line,
+    preflight,
+    project_root_for,
+)
 
 
 class _Bridge(QObject):
@@ -73,6 +88,11 @@ class _Bridge(QObject):
     remote = Signal(str)
     finished = Signal(object)
     failed = Signal(str)
+    #: A zero-argument job to run on the GUI thread, AND WAIT FOR. Connected
+    #: with BlockingQueuedConnection in `_connect` — never AutoConnection,
+    #: which from the worker thread would queue the dialog and return before
+    #: anyone had answered it.
+    ask = Signal(object)
 
 
 class CognitiveCoderPanel(QWidget):
@@ -83,6 +103,9 @@ class CognitiveCoderPanel(QWidget):
         self.ctx = ctx
         self.session: Any = None
         self._worker: Any = None
+        #: True from Build until finished/failed. Separate from the button's
+        #: state because other code (refresh_model) sets that state too.
+        self._running = False
         self._images: list[tuple[bytes, str]] = []
         self._bridge = _Bridge()
         self._build_ui()
@@ -171,13 +194,17 @@ class CognitiveCoderPanel(QWidget):
         """Pop the console, diff and CodeMap to another monitor (§7.1)."""
         try:
             from atk.ui.detach import register_detachable
+        except ImportError:
+            return      # a convenience; the panel works without it
+        try:
             register_detachable(self.console, "Cognitive Coder — Console")
             register_detachable(self.diff, "Cognitive Coder — Changes")
             register_detachable(self.codemap, "Cognitive Coder — CodeMap")
         except Exception:                                # noqa: BLE001
-            # Detaching is a convenience; the panel works without it, and a
-            # missing helper must not stop the tab from loading.
-            pass
+            # A failing helper must not stop the tab from loading — but it
+            # is a bug in ATK's detach code, so it goes to the log.
+            logging.getLogger(__name__).exception(
+                "register_detachable failed; the panes will not detach")
 
     def _connect(self) -> None:
         self.go.clicked.connect(self.start_build)
@@ -189,6 +216,11 @@ class CognitiveCoderPanel(QWidget):
         self._bridge.remote.connect(self._on_remote)
         self._bridge.finished.connect(self._on_finished)
         self._bridge.failed.connect(self._on_failed)
+        self._bridge.ask.connect(self._run_on_gui_thread,
+                                 Qt.ConnectionType.BlockingQueuedConnection)
+        self._ask = AskOnGuiThread(on_gui_thread=self._on_gui_thread,
+                                   post=self._bridge.ask.emit,
+                                   report=self._bridge.status.emit)
         self.refresh_languages()
 
     # ------------------------------------------------------------------
@@ -232,7 +264,10 @@ class CognitiveCoderPanel(QWidget):
         self.model_label.setText(
             f"{meta.get('model_file', 'a model')} · "
             f"{meta.get('n_ctx', '?')} tokens of context")
-        self.go.setEnabled(True)
+        # Not mid-run: a model-change notification during a build used to
+        # re-enable Build, and a second press started a second session on
+        # the same project while the first was still writing.
+        self.go.setEnabled(not self._running)
 
     # ------------------------------------------------------------------
     def attach_screenshot(self) -> None:
@@ -262,7 +297,11 @@ class CognitiveCoderPanel(QWidget):
         if not request:
             return
         engine = getattr(self.ctx, "llm_engine", None)
-        project = getattr(self.ctx, "project_root", None) or str(Path.cwd())
+        project, why_not = project_root_for(self.ctx)
+        if project is None:
+            self._on_console("error", why_not)
+            self._on_status(why_not)
+            return
 
         problems = preflight(engine, project)
         if problems:
@@ -277,13 +316,17 @@ class CognitiveCoderPanel(QWidget):
             console=lambda kind, text: self._bridge.console.emit(kind, text),
             flow=self._bridge.flow.emit,
             remote_banner=self._bridge.remote.emit,
-            ask_diff=None,          # auto-apply is the owner's choice
-            ask_remote=self._ask_remote)
+            # Always wired. With it None and auto-apply off (the default),
+            # approve_diff returned False for EVERY diff: a fresh install
+            # refused every change and never showed a dialog to say so.
+            ask_diff=self._ask.for_diff(self._diff_dialog),
+            ask_remote=self._ask.for_remote(self._remote_dialog))
         self.session = build_session(
             host, lang=self.language.currentData() or "python",
             conventions=ATK_CONVENTIONS)
 
         self.console.clear()
+        self._running = True
         self.go.setEnabled(False)
         self.stop.setEnabled(True)
 
@@ -331,13 +374,50 @@ class CognitiveCoderPanel(QWidget):
         profile.setdefault("skill_level", "senior")
         return profile
 
-    def _ask_remote(self, provider: str, bytes_out: int,
-                    estimate: str) -> bool:
+    def _on_gui_thread(self) -> bool:
+        app = QCoreApplication.instance()
+        return app is not None and QThread.currentThread() is app.thread()
+
+    def _run_on_gui_thread(self, job: Any) -> None:
+        """The slot behind `_Bridge.ask`: runs on the GUI thread, by design."""
+        job()
+
+    def _diff_dialog(self, summary: str, unified_diff: str) -> bool:
+        """Show one change and ask. GUI thread only — see AskOnGuiThread.
+
+        Default is DON'T apply: Enter on a dialog nobody read must not
+        write to the operator's project.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Apply this change?")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(summary)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFont("Consolas", 9))
+        view.setPlainText(unified_diff or "(no diff)")
+        layout.addWidget(view, 1)
+        buttons = QDialogButtonBox()
+        buttons.addButton("Apply", QDialogButtonBox.ButtonRole.AcceptRole)
+        skip = buttons.addButton("Don't apply",
+                                 QDialogButtonBox.ButtonRole.RejectRole)
+        skip.setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(900, 600)
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _remote_dialog(self, provider: str, bytes_out: int,
+                       estimate: str) -> bool:
         """The one thing that always asks, whatever the diff setting says.
 
         C3 is ATK's core promise. Auto-approving outbound traffic in an
         air-gapped tool would be a contradiction, so this is a real modal
-        with a real default of No.
+        with a real default of No — built on the GUI thread, because it is
+        only ever called through AskOnGuiThread.
         """
         answer = QMessageBox.question(
             self, "Send data off this machine?",
@@ -377,8 +457,10 @@ class CognitiveCoderPanel(QWidget):
         self.remote_banner.setVisible(bool(banner))
 
     def _on_finished(self, session: Any) -> None:
+        self._running = False
         self.go.setEnabled(True)
         self.stop.setEnabled(False)
+        self._flush_storage()
         self._images.clear()
         self.console.appendPlainText("\n" + session.report())
         self._refresh_history()
@@ -386,12 +468,36 @@ class CognitiveCoderPanel(QWidget):
         self._show_recommendation()
 
     def _on_failed(self, detail: str) -> None:
+        self._running = False
         self.go.setEnabled(True)
         self.stop.setEnabled(False)
+        self._flush_storage()
         # C6: the operator sees a sentence. The traceback goes to the log.
         self._on_status("The build stopped with an unexpected error. The "
                         "details are in the log.")
-        self.console.appendPlainText(f"!! {detail.strip().splitlines()[-1]}")
+        self.console.appendPlainText(f"!! {failure_line(detail)}")
+
+    def _flush_storage(self) -> None:
+        """Save the engine's state into ATK's settings, on THIS thread."""
+        storage = getattr(getattr(self.session, "host", None), "storage",
+                          None)
+        flush = getattr(storage, "flush", None)
+        if callable(flush):
+            flush()             # reports its own failure, as a sentence
+
+    def closeEvent(self, event: Any) -> None:            # noqa: N802
+        """A panel closed mid-build cancels the build rather than orphan it.
+
+        Without this the worker kept generating, applying and asking for
+        approval through a bridge whose widgets were gone.
+        """
+        if self._running and self.session is not None:
+            self.session.cancel()
+            self._on_status("Cognitive Coder was closed mid-build; it stops "
+                            "at the next safe point and keeps what was "
+                            "verified.")
+        self._flush_storage()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     def _refresh_history(self) -> None:
@@ -405,10 +511,12 @@ class CognitiveCoderPanel(QWidget):
                 record.state + (" · sealed" if record.sealed else ""),
                 record.task_id, ", ".join(record.files)])
             self.history.addTopLevelItem(item)
-        diffs = [tx.diff for tx in getattr(self.session.patcher, "_open", [])
-                 if getattr(tx, "diff", "")]
-        if diffs:
-            self.diff.setPlainText("\n".join(diffs))
+        text = change_log(self.session)
+        if text:
+            self.diff.setPlainText(text)
+        # A patch event is the natural checkpoint: the transaction log has
+        # just grown, and this slot is already on the GUI thread.
+        self._flush_storage()
 
     def _refresh_codemap(self) -> None:
         if self.session is None:

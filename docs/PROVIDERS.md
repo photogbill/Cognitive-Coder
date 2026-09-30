@@ -57,13 +57,39 @@ so a host can offer a list instead of a text box:
 | vLLM | 8000 |
 | LiteLLM | 4000 |
 
-**A local endpoint is not a remote one.** `127.0.0.1`, `localhost`, and
-private ranges like `192.168.x.x` and `10.x.x.x` are LAN addresses; talking
-to them is not "the network" in the sense that matters, and the provider
-reports `is_remote=False` for them. A public host **is** remote, says so, and
-needs the gate. Treating a local llama.cpp server as remote would make the
-warning meaningless through overuse — which is how a safety indicator stops
-being read.
+**A local endpoint is not a remote one.** Talking to this machine or the
+LAN is not "the network" in the sense that matters, and treating a local
+llama.cpp server as remote would make the warning meaningless through
+overuse — which is how a safety indicator stops being read. So the URL is
+classified, **from its text alone, with no DNS lookup**:
+
+| The URL's host | Classified |
+|---|---|
+| a literal loopback, private or link-local IP — `127.0.0.1`, `::1`, `10.x`, `172.16–31.x`, `192.168.x`, `169.254.x`, `fe80::`; an IPv4-mapped IPv6 address is judged by the IPv4 inside it | **local** |
+| `localhost`, and any name ending in `.localhost` (RFC 6761 reserves them for this machine) | **local** |
+| **any other hostname** — `gpu-box.lan`, `mybox.local`, `api.example.com` | **remote** |
+| no scheme (`127.0.0.1:8080`), or a scheme that is not `http`/`https` | **refused** with a sentence; nothing is contacted |
+
+Names are never resolved to decide this. A lookup is already traffic, sent
+before anyone consented, and its answer is not evidence: a name that
+resolves to 127.0.0.1 at classification can resolve anywhere by the time of
+the call. A LAN box you reach by name is therefore remote — reach it by its
+address instead, or accept the one-time question. `ccoder` also refuses a
+`--url` ending in `/v1` (the provider adds `/v1/chat/completions` itself).
+
+**When its URL is remote, `openai_compatible` goes through everything a
+remote provider does**: it is constructed only with a session gate that has
+`openai_compatible` enabled, and every call is budgeted before it is sent,
+redacted (every message, tool results included), approved through
+`approve_remote` before the first byte leaves, counted in `bytes_out`, and
+journaled. It used to be the one hole in C3: consulted once at
+construction, it then sent the raw prompt — an AWS key included, in the
+observed case — with no approval, no redaction and `bytes_out == 0`. From
+the CLI:
+
+```bash
+ccoder build "…" --url https://api.example.com --remote openai_compatible
+```
 
 Where the server offers more, it is used: llama.cpp's `/props` reveals GBNF
 grammar support, `/tokenize` gives exact token counts, and its `timings`
@@ -91,27 +117,28 @@ KV prefix across their own model-swap button. Offered, never driven.
 
 ---
 
-## What is not built
+### The remote providers
 
-Remote providers — Anthropic, Google Gemini, Mistral, OpenRouter, OpenAI —
-are specified and **not present in this version.** They arrive with
-`redact.py` and budget enforcement, which are the things that make them safe
-to have.
+Anthropic, Google Gemini, Mistral, OpenRouter and OpenAI are built
+(`providers/remote.py`), and `available_providers()` marks each
+`'remote': True` — `ccoder doctor` lists them on their own line, apart from
+the local ones. (It used to print all seven under "local providers".)
 
-`available_providers()` names them and says why they are absent, rather than
-offering a name that fails at call time:
+Nothing turns one on but a person, per session. From a host:
 
 ```python
-{'openai_compatible': {'built': True,  'remote': False, ...},
- 'local_llamacpp':    {'built': True,  'remote': False, ...},
- 'anthropic':         {'built': False, 'remote': True,
-                       'description': 'remote provider — arrives with '
-                                      'redaction and budgets (phase 8)'}}
+session.enable_remote("anthropic", reason="the operator asked")
+host.llm = session.remote_provider("anthropic", api_key=key, model="…")
 ```
 
-**The gate they must come through was built first, on purpose**, so that
-adding a provider later cannot accidentally route around it. When they land,
-every one of them must:
+and from the CLI, `--remote PROVIDER` on `build` or `resume`, which does
+exactly that and puts the banner up before anything could be sent. The key
+comes from the host's storage or, for the CLI, from the provider's usual
+environment variable (`ANTHROPIC_API_KEY` …) — read only because `--remote`
+was given: finding a key enables nothing.
+
+**The gate they come through was built first, on purpose**, so that adding
+a provider could not accidentally route around it. Every one of them must:
 
 1. be **disabled unless explicitly enabled for the session** — no env-var
    auto-detection;
@@ -127,7 +154,7 @@ every one of them must:
 
 **Keys never touch the journal, the codemap, or any log.**
 
-A note for the implementer of phase 8: OpenAI is in the provider list for the
+A note for whoever maintains the providers: OpenAI is in the list for the
 benefit of users who want it. The project owner does not use it and this is a
 settled preference — implement it, don't advocate it, and don't make it a
 default anywhere.

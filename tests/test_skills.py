@@ -193,3 +193,55 @@ def test_the_list_command_reports_active_and_skipped(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "10-any" in out
     assert "scoped to rust" in out
+
+
+# --------------------------------------------------------------------------
+# header edge cases (item 17)
+# --------------------------------------------------------------------------
+
+def test_a_utf8_bom_does_not_push_the_header_into_the_body():
+    """Windows editors save with a BOM; `\\ufeff---` failed the fence test,
+    and the header landed in the CACHED PREFIX as rule text."""
+    from cognitive_coder import skills as sk
+    s = sk.parse_skill(".ccoder/skills/10-style.md",
+                       "﻿---\nname: style\nlang: python\n---\n"
+                       "Rule one.\n")
+    assert s.name == "style" and s.langs == ("python",)
+    assert s.body == "Rule one."
+
+
+def test_a_leading_markdown_rule_is_not_a_header():
+    """A file that opens with a `---` horizontal rule lost everything up to
+    the next `---`, silently."""
+    from cognitive_coder import skills as sk
+    s = sk.parse_skill(".ccoder/skills/20-x.md",
+                       "---\nRule one.\n---\nRule two.\n")
+    assert "Rule one." in s.body and "Rule two." in s.body
+    assert s.name == "20-x"
+
+
+def test_a_language_scoped_skill_on_an_unset_session_is_reported():
+    from cognitive_coder import skills as sk
+    from cognitive_coder.ports import MemoryFileSystem
+
+    class Events:
+        def __init__(self):
+            self.rows = []
+
+        def event(self, *args):
+            self.rows.append(args)
+
+    events = Events()
+    load = sk.load_skills(MemoryFileSystem(
+        {".ccoder/skills/10-r.md": b"---\nlang: rust\n---\nUse Result.\n"}),
+        lang="", events=events)
+    assert not load.skills
+    assert any(r[0] == "warning" and "10-r.md" in r[1] and "rust" in r[1]
+               for r in events.rows), events.rows
+    # A session that DID choose another language skips it quietly: that is
+    # the scope doing its job.
+    events.rows.clear()
+    sk.load_skills(MemoryFileSystem(
+        {".ccoder/skills/10-r.md": b"---\nlang: rust\n---\nUse Result.\n"}),
+        lang="python", events=events)
+    assert not events.rows

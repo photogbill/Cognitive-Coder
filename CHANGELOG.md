@@ -10,6 +10,123 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — `ccoder audit`: improve what already exists
+
+`ccoder audit FOLDER` reviews an existing project — one this engine built
+or one written by hand — and reports what is wrong and what could be
+better, ranked, with file and line; it writes a plan `ccoder build --spec`
+can carry out, and the next audit says what was fixed, what remains and
+what is new. Tools first (the review scanners, undefined names,
+possibly-unused code where the call graph and a text search agree,
+untested modules, does it compile, do its tests run), then one bounded
+model read per file with a byte-identical cached prefix. It never runs the
+program, never writes a source file, never asks for approval.
+`--focus`, `--no-model`, `--no-tests`, `--only`, `--max-files`,
+`--max-model-files`. See `docs/AUDIT.md`. Public API: `audit_project`,
+`AuditConfig`, `AuditReport`, `AuditFinding`.
+
+### Fixed — the September review pass
+
+A five-part review reproduced about eighty defects; every fix below has a
+test that fails on the previous code. The ones that change what a build
+does come first.
+
+**Writes that went around approval, snapshots and undo**
+- `runner.autofix`, `format_code` and `lint_code` wrote the model's
+  candidate to `<root>/<stem>.py` before the guard and before approval —
+  a refused build still left files behind, and a task named `main.py`
+  overwrote the operator's `main.py`. They now work on a scratch copy.
+- The skeleton wrote stubs with `fs.write`, outside any transaction: a
+  plan naming an existing file replaced it with a stub, with no snapshot
+  and no undo, and under `DenyAll` stubs were written anyway. The
+  skeleton is now one approved, snapshotted transaction, and an existing
+  file with real work in it is kept as found.
+- `undo_to` read a pruned snapshot as "created by this transaction" and
+  deleted the file. It now reads the manifest, deletes only files it
+  created, and refuses with a sentence when old bytes are gone.
+- **The first attempt on an existing file never showed it.** "Write the
+  complete contents of `x`" regenerated a working file blind. The model is
+  now shown the file and asked for a change; a file too large to show
+  whole is refused before any model call.
+
+**"Verified" now means verified**
+- A module and its test are actually paired; a test that collected zero
+  tests is not sealed as verified; a test that fails because the MODULE
+  is wrong is never "repaired" into agreement — the module is repaired
+  against the test.
+- The test phase is scoped to the task's own test file, so one failing
+  test elsewhere no longer blocks every later file.
+- Rust tests were compiled and never run; JavaScript could never verify
+  on Node 21+; rustc's "aborting due to 1 previous error" was the one line
+  the model saw. All three fixed, checked against the real toolchains.
+
+**The loop**
+- Truncation detection used the tokenizer for Python and handles escapes
+  and comments elsewhere; continuation seams handle a re-emitted partial
+  line, a re-opened fence and a restart from the top.
+- The commentary stripper removes whole lines only — it had turned
+  `## Why this exists: …` in a shell script into a command.
+- Stagnation is keyed on what changed, not on line numbers; a guard-blocked
+  attempt counts; the cosmetic-churn rule works.
+- Empty and tool-exhausted attempts are journaled; repairs keep the
+  request; `prompt_sha256` hashes the messages actually sent.
+- **The prompt is measured against the model's context.** Nothing did,
+  and llama.cpp's context shift drops the system prompt first. Reference
+  material is cut to fit and named; the file being repaired never is.
+- The first file now sees the skeleton in its cached prefix; a context
+  resize is an epoch boundary, as a model swap already was.
+
+**Offline, and the environment**
+- `openai_compatible` pointed at a remote URL skipped the gate, redaction
+  and budget once enabled. It now goes through all three.
+- Local endpoints bypass the system proxy; URLs are classified without a
+  DNS lookup.
+- `SubprocessExec` treated `env=None` as "inherit everything", so the
+  review stage's scanners ran with API keys and proxy variables. It now
+  scrubs, as the README always said.
+- Output capture is bounded (a printing loop no longer exhausts memory
+  before its timeout), never raises on bad bytes, and keeps the tail.
+- Redaction judges only the secret itself, keeps one numbering per
+  session, and knows 18 shapes (was 15).
+
+**Measurement and provenance**
+- `complete()` streams internally, so `prompt_ms` is prefill and
+  `decode_ms` is decode — `cache_health()` can finally give a verdict.
+- The architecture prefix is snapshotted per epoch rather than rendered
+  live, so it is byte-identical within an epoch (M52).
+- Journal writes append instead of rewriting the file; numeric zeros
+  survive; unknown event names warn.
+
+**Review and codemap**
+- The review's model pass reads the last object carrying the answer, not
+  the schema the model restated; unknown severities fail closed; a
+  scanner that timed out is reported, not counted as clean; semgrep runs
+  only with local rules.
+- The codemap binds `self.x` to its own class, gives modules a symbol, no
+  longer cries wolf on aliases, `from pathlib import Path` or other
+  languages, and works from the worker thread a host runs the build on —
+  **in ATK every codemap call from the build had been failing**.
+- `read_slice` is capped and refuses `.env` and skipped directories.
+
+**ATK adapter, CLI, installers, CI**
+- The panel has an approval dialog (every diff was refused), builds no
+  dialog on the worker thread, and `ATKExec` uses the core's capture;
+  `timeout=0` waits; storage is per project.
+- `ccoder history` persists (`JsonFileStorage`); `--remote` exists; bad
+  flags and URLs are sentences; `resume` never tracebacks.
+- Installers put Python in the clone as documented; `push.bat` retires
+  its commit message after use.
+- CI lint covers `adapters/` and is green; the coverage floor is 85 again
+  (measured 86%); the tree-sitter extra lists grammars that load.
+
+**Numbers:** 442 → 1,094 tests; branch coverage 76% → 86%.
+
+**Open design questions, deliberately not changed:** the epoch still
+bumps after every task (`maybe_bump_epoch(target=task.path)`), which
+rebuilds the cached prefix per file; and the persona block sits first in
+the prefix, so a switch to the repairer persona discards the cache.
+Both are the specification's current rules.
+
 ### Added — deployed skills: guidance that travels with the code (F3)
 
 `.ccoder/skills/*.md` now loads into every session's cached prompt prefix

@@ -100,8 +100,15 @@ def test_unresolved_calls_are_kept_and_counted_not_dropped(codemap):
     assert "resolved" in stats.one_line()
 
 
-def test_regex_extracted_symbols_are_labelled_approximate(codemap):
-    """C7 — say which mode you are in, everywhere it surfaces."""
+def test_regex_extracted_symbols_are_labelled_approximate():
+    """C7 — say which mode you are in, everywhere it surfaces.
+
+    Pinned to the regex path: on a machine WITH tree-sitter the C file is
+    parsed exactly, and this test is about the pattern-matched case.
+    """
+    codemap = CodeMap(MemoryFileSystem(dict(PROJECT)), MemoryStorage(),
+                      use_treesitter=False)
+    codemap.index_project()
     rows = codemap.store.symbols_in("lib/util.c")
     assert rows and all(r["approximate"] for r in rows)
     assert "pattern-matched" in codemap.call_tool("list_symbols",
@@ -305,6 +312,199 @@ def test_a_tool_using_model_is_allowed_to_lag(codemap):
     codemap.store.bump_epoch("start")
     before = codemap.store.epoch
 
-    codemap.fs.write("src/readings.py", "def load_readings(p):\n    return []\n")
+    codemap.fs.write("src/readings.py",
+                     "def load_readings(p):\n    return []\n")
     codemap.reindex_after_write("src/readings.py")
     assert codemap.maybe_bump_epoch(target="src/cli.py") == before
+
+
+# --------------------------------------------------------------------------
+# binding: bind to the RIGHT symbol or not at all (item 13)
+# --------------------------------------------------------------------------
+
+def _fresh(files):
+    cm = CodeMap(MemoryFileSystem(dict(files)), MemoryStorage())
+    cm.index_project()
+    return cm
+
+
+def _callers(cm, name):
+    return sorted((c["name"], c["path"]) for c in cm.store.callers_of(name))
+
+
+def _edge_targets(cm, src):
+    rows = cm.store.db.execute(
+        "SELECT d.name, f.path FROM edges e "
+        "JOIN symbols s ON s.id = e.src_symbol_id "
+        "JOIN symbols d ON d.id = e.dst_symbol_id "
+        "JOIN files f ON f.id = d.file_id "
+        "WHERE s.name = ? AND e.kind = 'calls'", (src,)).fetchall()
+    return sorted((r["name"], r["path"]) for r in rows)
+
+
+def test_self_call_binds_to_its_own_class_not_the_first_save():
+    """`self.save()` in `Doc` was bound to `Db.save` in another file — the
+    first `%.save` in the database — so the blast radius of `Db.save`
+    named a caller that never calls it."""
+    cm = _fresh({
+        "a/db.py": b"class Db:\n    def save(self):\n        return 1\n",
+        "b/doc.py": b"class Doc:\n    def save(self):\n        return 2\n"
+                    b"    def publish(self):\n        return self.save()\n",
+    })
+    assert _callers(cm, "Db.save") == []
+    assert _callers(cm, "Doc.save") == [("Doc.publish", "b/doc.py")]
+
+
+def test_a_library_call_is_not_rebound_to_a_project_method():
+    """`subprocess.run(...)` was rebound to a later `class Job: def run`,
+    the resolution rate went 0% -> 67%, and the blast radius of `Job.run`
+    was fabricated."""
+    cm = _fresh({"a/go.py": b"import subprocess\n\n\ndef go():\n"
+                            b"    return subprocess.run(['ls'])\n"})
+    cm.fs.write("b/job.py", "class Job:\n    def run(self):\n        "
+                            "return 1\n")
+    cm.reindex_after_write("b/job.py")
+    assert _callers(cm, "Job.run") == []
+    assert "subprocess.run" in {u["name"]
+                                for u in cm.store.unresolved_names()}
+
+
+def test_the_main_guard_is_a_caller_of_main():
+    """`if __name__ == "__main__": main()` left `callers_of("main")` empty at
+    "100% resolved" — the exact "CLI entry point looks dead" case."""
+    for path in ("src/cli.py", "main.py"):
+        cm = _fresh({path: b"def main():\n    return 0\n\n\n"
+                           b"if __name__ == '__main__':\n    main()\n"})
+        callers = cm.store.callers_of("main")
+        assert [(c["kind"], c["path"]) for c in callers] == [
+            ("module", path)], callers
+
+
+def test_an_import_is_not_attributed_to_a_method_named_like_the_module():
+    cm = _fresh({
+        "lib/report.py": b"class R:\n    def stats(self):\n        "
+                         b"return 1\n",
+        "src/stats.py": b"import csv\n\n\ndef summarise():\n"
+                        b"    return csv.reader([])\n",
+    })
+    assert all(u["src"] != "R.stats" for u in cm.store.unresolved_names())
+
+
+def test_module_qualified_calls_bind_in_either_index_order():
+    util = b"def helper():\n    return 1\n"
+    user = b"from pkg import util\n\n\ndef go():\n    return util.helper()\n"
+    for files in ({"pkg/util.py": util, "app/go.py": user},
+                  {"app/go.py": user}):
+        cm = _fresh(files)
+        if "pkg/util.py" not in files:
+            cm.fs.write("pkg/util.py", util.decode())
+            cm.reindex_after_write("pkg/util.py")
+        assert _edge_targets(cm, "go") == [("helper", "pkg/util.py")]
+
+
+def test_a_from_import_binds_to_the_module_it_names():
+    cm = _fresh({
+        "a/x.py": b"def f():\n    return 'a'\n",
+        "b/x.py": b"def f():\n    return 'b'\n",
+        "c.py": b"from b.x import f\n\n\ndef g():\n    return f()\n",
+    })
+    assert _edge_targets(cm, "g") == [("f", "b/x.py")]
+
+
+def test_module_rows_stay_out_of_outlines_and_counts():
+    cm = _fresh({"src/cli.py": b"def main():\n    return 0\n"})
+    assert [r["name"] for r in cm.store.symbols_in("src/cli.py")] == ["main"]
+    assert cm.stats().symbols == 1
+
+
+def test_an_external_import_does_not_count_as_an_unbound_call():
+    cm = _fresh({"src/x.py": b"import csv\nimport os.path\n\n\n"
+                             b"def go():\n    return helper()\n\n\n"
+                             b"def helper():\n    return 1\n"})
+    stats = cm.stats()
+    assert stats.unresolved == 0, cm.store.unresolved_names()
+
+
+# --------------------------------------------------------------------------
+# D4 without crying wolf (item 14)
+# --------------------------------------------------------------------------
+
+_QUIET = {
+    "aliased import":
+        "import numpy as np\n\ndef go():\n    return np.array([1])\n",
+    "from-import of a stdlib name":
+        "from collections import OrderedDict\n\ndef go():\n"
+        "    return OrderedDict()\n",
+    "chained call on a stdlib class":
+        "from pathlib import Path\n\ndef go(p):\n"
+        "    return Path(p).read_text()\n",
+    "decorator with arguments":
+        "from dataclasses import dataclass\n\n@dataclass(frozen=True)\n"
+        "class A:\n    x: int = 0\n",
+    "match-case captures":
+        "def go(cmd):\n    match cmd:\n        case ['go', direction]:\n"
+        "            return direction.upper()\n"
+        "        case {'k': v, **others}:\n            return others.get(v)\n"
+        "        case [first, *more]:\n            return more.count(first)\n"
+        "    return None\n",
+    "lambda varargs":
+        "f = lambda *rest, **kw: rest.count(1) + kw.get('x')\n",
+    "walrus":
+        "import re\n\ndef go(s):\n    if (m := re.match('a', s)):\n"
+        "        return m.group(0)\n",
+    "method on a class defined here":
+        "class A:\n    def run(self):\n        return self.helper()\n"
+        "    def helper(self):\n        return 1\n",
+    "a real project symbol":
+        "from src.readings import load_readings\n\ndef go():\n"
+        "    return load_readings('x')\n",
+    "an attribute on a local object (screen.fill)":
+        "import pygame\n\ndef go():\n"
+        "    screen = pygame.display.set_mode((1, 1))\n"
+        "    screen.fill((0, 0, 0))\n",
+}
+
+
+@pytest.mark.parametrize("label", sorted(_QUIET))
+def test_unresolved_in_does_not_cry_wolf(codemap, label):
+    assert codemap.unresolved_in(_QUIET[label], "python") == []
+
+
+def test_unresolved_in_still_reports_an_invented_module_name(codemap):
+    missing = codemap.unresolved_in(
+        "from utils import cfg\n\ndef go():\n    cfg = cfg or None\n"
+        "    return cfg.load()\n", "python")
+    assert any("cfg" in m for m in missing), missing
+
+
+def test_unresolved_in_reports_a_name_missing_from_a_project_module(
+        codemap):
+    missing = codemap.unresolved_in(
+        "from src.readings import load_everything\n\ndef go():\n"
+        "    return load_everything('x')\n", "python")
+    assert missing == ["load_everything"]
+
+
+@pytest.mark.parametrize("lang,code", [
+    ("javascript", "const el = document.getElementById('x');\n"
+                   "el.addEventListener('click', () => {});\n"
+                   "window.alert('hi');\n"),
+    ("javascript", "import React from 'react';\n"
+                   "import { useState as useS } from 'react';\n"
+                   "function App(props) {\n"
+                   "  let [n, setN] = useS(0);\n"
+                   "  return React.createElement('div', props.x);\n}\n"),
+    ("go", 'package main\n\nimport "fmt"\n\n'
+           'func main() {\n\tx := 1\n\tfmt.Println(x)\n}\n'),
+    ("rust", "fn main() {\n    let mut v = Vec::new();\n"
+             "    v.push(1);\n}\n"),
+])
+def test_non_python_locals_and_imports_are_not_reported(codemap, lang,
+                                                         code):
+    assert codemap.unresolved_in(code, lang) == []
+
+
+def test_non_python_invented_names_are_still_reported(codemap):
+    missing = codemap.unresolved_in(
+        "function draw(ctx) {\n  renderRoad(ctx);\n}\n", "javascript")
+    assert missing == ["renderRoad"]

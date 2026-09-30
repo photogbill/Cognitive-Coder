@@ -37,6 +37,8 @@ name is better and the old one is free.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,13 +49,10 @@ from cognitive_coder import guard as _guard
 from cognitive_coder import langs as _langs
 from cognitive_coder import patcher as _patcher
 from cognitive_coder import runner as _runner
-from cognitive_coder.ports import (
-    AutoApprove,
-    LocalFileSystem,
-    MemoryStorage,
-    SubprocessExec,
-)
+from cognitive_coder.filestorage import JsonFileStorage
+from cognitive_coder.ports import AutoApprove, LocalFileSystem, SubprocessExec
 from cognitive_coder.types import Edit as _Edit
+from cognitive_coder.types import GuardFinding as _GuardFinding
 
 # One shared ExecPort. `which` is the only thing it is used for in the langs
 # compatibility layer, and building one per call would be wasteful.
@@ -68,15 +67,70 @@ def _fs(root: Any) -> LocalFileSystem:
 # langs — the registry, with the no-argument probing ATK expects
 # ==========================================================================
 
-LANGS = _langs.LANGS
 EXE_SUFFIX = ".exe"
-Lang = _langs.Lang
-get = _langs.get
+render = _langs.render
+scaffold_for = _langs.scaffold_for
 ids = _langs.ids
 labels = _langs.labels
-for_extension = _langs.for_extension
-scaffold_for = _langs.scaffold_for
-render = _langs.render
+
+
+class CompatLang(_langs.Lang):
+    """A `Lang` whose probes work with no argument, as ATK's did.
+
+    ATK calls `lang.available()`; the engine's `Lang.available(ex)` takes an
+    ExecPort (C2). The shim used to re-export the engine's `get` directly,
+    so `get("python").available()` — the exact call the shim's docstring,
+    CHANGELOG and CONFORMANCE all promised still worked — raised
+    `TypeError: missing 'ex'`, and the no-argument wrapper that did exist
+    was under another name nobody called.
+
+    A SUBCLASS, so `isinstance(lang, Lang)` holds in ATK and in the engine,
+    and the probes take the ExecPort optionally, so the engine's own calls
+    with one still work. Nothing on the engine's class is changed.
+    """
+
+    def available(self, ex: Any = None) -> bool:
+        return super().available(_EX if ex is None else ex)
+
+    def which_build(self, ex: Any = None) -> str:
+        return super().which_build(_EX if ex is None else ex)
+
+    def which_run(self, ex: Any = None) -> str:
+        return super().which_run(_EX if ex is None else ex)
+
+
+def _compat(lang: Any) -> CompatLang | None:
+    """The same object's data as a CompatLang (a shallow copy)."""
+    if lang is None or isinstance(lang, CompatLang):
+        return lang
+    twin = copy.copy(lang)
+    twin.__class__ = CompatLang
+    return twin
+
+
+class _CompatLangs(Mapping):
+    """`LANGS`, live over the engine's registry, yielding CompatLangs."""
+
+    def __getitem__(self, key: str) -> CompatLang:
+        return _compat(_langs.LANGS[key])
+
+    def __iter__(self):
+        return iter(_langs.LANGS)
+
+    def __len__(self) -> int:
+        return len(_langs.LANGS)
+
+
+LANGS = _CompatLangs()
+Lang = _langs.Lang
+
+
+def get(lang_id: str) -> CompatLang | None:
+    return _compat(_langs.get(lang_id))
+
+
+def for_extension(path: Any) -> CompatLang | None:
+    return _compat(_langs.for_extension(path))
 
 
 def available_ids() -> list[str]:
@@ -84,53 +138,8 @@ def available_ids() -> list[str]:
     return _langs.available_ids(_EX)
 
 
-def _lang_available(self: Any) -> bool:
-    return _langs.Lang.available(self, _EX)
-
-
-def _lang_which_build(self: Any) -> str:
-    return _langs.Lang.which_build(self, _EX)
-
-
-def _lang_which_run(self: Any) -> str:
-    return _langs.Lang.which_run(self, _EX)
-
-
-# ATK's code calls `lang.available()` with no arguments. Rather than rename
-# the engine's method — which would be the tail wagging the dog — the
-# no-argument forms are attached here, under names that do not collide.
-_langs.Lang.available_here = _lang_available          # type: ignore[attr-defined]
-_langs.Lang.which_build_here = _lang_which_build      # type: ignore[attr-defined]
-_langs.Lang.which_run_here = _lang_which_run          # type: ignore[attr-defined]
-
-
-class CompatLang:
-    """A `Lang` whose probing methods take no arguments, as ATK's did.
-
-    A thin wrapper rather than a subclass: `Lang` is a dataclass in the
-    engine's frozen public surface, and subclassing it here would make ATK's
-    objects fail an `isinstance` check inside the engine.
-    """
-
-    def __init__(self, lang: Any) -> None:
-        self._lang = lang
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._lang, name)
-
-    def available(self) -> bool:
-        return self._lang.available(_EX)
-
-    def which_build(self) -> str:
-        return self._lang.which_build(_EX)
-
-    def which_run(self) -> str:
-        return self._lang.which_run(_EX)
-
-
-def get_compat(lang_id: str) -> CompatLang | None:
-    lang = _langs.get(lang_id)
-    return CompatLang(lang) if lang else None
+#: Kept for anything written against the earlier shim.
+get_compat = get
 
 
 # ==========================================================================
@@ -157,7 +166,7 @@ class Diagnostic:
     source: str = ""
 
     @classmethod
-    def _from(cls, d: Any) -> "Diagnostic":
+    def _from(cls, d: Any) -> Diagnostic:
         return cls(message=d.message, file=d.file, line=d.line,
                    col=d.col or 0, severity=d.severity, code=d.code or "",
                    source=d.source_excerpt)
@@ -225,22 +234,10 @@ scan = _guard.scan
 blocked = _guard.blocked
 advisory = _guard.advisory
 explain_to_model = _guard.explain_to_model
-Finding = None      # set below, so `isinstance` keeps working
-
-
-@dataclass
-class _CompatFinding:
-    severity: str
-    reason: str
-    match: str
-    line: int = 0
-
-    def one_line(self) -> str:
-        where = f" (line {self.line})" if self.line else ""
-        return f"{self.severity}: {self.reason}{where} — `{self.match}`"
-
-
-Finding = _CompatFinding
+#: The engine's own type — the one `scan()` returns. It was a fresh dataclass
+#: with the same fields, so `isinstance(scan(code)[0], Finding)` was always
+#: False in ATK. Same fields, same `one_line()`: nothing else to adapt.
+Finding = _GuardFinding
 
 
 # ==========================================================================
@@ -273,7 +270,7 @@ class Phase:
         return (self.stdout + joiner + self.stderr).strip()
 
     @classmethod
-    def _from(cls, p: Any) -> "Phase":
+    def _from(cls, p: Any) -> Phase:
         proc = p.proc
         return cls(name=p.name, cmd=list(p.argv),
                    stdout=proc.stdout if proc else "",
@@ -323,7 +320,7 @@ class RunResult:
         return f"{phase} failed — {summarise(self.diagnostics)}"
 
     @classmethod
-    def _from(cls, r: Any) -> "RunResult":
+    def _from(cls, r: Any) -> RunResult:
         return cls(ok=r.ok, lang=r.lang,
                    phases=[Phase._from(p) for p in r.phases],
                    blocked=r.blocked, warnings=r.warnings,
@@ -411,12 +408,16 @@ def _patcher_for(root: Any) -> Any:
     """One Patcher per root, so sequence numbers stay monotonic per project.
 
     A fresh Patcher per call would restart the counter at 1 and make the
-    transaction log's linearity a lie (M25 rule 2).
+    transaction log's linearity a lie (M25 rule 2). Its log lives on disk,
+    in `<root>/.cc_state/` like the CLI's: in `MemoryStorage` it died with
+    ATK's process, so after a restart `undo(root)` said "nothing to undo"
+    beside a full `.cc_snapshots/`.
     """
     key = str(Path(root).resolve())
     if key not in _PATCHERS:
-        _PATCHERS[key] = _patcher.Patcher(_fs(root), MemoryStorage(),
-                                          AutoApprove())
+        _PATCHERS[key] = _patcher.Patcher(
+            _fs(root), JsonFileStorage(str(Path(key) / ".cc_state")),
+            AutoApprove())
     return _PATCHERS[key]
 
 

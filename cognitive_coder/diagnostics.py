@@ -20,9 +20,15 @@ WHAT'S PARSED
   MSVC (cl)                   file(line,col): error C2065: message
   rustc                       error[E0425]: message  →  --> file:line:col
   javac                       file:line: error: message
-  Python                      traceback frames + the final exception line
-  Node / JS                   stack frames + the thrown error
-  Go                          file:line:col: message
+  Python                      traceback frames + the final exception line,
+                              located in the deepest PROJECT frame
+  Node / JS                   the `file:line` header or the first non-
+                              `node:` frame + the thrown error; `node
+                              --test` TAP failures
+  Ruby                        `ruby -c` and `file:line:in 'fn': msg (Exc)`
+  ruff / flake8               `file:line:col: CODE msg`, and ruff's
+                              `CODE msg` / `--> file:line:col` form
+  Go                          file:line:col: message (and `vet: …`)
   TypeScript                  file(line,col): error TS2345: message
   cppcheck / shellcheck       file:line:col: severity: message [id]
   unittest / pytest           FAIL:/ERROR: lines, assertion text, pytest's
@@ -86,6 +92,13 @@ _RUSTC_HEAD = re.compile(
     r"^(?P<sev>error|warning)(?:\[(?P<code>E\d+)\])?:\s*(?P<msg>.+)$", re.M)
 _RUSTC_LOC = re.compile(
     r"^\s*-->\s*(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+)", re.M)
+# rustc's and cargo's closing summaries. They are shaped like errors and
+# carry no location, and they USED to sort first: with Rust's feedback cap
+# of one, the model was handed "error: aborting due to 1 previous error"
+# and never saw E0425.
+_RUSTC_TRAILER = re.compile(
+    r"^(?:aborting due to\b|could not compile\b|\d+ warnings? emitted\b|"
+    r"build failed\b)", re.I)
 
 _JAVAC = re.compile(
     r"^(?P<file>[^\s:][^:]*?):(?P<line>\d+):\s*(?P<sev>error|warning):\s*"
@@ -100,6 +113,22 @@ _PY_EXC = re.compile(
 
 _NODE_FRAME = re.compile(
     r"^\s*at .*?\(?(?P<file>[^\s()]+):(?P<line>\d+):(?P<col>\d+)\)?", re.M)
+# The `file:line` header Node prints above a SyntaxError (and above any
+# uncaught error it can place). For a SyntaxError it is the ONLY user
+# location: every `at` frame beneath it is `node:internal/…`, and taking
+# the first frame pointed the model at Node's own module loader.
+_NODE_HEADER = re.compile(
+    r"^(?P<file>(?:file://)?(?:/|[A-Za-z]:[\\/])[^\n]*?|[^\s:][^\n:]*?"
+    r"\.[cm]?[jt]sx?):(?P<line>\d+)[ \t]*$", re.M)
+# `node --test` reports failures as TAP. Without this a failing JS test
+# came back as the unparsed tail — `# duration_ms 44.66`.
+_TAP_NOT_OK = re.compile(r"^(?P<indent>[ \t]*)not ok \d+ - (?P<name>.+?)"
+                         r"[ \t]*$", re.M)
+_TAP_LOCATION = re.compile(
+    r"^[ \t]*location: '(?P<file>.+?):(?P<line>\d+):(?P<col>\d+)'", re.M)
+_TAP_STACK = re.compile(
+    r"\(?(?P<file>(?:file://)?(?:/|[A-Za-z]:[\\/])[^\s()']+?):"
+    r"(?P<line>\d+):(?P<col>\d+)\)?")
 _NODE_EXC = re.compile(
     r"^(?P<exc>[A-Z]\w*(?:Error))(?::\s*(?P<msg>.*))?$", re.M)
 
@@ -113,8 +142,8 @@ _CPPCHECK = re.compile(
 # pattern, deliberately anchored to a Go-shaped path so it does not swallow
 # unrelated colon-separated lines from other toolchains.
 _GO = re.compile(
-    r"^(?P<file>\.{0,2}[\w./\\-]+\.go):(?P<line>\d+):(?:(?P<col>\d+):)?\s+"
-    r"(?P<msg>[^\n]+)$", re.M)
+    r"^(?:vet: )?(?P<file>\.{0,2}[\w./\\-]+\.go):(?P<line>\d+):"
+    r"(?:(?P<col>\d+):)?\s+(?P<msg>[^\n]+)$", re.M)
 
 _UNITTEST = re.compile(r"^(?P<sev>FAIL|ERROR):\s*(?P<msg>.+)$", re.M)
 _ASSERT = re.compile(r"^(?P<exc>AssertionError)(?::\s*(?P<msg>.*))?$", re.M)
@@ -124,6 +153,41 @@ _PYTEST_SUMMARY = re.compile(
     r"(?:\s+-\s+(?P<msg>.+))?$", re.M)
 # pytest's assertion location line: `E       assert 3 == 4`
 _PYTEST_E = re.compile(r"^E\s{2,}(?P<msg>.+)$", re.M)
+# ... and where it happened, per test section: `____ test_a ____` then
+# `test_x.py:2: AssertionError`. The docstring always claimed this form was
+# parsed; the summary line alone gave `line=0`.
+_PYTEST_SECTION = re.compile(r"^_{3,} (?P<test>\S.*?) _{3,}$", re.M)
+_PYTEST_WHERE = re.compile(
+    r"^(?P<file>[^\s:][^:\n]*\.py):(?P<line>\d+): (?P<exc>[A-Za-z_][\w.]*)$",
+    re.M)
+
+# Ruby. The raise site is the FIRST line (like JavaScript); `from` lines
+# follow with the callers. Ruby 3.4 quotes with '…', 3.3 with `…'.
+_RUBY_RAISE = re.compile(
+    r"^(?P<file>[^\s:][^:\n]*\.rb):(?P<line>\d+):in [`'](?P<fn>[^`'\n]+)'"
+    r": (?P<msg>.+?)(?: \((?P<exc>[A-Z]\w*(?:::\w+)*)\))?$", re.M)
+_RUBY_FROM = re.compile(
+    r"^\s+from (?P<file>[^\s:][^:\n]*\.rb):(?P<line>\d+):in ", re.M)
+_RUBY_LINE = re.compile(
+    r"^(?:ruby: )?(?P<file>[^\s:][^:\n]*\.rb):(?P<line>\d+): "
+    r"(?P<msg>(?!in [`']).+?)(?: \((?P<exc>[A-Z]\w*)\))?$", re.M)
+
+# ruff (full and concise), flake8: a rule code where gcc has a severity.
+_LINT = re.compile(
+    r"^(?P<file>[^\s:][^:\n]*?\.\w+):(?P<line>\d+):(?P<col>\d+): "
+    r"(?P<code>[A-Z]{1,3}\d{2,4}) (?:\[\*\] )?(?P<msg>.+)$", re.M)
+_RUFF_FULL = re.compile(
+    r"^(?P<code>[A-Z]{1,3}\d{2,4}) (?:\[\*\] )?(?P<msg>.+)\n[ \t]*--> "
+    r"(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+)", re.M)
+# Rules that are errors rather than style: undefined names and syntax.
+_LINT_ERRORS = ("F821", "F822", "F823", "E999")
+
+# Frames that are not the project's: the standard library, installed
+# packages, virtualenvs, and runtimes' own internals.
+_LIBRARY_PATH = re.compile(
+    r"(?i)(?:^|/)(?:site-packages|dist-packages|node_modules|\.?venv|"
+    r"lib/python\d[\d.]*|lib64/python\d[\d.]*)(?:/|$)|^<|^node:|"
+    r"^internal/")
 
 # Godot 4 (§6.1a). Without these the loop is blind on GDScript, which is the
 # whole reason GDScript is first class rather than outline-only.
@@ -156,7 +220,7 @@ _GUT_FAIL = re.compile(
 # per-family parsers
 # ---------------------------------------------------------------------------
 
-def _parse_gcc(text: str) -> list[Diagnostic]:
+def _parse_gcc(text: str, root: str = "") -> list[Diagnostic]:
     out = []
     for m in _GCC.finditer(text):
         sev = m.group("sev").replace("fatal error", "fatal")
@@ -167,7 +231,7 @@ def _parse_gcc(text: str) -> list[Diagnostic]:
     return out
 
 
-def _parse_msvc(text: str) -> list[Diagnostic]:
+def _parse_msvc(text: str, root: str = "") -> list[Diagnostic]:
     return [Diagnostic(
         message=m.group("msg").strip(), file=m.group("file").strip(),
         line=_int(m.group("line")), col=_int(m.group("col")) or None,
@@ -177,14 +241,15 @@ def _parse_msvc(text: str) -> list[Diagnostic]:
         for m in _MSVC.finditer(text)]
 
 
-def _parse_rustc(text: str) -> list[Diagnostic]:
+def _parse_rustc(text: str, root: str = "") -> list[Diagnostic]:
     """rustc puts the message and the location on different lines.
 
     The location FOLLOWS its message, so heads and locations are paired in
     order and only within the span of one head. Any other pairing attaches the
     wrong file to the wrong error.
     """
-    heads = list(_RUSTC_HEAD.finditer(text))
+    heads = [h for h in _RUSTC_HEAD.finditer(text)
+             if not _RUSTC_TRAILER.match(h.group("msg").strip())]
     locs = list(_RUSTC_LOC.finditer(text))
     out = []
     for i, h in enumerate(heads):
@@ -204,14 +269,50 @@ def _parse_rustc(text: str) -> list[Diagnostic]:
     return out
 
 
-def _parse_python(text: str) -> list[Diagnostic]:
-    """The DEEPEST frame plus the exception. Not the whole traceback.
+def _in_project(path: str, root: str = "") -> bool:
+    """Is this frame's file the project's own, rather than a library's?
+
+    With ``root``, an absolute path must be under it; a relative path is
+    taken as relative to it (the runner's cwd). Either way a path through
+    site-packages, a virtualenv, `lib/pythonX.Y` or `node:` is a library's.
+    Without ``root`` only that second test applies — which is why callers
+    that know the root pass it.
+    """
+    p = (path or "").replace("\\", "/")
+    if not p or _LIBRARY_PATH.search(p):
+        return False
+    r = (root or "").replace("\\", "/").rstrip("/")
+    if not r or not (p.startswith("/") or re.match(r"^[A-Za-z]:/", p)):
+        return True
+    if re.match(r"^[A-Za-z]:", r):                     # Windows: no case
+        return p.lower().startswith(r.lower() + "/")
+    return p.startswith(r + "/")
+
+
+def _file_path(raw: str) -> str:
+    """`file:///C:/x.js` → `C:/x.js`; `file:///x.js` → `/x.js`."""
+    text = (raw or "").strip()
+    if text.startswith("file://"):
+        text = text[len("file://"):]
+        if re.match(r"^/[A-Za-z]:/", text):
+            text = text[1:]
+    return text
+
+
+def _parse_python(text: str, root: str = "") -> list[Diagnostic]:
+    """The deepest PROJECT frame plus the exception. Not the whole traceback.
 
     The deepest frame is where it broke; the intermediate frames are how it
     got there, which a model rarely needs and always gets distracted by. In a
     Python traceback the deepest frame is the LAST one — the opposite of a
     JavaScript stack, and getting it backwards points the model at the entry
     point instead of the fault.
+
+    But "deepest" means the deepest frame the model can FIX. An exception
+    raised inside the standard library or an installed package used to be
+    located at `/usr/lib/python3.12/json/decoder.py:353` — a file the model
+    cannot edit and the FileSystemPort cannot quote. The deepest frame in
+    the project wins; only when there is none does the last frame stand.
     """
     frames = list(_PY_FRAME.finditer(text))
     excs = [m for m in _PY_EXC.finditer(text)
@@ -225,7 +326,8 @@ def _parse_python(text: str) -> list[Diagnostic]:
     line = 0
     code = None
     if frames:
-        last = frames[-1]
+        mine = [f for f in frames if _in_project(f.group("file"), root)]
+        last = (mine or frames)[-1]
         file = last.group("file")
         line = _int(last.group("line"))
         if last.group("fn"):
@@ -234,7 +336,7 @@ def _parse_python(text: str) -> list[Diagnostic]:
                        severity="exception", code=code, tool="python")]
 
 
-def _parse_node(text: str) -> list[Diagnostic]:
+def _parse_node(text: str, root: str = "") -> list[Diagnostic]:
     excs = list(_NODE_EXC.finditer(text))
     frames = list(_NODE_FRAME.finditer(text))
     if not excs and not frames:
@@ -243,24 +345,144 @@ def _parse_node(text: str) -> list[Diagnostic]:
            .strip(": ") if excs else "failed")
     file = ""
     line = col = 0
-    if frames:
-        # The FIRST frame in a JS stack is the deepest — opposite of Python.
-        file = frames[0].group("file")
-        line = _int(frames[0].group("line"))
-        col = _int(frames[0].group("col"))
+    exc_at = excs[-1].start() if excs else len(text)
+    header = [h for h in _NODE_HEADER.finditer(text, 0, exc_at)
+              if not h.group("file").startswith("node:")]
+    mine = [f for f in frames if _in_project(_file_path(f.group("file")),
+                                             root)]
+    if header:
+        # Node's own `file:line` header — the one user location a
+        # SyntaxError has.
+        file = _file_path(header[-1].group("file"))
+        line = _int(header[-1].group("line"))
+    elif mine or frames:
+        # The FIRST frame in a JS stack is the deepest — opposite of
+        # Python — but never Node's own `node:internal/…`.
+        first = (mine or frames)[0]
+        file = _file_path(first.group("file"))
+        line = _int(first.group("line"))
+        col = _int(first.group("col"))
     return [Diagnostic(message=msg, file=file, line=line, col=col or None,
                        severity="exception", tool="node")]
 
 
-def _parse_tests(text: str) -> list[Diagnostic]:
+def _parse_node_tap(text: str, root: str = "") -> list[Diagnostic]:
+    """`node --test` failures: one per failing test, at the failing line.
+
+    The location is the first project frame of the TAP `stack:` (the
+    assertion), else `location:` (the `test(…)` call). A parent reporting
+    only that its subtests failed is skipped: its children say why.
+    """
+    out: list[Diagnostic] = []
+    for m in _TAP_NOT_OK.finditer(text):
+        end = re.compile(r"^[ \t]*\.\.\.[ \t]*$", re.M).search(text, m.end())
+        block = text[m.end():end.start() if end else len(text)]
+        if "failureType: 'subtestsFailed'" in block:
+            continue
+        err = ""
+        em = re.search(r"^([ \t]*)error: (?:\|-?\n(?P<body>(?:\1[ \t]+.*\n?"
+                       r"|[ \t]*\n)+)|'(?P<one>.*)')", block, re.M)
+        if em:
+            lines = (em.group("body") or em.group("one") or "").splitlines()
+            err = " ".join(ln.strip() for ln in lines if ln.strip())[:200]
+        file, line, col = "", 0, 0
+        stack = block[block.find("stack:"):] if "stack:" in block else ""
+        for sm in _TAP_STACK.finditer(stack):
+            path = _file_path(sm.group("file"))
+            if _in_project(path, root):
+                file, line = path, _int(sm.group("line"))
+                col = _int(sm.group("col"))
+                break
+        if not file:
+            lm = _TAP_LOCATION.search(block)
+            if lm:
+                file = _file_path(lm.group("file"))
+                line, col = _int(lm.group("line")), _int(lm.group("col"))
+        name = m.group("name").strip()
+        out.append(Diagnostic(
+            message=f"{name}: {err}" if err else f"{name} failed",
+            file=file, line=line, col=col or None, severity="failure",
+            code="test", tool="node-test"))
+    return out
+
+
+def _parse_ruby(text: str, root: str = "") -> list[Diagnostic]:
+    """Ruby's raise line (first = deepest, like JS) and `ruby -c` errors."""
+    out: list[Diagnostic] = []
+    raise_at = -1
+    rm = _RUBY_RAISE.search(text)
+    if rm:
+        raise_at = rm.start()
+        exc = rm.group("exc")
+        msg = rm.group("msg").strip()
+        file, line = rm.group("file"), _int(rm.group("line"))
+        if not _in_project(file, root):
+            for fm in _RUBY_FROM.finditer(text, rm.end()):
+                if _in_project(fm.group("file"), root):
+                    file, line = fm.group("file"), _int(fm.group("line"))
+                    break
+        out.append(Diagnostic(
+            message=f"{exc}: {msg}" if exc else msg, file=file, line=line,
+            severity="exception", code=f"in {rm.group('fn')}", tool="ruby"))
+    for m in _RUBY_LINE.finditer(text):
+        if m.start() == raise_at:
+            continue
+        msg = m.group("msg").strip()
+        sev = "warning" if msg.startswith("warning:") else "error"
+        out.append(Diagnostic(
+            message=msg.split(":", 1)[1].strip() if sev == "warning" else msg,
+            file=m.group("file"), line=_int(m.group("line")), severity=sev,
+            tool="ruby"))
+    return out
+
+
+def _parse_lint(text: str, root: str = "") -> list[Diagnostic]:
+    """ruff and flake8 findings: a rule code in place of a severity word."""
+    out: list[Diagnostic] = []
+    for pattern in (_RUFF_FULL, _LINT):
+        for m in pattern.finditer(text):
+            code = m.group("code")
+            out.append(Diagnostic(
+                message=m.group("msg").strip(), file=m.group("file").strip(),
+                line=_int(m.group("line")), col=_int(m.group("col")) or None,
+                severity="error" if code in _LINT_ERRORS
+                or code.startswith("E9") else "warning",
+                code=code, tool="lint"))
+    return out
+
+
+def _pytest_where(text: str, root: str = "") -> dict[str, tuple[str, int]]:
+    """{test name: (file, line)} from the long traceback's sections.
+
+    The deepest location in the project wins, like a Python traceback: a
+    test failing inside `src/calc.py` is located there, not at the call.
+    """
+    found: dict[str, tuple[str, int]] = {}
+    sections = list(_PYTEST_SECTION.finditer(text))
+    for i, sec in enumerate(sections):
+        stop = sections[i + 1].start() if i + 1 < len(sections) else len(text)
+        wheres = list(_PYTEST_WHERE.finditer(text, sec.end(), stop))
+        mine = [w for w in wheres if _in_project(w.group("file"), root)]
+        if mine or wheres:
+            w = (mine or wheres)[-1]
+            found[sec.group("test").replace("::", ".")] = (
+                w.group("file"), _int(w.group("line")))
+    return found
+
+
+def _parse_tests(text: str, root: str = "") -> list[Diagnostic]:
     out = [Diagnostic(message=m.group("msg").strip(), severity="failure",
                       code="test", tool="unittest")
            for m in _UNITTEST.finditer(text)]
+    where = _pytest_where(text, root)
     for m in _PYTEST_SUMMARY.finditer(text):
+        test = m.group("test")
+        file, line = where.get(test.replace("::", "."),
+                               (m.group("file"), 0))
         out.append(Diagnostic(
-            message=(m.group("msg") or f"{m.group('test')} failed").strip(),
-            file=m.group("file"), severity="failure",
-            code=m.group("test"), tool="pytest"))
+            message=(m.group("msg") or f"{test} failed").strip(),
+            file=file, line=line, severity="failure",
+            code=test, tool="pytest"))
     for m in _ASSERT.finditer(text):
         out.append(Diagnostic(
             message=f"AssertionError: {m.group('msg') or ''}".strip(": "),
@@ -272,7 +494,7 @@ def _parse_tests(text: str) -> list[Diagnostic]:
     return out
 
 
-def _parse_javac(text: str) -> list[Diagnostic]:
+def _parse_javac(text: str, root: str = "") -> list[Diagnostic]:
     """javac omits the column, so the gcc pattern misses these."""
     return [Diagnostic(message=m.group("msg").strip(),
                        file=m.group("file").strip(),
@@ -281,7 +503,7 @@ def _parse_javac(text: str) -> list[Diagnostic]:
             for m in _JAVAC.finditer(text)]
 
 
-def _parse_go(text: str) -> list[Diagnostic]:
+def _parse_go(text: str, root: str = "") -> list[Diagnostic]:
     """Go's compiler and vet output. No severity word, so no gcc match."""
     out = []
     for m in _GO.finditer(text):
@@ -295,7 +517,7 @@ def _parse_go(text: str) -> list[Diagnostic]:
     return out
 
 
-def _parse_cppcheck(text: str) -> list[Diagnostic]:
+def _parse_cppcheck(text: str, root: str = "") -> list[Diagnostic]:
     """cppcheck's severities (style, performance, portability) are its own."""
     return [Diagnostic(message=m.group("msg").strip(),
                        file=m.group("file").strip(),
@@ -306,7 +528,7 @@ def _parse_cppcheck(text: str) -> list[Diagnostic]:
             for m in _CPPCHECK.finditer(text)]
 
 
-def _parse_godot(text: str) -> list[Diagnostic]:
+def _parse_godot(text: str, root: str = "") -> list[Diagnostic]:
     """Godot's two error shapes, plus GUT/gdUnit4 failures (§6.1a).
 
     Godot prints the message and `at: func (res://path.gd:LINE)` on separate
@@ -369,14 +591,14 @@ _FAMILIES: dict[str, tuple] = {
     "rust": (_parse_rustc, _parse_gcc),
     "java": (_parse_javac, _parse_gcc),
     "go": (_parse_go, _parse_gcc),
-    "python": (_parse_python, _parse_tests, _parse_gcc),
-    "javascript": (_parse_node, _parse_tests),
-    "typescript": (_parse_msvc, _parse_gcc, _parse_node),
+    "python": (_parse_python, _parse_tests, _parse_lint, _parse_gcc),
+    "javascript": (_parse_node, _parse_node_tap, _parse_tests),
+    "typescript": (_parse_msvc, _parse_gcc, _parse_node, _parse_node_tap),
     "csharp": (_parse_msvc, _parse_gcc),
     "zig": (_parse_gcc,),
     "bash": (_parse_gcc,),
     "gdscript": (_parse_godot,),
-    "ruby": (_parse_gcc, _parse_tests),
+    "ruby": (_parse_ruby, _parse_gcc, _parse_tests),
     "lua": (_parse_gcc,),
 }
 
@@ -384,13 +606,17 @@ _ALWAYS = (_parse_gcc, _parse_python, _parse_node, _parse_tests,
            _parse_godot)
 
 
-def parse(text: str, lang_id: str = "") -> list[Diagnostic]:
+def parse(text: str, lang_id: str = "", root: str = "") -> list[Diagnostic]:
     """Every diagnostic found, errors first, deduplicated.
 
     Parsers are tried in an order suited to the language but ALL the common
     ones run: a Python script that shells out to a compiler produces both
     kinds of output, and a loop that only understood one of them would fix
     half the problem and report the rest as mysterious.
+
+    ``root`` is the project root as the tools saw it. With it, a traceback
+    is located in the deepest frame UNDER the root; without it, in the
+    deepest frame that is not recognisably a library's.
     """
     if not text or not text.strip():
         return []
@@ -398,7 +624,7 @@ def parse(text: str, lang_id: str = "") -> list[Diagnostic]:
     tried = list(_FAMILIES.get((lang_id or "").lower(),
                                (_parse_gcc, _parse_python, _parse_node,
                                 _parse_msvc, _parse_rustc, _parse_tests,
-                                _parse_godot)))
+                                _parse_lint, _parse_godot)))
     for extra in _ALWAYS:
         if extra not in tried:
             tried.append(extra)
@@ -406,7 +632,7 @@ def parse(text: str, lang_id: str = "") -> list[Diagnostic]:
     found: list[Diagnostic] = []
     seen: set = set()
     for fn in tried:
-        for d in fn(text):
+        for d in fn(text, root):
             if not (d.message or "").strip():
                 continue
             if d.key() not in seen:
@@ -430,7 +656,10 @@ def parse(text: str, lang_id: str = "") -> list[Diagnostic]:
             found = [Diagnostic(message="\n".join(tail), severity="error",
                                 code="unparsed", tool="raw")]
 
-    found.sort(key=lambda d: (d.rank, d.file, d.line))
+    # Unlocated diagnostics go LAST within their rank. An empty file name
+    # sorts before every real one as text, so a summary line with no
+    # location used to displace the error it summarised.
+    found.sort(key=lambda d: (d.rank, not d.file, d.file, d.line))
     return found
 
 
@@ -522,7 +751,13 @@ def feedback_for(text: str, lang_id: str = "", fs: Any = None,
     from . import langs  # local: avoids a cycle
     lang = langs.get(lang_id)
     cap = lang.feedback_cap if lang else MAX_FEEDBACK
-    diags = attach_source(parse(text, lang_id), fs, sources)
+    root = ""
+    if fs is not None:
+        try:
+            root = str(fs.root())
+        except Exception:                                # noqa: BLE001
+            root = ""
+    diags = attach_source(parse(text, lang_id, root=root), fs, sources)
     return feedback(diags, cap, extra_context=bool(lang and lang.cascades))
 
 

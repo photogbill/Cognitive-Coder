@@ -41,8 +41,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # `adapters` is linted too: it ships to ATK verbatim, and a file CI
+      # never looks at is where the fourteen findings accumulated.
       - name: Lint
-        run: ruff check cognitive_coder tests examples
+        run: ruff check cognitive_coder tests examples adapters
 
       - name: C1 — the core imports no GUI and no host
         run: pytest tests/test_contract.py::test_core_imports_no_gui_and_no_host -q

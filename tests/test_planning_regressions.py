@@ -31,13 +31,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognitive_coder.codemap import parse_python as pp        # noqa: E402
+from cognitive_coder.codemap import parse_python as pp  # noqa: E402
 from cognitive_coder.planner import Planner, _required_tests  # noqa: E402
-from cognitive_coder.review import (                          # noqa: E402
+from cognitive_coder.review import (  # noqa: E402
     ReviewResult,
     recommendation_document,
 )
-from cognitive_coder.types import Plan, Task                  # noqa: E402
+from cognitive_coder.types import Plan, Task  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -144,6 +144,33 @@ def test_real_imports_override_the_heuristic(planner):
     assert out.index("src/track.py") < out.index("src/main.py")
 
 
+@pytest.mark.parametrize("render_src", [
+    "from src.track import Segment\n",       # absolute: always worked
+    "from .track import Segment\n",          # relative: missed
+    "from src import track\n",               # package: missed
+    "from . import track\n",                 # relative package: missed
+])
+def test_the_idioms_models_actually_use_are_understood(planner, render_src):
+    """The exact CHANGELOG failure — render scheduled before the track it
+    imports — was still there for the two import forms models use most.
+    `from .track import T` did not resolve against the importer's package,
+    and `from src import track` was read as a dependency on `src`."""
+    p = planner({"src/render.py": render_src, "src/track.py": "X = 1\n"})
+    plan = _plan([("src/render.py", "draws"), ("src/track.py", "data")])
+    out = p.derive_order(plan)
+    assert [t.path for t in out.tasks] == ["src/track.py", "src/render.py"]
+    assert out.task("t1").depends_on == ("t2",)
+
+
+def test_a_relative_import_climbs_the_right_number_of_levels(planner):
+    p = planner({"pkg/ui/render.py": "from ..core.track import Segment\n",
+                 "pkg/core/track.py": "X = 1\n"})
+    plan = _plan([("pkg/ui/render.py", "draws"),
+                  ("pkg/core/track.py", "data")])
+    assert [t.path for t in p.derive_order(plan).tasks] == \
+        ["pkg/core/track.py", "pkg/ui/render.py"]
+
+
 def test_a_test_file_follows_the_module_it_covers(planner):
     rows = MINISTRAL + [("tests/test_physics.py", "physics tests")]
     out = [t.path for t in planner().derive_order(_plan(rows)).tasks]
@@ -211,6 +238,78 @@ def test_adding_required_tests_is_idempotent(planner):
                                       list(_plan(DEVSTRAL).tasks), {})
     _out2, added2 = p._ensure_required_tests(SPEC_TESTS, out, {})
     assert added2 == []
+
+
+def _real_planner(reply, max_files=12):
+    from cognitive_coder.ports import (
+        Host,
+        MemoryFileSystem,
+        RecordingEvents,
+        ScriptedLLM,
+    )
+    host = Host(llm=ScriptedLLM([reply], supports_tools=False),
+                fs=MemoryFileSystem(), events=RecordingEvents())
+    return Planner(host, max_files=max_files)
+
+
+def _warnings(p):
+    return [m for k, m, _d in p.host.events.events if k == "warning"]
+
+
+def test_files_the_engine_cannot_build_are_named_not_dropped():
+    """`README.md` and `pyproject.toml` were deleted from the plan without a
+    word. The operator asked for them, or the model thought they mattered;
+    either way someone should be told they will not be written."""
+    p = _real_planner("README.md — how to run it\n"
+                      "pyproject.toml — packaging\n"
+                      "src/app.py — the app\n")
+    plan = p.plan("an app with a README and packaging")
+    assert [t.path for t in plan.tasks] == ["src/app.py"]
+    left_out = [c for c in plan.caveats if "README.md" in c]
+    assert left_out and "pyproject.toml" in left_out[0], plan.caveats
+    assert any("README.md" in m for m in _warnings(p))
+
+
+def test_a_named_test_that_does_not_fit_is_said_out_loud():
+    """At `max_files` a test the REQUEST named was skipped silently — the
+    exact omission `_ensure_required_tests` exists to prevent."""
+    p = _real_planner("src/a.py — a\nsrc/b.py — b\n", max_files=2)
+    plan = p.plan("Build it. Tests: tests/test_app.py must pass.")
+    assert "tests/test_app.py" not in [t.path for t in plan.tasks]
+    assert any("tests/test_app.py" in c for c in plan.caveats), plan.caveats
+    assert any("tests/test_app.py" in m for m in _warnings(p))
+
+
+@pytest.mark.parametrize("path", [
+    "src/contest.py", "src/attest.py", "src/testimonials.py",
+    "app/testing_tools.py", "src/protest.py", "src/Contest.java",
+])
+def test_a_module_whose_name_contains_test_is_a_module(path):
+    """`_looks_like_test` was looser than `_TEST_PATH`: these got the tester
+    persona and no stub. One definition of "test file" now serves both."""
+    from cognitive_coder.planner import _looks_like_test
+    assert not _looks_like_test(path)
+    tasks = _real_planner("")._to_tasks([(path, "a module")], {})
+    assert tasks[0].persona == "engineer"
+    assert tasks[0].test_path
+
+
+@pytest.mark.parametrize("path", [
+    "tests/test_x.py", "pkg/mod_test.go", "src/thing.test.ts",
+    "spec/thing_spec.rb", "src/test/java/FooTest.java", "FooTests.cs",
+])
+def test_real_test_files_are_still_test_files(path):
+    from cognitive_coder.planner import _looks_like_test
+    assert _looks_like_test(path)
+    assert _required_tests(f"write {path} please") == [path]
+
+
+def test_support_code_in_a_test_folder_is_not_paired_with_a_test():
+    """`tests/helpers.py` is not a test, but it is not a module that needs
+    `tests/test_helpers.py` either."""
+    tasks = _real_planner("")._to_tasks(
+        [("tests/helpers.py", "shared fixtures")], {})
+    assert tasks[0].test_path == ""
 
 
 def test_a_request_naming_no_tests_invents_none(planner):
@@ -330,9 +429,9 @@ def test_attribute_calls_on_locals_are_suppressed_end_to_end():
 # used", directly above a Verification line reading "3 of 5 file(s) built".
 
 def _doc(**kw):
-    base = dict(request="Pseudo-3D Racing Game",
-                files=["src/math3d.py", "src/physics.py", "src/track.py"],
-                build_summary="3 of 5 file(s) built and their tests ran")
+    base = {"request": "Pseudo-3D Racing Game",
+                "files": ["src/math3d.py", "src/physics.py", "src/track.py"],
+                "build_summary": "3 of 5 file(s) built and their tests ran"}
     base.update(kw)
     return recommendation_document(ReviewResult(), **base)
 
@@ -366,4 +465,7 @@ def test_the_session_passes_failed_files_to_the_reviewer():
     """Without this wiring the reviewer cannot tell a clean build from a
     collapsed one, and reports the second as the first."""
     src = (REPO / "cognitive_coder" / "session.py").read_text(encoding="utf-8")
-    assert "unfinished=[o.path for o in self.outcomes if not o.ok]" in src
+    # `final` is the last outcome per file: a module repaired against its
+    # test has two outcomes, and the later one is the verdict.
+    assert "unfinished=[o.path for o in final if not o.ok]" in src
+    assert "final = self._final_outcomes()" in src

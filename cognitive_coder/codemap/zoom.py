@@ -100,9 +100,9 @@ def dependency_interfaces(store: Any, target: str, *,
     deps = _direct_dependencies(store, target)
     if not deps:
         return ""
-    lines = ["# INTERFACES YOU MAY CALL (exact signatures — use these, do "
-             "not guess)"]
+    lines = [""]                         # the header, chosen below
     used = 0
+    approx = False
     dropped: list[str] = []
     for path in deps:
         block = [f"## {path}"]
@@ -110,7 +110,12 @@ def dependency_interfaces(store: Any, target: str, *,
             if s["name"].split(".")[-1].startswith("_"):
                 continue
             doc = f"  # {s['docstring']}" if s["docstring"] else ""
-            block.append(f"{s['signature'] or s['name']}{doc}")
+            # A pattern-matched row says so on its own line. These used to
+            # sit under "exact signatures — use these, do not guess" with no
+            # marker, including a C signature that was just `static int`.
+            mark = "  ~approx" if s["approximate"] else ""
+            approx = approx or bool(mark)
+            block.append(f"{s['signature'] or s['name']}{doc}{mark}")
         text = "\n".join(block)
         cost = count_tokens(text) if count_tokens else len(text) // 4
         if used + cost > budget_tokens and used:
@@ -118,6 +123,11 @@ def dependency_interfaces(store: Any, target: str, *,
             continue
         lines.append(text)
         used += cost
+    lines[0] = ("# INTERFACES YOU MAY CALL (exact signatures — use these, "
+                "do not guess)" if not approx else
+                "# INTERFACES YOU MAY CALL (use these rather than guess; "
+                "lines marked ~approx were pattern-matched, not parsed — "
+                "confirm one with search_codemap before relying on it)")
     if dropped:
         lines.append(f"# NOT SHOWN (no room): {', '.join(dropped)} — call "
                      f"search_codemap if you need them.")

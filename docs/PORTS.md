@@ -105,10 +105,34 @@ def root(self) -> str
 4. **`root()` is a real, absolute path.** The core resolves every path it
    touches to a real path and refuses anything escaping this root — including
    via `..` and via symlinks. You are welcome to check again.
+5. **`write_bytes` keeps an existing file's permission bits.** An atomic
+   replace puts a NEW file in the old one's place, and `mkstemp` creates new
+   files 0600 — so the obvious implementation resets the mode of everything
+   the engine edits: a 755 `build.sh` loses its execute bit, a
+   group-readable file stops being one, a 444 file comes back writable. Copy
+   the target's mode onto the temp file before the rename; give a NEW file
+   the ordinary default (0666 less the umask).
+
+**A host MAY also provide** one optional method, which the core uses when it
+is there and does without when it is not:
+
+```python
+def append_bytes(self, path, data: bytes) -> None
+```
+
+Append `data` to the end of `path`, creating the file (and its directory) if
+it is absent. The journal and `BUILD_LOG.txt` are append-only, and without
+this the core can only read the whole file and write it back per event —
+quadratic over a long session: 500 events of a 172 KB journal cost 43 MB
+read and 43 MB written. It need NOT be atomic — a crash mid-append leaves a
+torn last line, and the journal's reader skips an unparseable tail by
+design — but it must never rewrite bytes already in the file, and the same
+jail applies as for `write_bytes`.
 
 `LocalFileSystem` in `ports.py` is a correct implementation you may copy: the
 temp file is in the same directory (rename is only atomic within a
-filesystem), and containment is judged on resolved real paths.
+filesystem), the target's mode survives the swap, and containment is judged
+on resolved real paths.
 
 ---
 
@@ -150,6 +174,15 @@ def sqlite_path(self, name) -> str
 portability contract — a host storing pickles cannot hand its state to a host
 storing JSON, and resume has to survive that. `sqlite_path` returns a stable,
 writable path for a given logical name, with its parent directory present.
+
+**And it should outlive the process**, unless the host is a test. The
+patcher keeps its transaction log and sequence counter here; under
+`MemoryStorage` both vanish when the process ends, so the next run numbers
+its first transaction 1 again and "what did it do to my project" has no
+answer. `JsonFileStorage` (exported; what the CLI uses) is a small, atomic,
+one-file-per-key implementation to copy or use. Keep one store per PROJECT:
+ATK's adapter once keyed its bucket by name alone, and a second project then
+read the first one's codemap and appended to its log.
 
 ---
 

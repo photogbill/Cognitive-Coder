@@ -142,27 +142,49 @@ def parse_edits(text: str, default_path: str = "") -> list[Edit]:
     return edits
 
 
+#: Fence tags that name each language. Written out, never derived: the old
+#: `lang_id[:2]` rule produced "ru" for both Rust and Ruby, and a `.get(…,
+#: "")` fallback put the EMPTY tag in the set for every language missing
+#: from the map — so an untagged fence counted as tagged for the target.
+_FENCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "python": ("py", "python3", "py3"), "javascript": ("js", "mjs", "cjs",
+                                                       "node", "jsx"),
+    "typescript": ("ts", "tsx"), "csharp": ("cs", "c#"), "gdscript": ("gd",),
+    "rust": ("rs",), "cpp": ("c++", "cc", "cxx", "hpp"), "c": ("h",),
+    "bash": ("sh", "shell", "zsh"), "powershell": ("ps1", "pwsh", "ps"),
+    "ruby": ("rb",), "go": ("golang",), "batch": ("bat", "cmd"),
+    "sql": ("sqlite", "sqlite3"), "lua": (), "zig": (), "java": (),
+}
+
+
 def extract_code(text: str, lang_id: str = "", validator=None) -> str:
     """The code from a model reply, when the whole reply should be one file.
 
     Fence confusion is D5: three backticks inside a docstring, a language tag
     that isn't a language, no fence at all, two fences with different content.
-    So: prefer a fence whose tag matches the target language, then the longest
-    fence, then the whole reply — and **validate by parsing** where a
+    So, in order: fences TAGGED for the target language; then untagged
+    fences, longest first; then fences tagged for something else, longest
+    first; then the whole reply — and **validate by parsing** where a
     validator is supplied, trying the next candidate before giving up. Never
     assume the first fence.
+
+    Untagged is never "tagged for the target". Observed: "Build with:
+    ```cargo run```" followed by a ```rust fence wrote `main.rs` as
+    `cargo run`, because the untagged command came first and counted.
     """
     body = text or ""
     fences = list(_FENCE.finditer(body))
     candidates: list[str] = []
+
+    def tag(m: re.Match) -> str:
+        return (m.group("lang") or "").lower()
+
+    by_length = sorted(fences, key=lambda m: -len(m.group("body")))
     if lang_id:
-        aliases = {lang_id, lang_id[:2], {"python": "py", "javascript": "js",
-                                          "typescript": "ts", "csharp": "cs",
-                                          "gdscript": "gd"}.get(lang_id, "")}
-        candidates += [m.group("body") for m in fences
-                       if (m.group("lang") or "").lower() in aliases]
-    candidates += [m.group("body")
-                   for m in sorted(fences, key=lambda m: -len(m.group("body")))]
+        aliases = {lang_id.lower(), *_FENCE_ALIASES.get(lang_id.lower(), ())}
+        candidates += [m.group("body") for m in fences if tag(m) in aliases]
+    candidates += [m.group("body") for m in by_length if not tag(m)]
+    candidates += [m.group("body") for m in by_length if tag(m)]
     candidates.append(body)
 
     for cand in candidates:
@@ -178,14 +200,55 @@ def extract_code(text: str, lang_id: str = "", validator=None) -> str:
 # applying
 # ---------------------------------------------------------------------------
 
+def _is_word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _cuts_a_name(haystack: str, needle: str, at: int) -> bool:
+    """Does the match at ``at`` start or end in the middle of a name?"""
+    end = at + len(needle)
+    return bool(
+        (_is_word(needle[0]) and at > 0 and _is_word(haystack[at - 1]))
+        or (_is_word(needle[-1]) and end < len(haystack)
+            and _is_word(haystack[end])))
+
+
+#: `_unique_index` results that are not positions.
+MISSING, AMBIGUOUS, INSIDE_A_NAME = -1, -2, -3
+
+
 def _unique_index(haystack: str, needle: str) -> int:
-    """Index of ``needle`` if it appears exactly once; -1 missing, -2 ambiguous."""
-    first = haystack.find(needle)
-    if first < 0:
-        return -1
-    if haystack.find(needle, first + 1) >= 0:
-        return -2
-    return first
+    """Index of ``needle`` if it appears exactly once AS WHOLE WORDS.
+
+    -1 missing, -2 ambiguous, -3 it occurs only inside longer names.
+
+    Whole words, because a raw substring search applied `x = 1` → `x = 2`
+    to `max = 10` and produced `max = 20`: it applied cleanly and was
+    silently wrong, which is the failure this module exists to prevent. A
+    hit that starts or ends inside a name is not a candidate at all — so
+    it neither satisfies the anchor nor makes a real match ambiguous.
+    """
+    if not needle:
+        return MISSING
+    hits: list[int] = []
+    partial = False
+    at = haystack.find(needle)
+    while at >= 0:
+        if _cuts_a_name(haystack, needle, at):
+            partial = True
+        else:
+            hits.append(at)
+            if len(hits) > 1:
+                return AMBIGUOUS
+        at = haystack.find(needle, at + 1)
+    if hits:
+        return hits[0]
+    return INSIDE_A_NAME if partial else MISSING
+
+
+_INSIDE_A_NAME = ("the text to replace matches only inside a longer name "
+                  "(e.g. `x = 1` inside `max = 10`) — refusing rather than "
+                  "editing part of an identifier; give the whole line")
 
 
 def _apply_diff(original: str, diff_text: str) -> tuple[str, str]:
@@ -260,8 +323,11 @@ def safe_relpath(fs: Any, rel: str) -> str:
     norm = posixpath.normpath(raw)
     if norm.startswith("..") or norm == "." or posixpath.isabs(norm):
         raise PathEscape(rel, fs.root())
-    if norm.startswith(".git/") or norm == ".git":
-        raise PathEscape(rel, fs.root())      # M27: .git is never patched
+    # M27: .git is never patched — in ANY case and at any depth. On Windows
+    # and macOS `.GIT/config` is `.git/config`, and a case-sensitive check
+    # was a way into the one directory the engine promises not to touch.
+    if any(part.lower() == ".git" for part in norm.split("/")):
+        raise PathEscape(rel, fs.root())
     # The host's FileSystemPort resolves symlinks; LocalFileSystem raises on
     # an escape and MemoryFileSystem has no symlinks to follow. This check is
     # the core's own, deliberately duplicated — a jail with one door is not a
@@ -355,16 +421,18 @@ class Transaction:
                                   "match against")
             anchor = textio.normalise(edit.old)
             pos = _unique_index(before, anchor)
-            if pos == -1:
+            if pos == MISSING:
                 return EditResult(
                     edit.path, False,
                     "the text to replace is not in the file (it may have "
                     "changed since the model read it)")
-            if pos == -2:
+            if pos == AMBIGUOUS:
                 return EditResult(
                     edit.path, False,
                     "the text to replace appears more than once — refusing "
                     "rather than guessing which one was meant")
+            if pos == INSIDE_A_NAME:
+                return EditResult(edit.path, False, _INSIDE_A_NAME)
             after = (before[:pos] + textio.normalise(edit.new)
                      + before[pos + len(anchor):])
         elif edit.kind == "diff":
@@ -410,7 +478,7 @@ class Transaction:
                     f"({exc}) — an edit with no way back is not applied")
 
         try:
-            textio.write(fs, rel, tf, after)
+            widened = textio.write(fs, rel, tf, after)
         except Exception as exc:                         # noqa: BLE001
             return EditResult(edit.path, False, f"the write failed: {exc}")
 
@@ -420,7 +488,19 @@ class Transaction:
         self._p.events("patch", f"{rel} updated (transaction {self.seq})",
                        {"seq": self.seq, "files": [rel],
                         "task": self.task_id})
-        return EditResult(edit.path, True, "", diff)
+        # C7: what the write changed BEYOND the edit is said, not done
+        # quietly — a mixed-EOL file had every minority line ending
+        # rewritten, and the decode's assumption that says so was computed
+        # and thrown away. On success `reason` carries these notes.
+        notes = [n for n in ((tf.assumption if existed else ""), widened)
+                 if n]
+        if notes:
+            self._p.events("warning", f"{rel}: {'; '.join(notes)}",
+                           {"seq": self.seq, "files": [rel],
+                            "task": self.task_id})
+        return EditResult(edit.path, True,
+                          ("applied; " + "; ".join(notes)) if notes else "",
+                          diff)
 
     # -- finishing --------------------------------------------------------
     def commit(self, verified: bool = False) -> TransactionRecord:
@@ -436,7 +516,14 @@ class Transaction:
         # transaction's row. One row per sequence number is what makes the
         # log readable as a history rather than as a stream of state changes
         # — and readability is the point of it (M25 rule 5).
-        self._p._replace_log(rec)
+        #
+        # Which files this transaction CREATED goes in the row as well as
+        # the MANIFEST: the log is never pruned, the manifest is, and
+        # `undo_to` must know "created here" from "existed before" after the
+        # bytes are gone — the difference between deleting a file correctly
+        # and deleting somebody's file.
+        self._p._replace_log(rec, created=sorted(
+            rel for rel, raw in self._snapshots.items() if raw is None))
         return rec
 
     def mark_verified(self) -> TransactionRecord:
@@ -548,15 +635,55 @@ class Patcher:
         log.append(_rec_to_dict(rec))
         self.storage.set(_LOG_KEY, log)
 
-    def _replace_log(self, rec: TransactionRecord) -> None:
+    def _replace_log(self, rec: TransactionRecord,
+                     created: list[str] | None = None) -> None:
         log = self._log()
-        for i, row in enumerate(log):
-            if row.get("seq") == rec.seq and row.get("state") != "rollback_of":
-                log[i] = _rec_to_dict(rec)
+        row = _rec_to_dict(rec)
+        for i, old in enumerate(log):
+            if old.get("seq") == rec.seq and old.get("state") != "rollback_of":
+                # Keep what the record type does not carry (`created`), so a
+                # later mark_verified() does not erase it.
+                if "created" in old:
+                    row["created"] = old["created"]
+                if created is not None:
+                    row["created"] = list(created)
+                log[i] = row
                 break
         else:
-            log.append(_rec_to_dict(rec))
+            if created is not None:
+                row["created"] = list(created)
+            log.append(row)
         self.storage.set(_LOG_KEY, log)
+
+    def _created_in(self, seq: int) -> set[str] | None:
+        """Files the log says transaction ``seq`` created; None if unknown."""
+        for row in self._log():
+            if row.get("seq") == seq and row.get("state") != "rollback_of":
+                got = row.get("created")
+                return set(got) if isinstance(got, list) else None
+        return None
+
+    def _manifest(self, rec: TransactionRecord) -> dict[str, str] | None:
+        """{path: "NEW" | "OLD" | "??"} from a snapshot's MANIFEST.
+
+        None when the manifest itself is gone (pruned, or never written) —
+        which is "unknown", never "new".
+        """
+        base = self._snapshot_dir(rec.seq, rec.task_id)
+        try:
+            text = self.fs.read(f"{base}/MANIFEST.txt")
+        except Exception:                                # noqa: BLE001
+            return None
+        # The diff follows the list; a `+NEW …` line in it is not an entry.
+        head = text.split("\n\n--- what changed ---", 1)[0]
+        out: dict[str, str] = {}
+        for line in head.splitlines()[1:]:
+            tag, _, rel = line.partition(" ")
+            if tag == "??":
+                rel = rel.rsplit(" (could not be snapshotted)", 1)[0]
+            if tag in ("NEW", "OLD", "??") and rel:
+                out[rel] = tag
+        return out
 
     def _snapshot_dir(self, seq: int, task_id: str) -> str:
         # NNNN-<task_id>/ with a monotonic counter (M25 rule 2).
@@ -593,12 +720,22 @@ class Patcher:
         self._prune()
 
     def _prune(self) -> None:
-        """Drop the oldest snapshot BYTES. The log itself is never pruned."""
+        """Drop the oldest snapshot BYTES. The log itself is never pruned.
+
+        Sorted by the NUMBER, not the name: `{seq:04d}` is only four digits
+        wide, so as text "10000-…" sorts before "9999-…" and a lexicographic
+        prune deleted the newest snapshot first once the counter got there.
+        """
+        def seq_of(name: str) -> tuple[int, str]:
+            head = name.split("-", 1)[0]
+            return (int(head) if head.isdigit() else -1, name)
+
         try:
             dirs = sorted({p.split("/")[1] for p in
                            self.fs.list(f"{SNAPSHOT_DIR}/*")
                            if p.startswith(SNAPSHOT_DIR + "/")
-                           and "/" in p[len(SNAPSHOT_DIR) + 1:]})
+                           and "/" in p[len(SNAPSHOT_DIR) + 1:]},
+                          key=seq_of)
         except Exception:                                # noqa: BLE001
             return
         for old in dirs[:-MAX_SNAPSHOTS]:
@@ -643,6 +780,42 @@ class Patcher:
         if not doomed:
             return {"ok": False,
                     "note": f"nothing has happened since transaction {seq}."}
+
+        # PLAN every file first, and refuse before touching anything if any
+        # step cannot be done honestly. A missing snapshot used to be read
+        # as "this transaction created the file" and the file was DELETED
+        # with ok=True — but `_prune` removes exactly those bytes, so any
+        # file edited more than MAX_SNAPSHOTS transactions ago was one
+        # undo_to away from being destroyed. "Created here" now has to be
+        # SAID, by the MANIFEST or by the log; absence of evidence is not it.
+        #
+        # Newest first, so an older snapshot overwrites a newer one and the
+        # tree ends at the requested point rather than somewhere in between.
+        plan: list[tuple[str, str, str]] = []       # (action, rel, snapshot)
+        gone: list[str] = []
+        for rec in sorted(doomed, key=lambda r: -r.seq):
+            base = self._snapshot_dir(rec.seq, rec.task_id)
+            manifest = self._manifest(rec) or {}
+            created = self._created_in(rec.seq) or set()
+            for rel in rec.files:
+                snap = f"{base}/files/{rel}"
+                if self.fs.exists(snap):
+                    plan.append(("restore", rel, snap))
+                elif manifest.get(rel) == "NEW" or (
+                        rel not in manifest and rel in created):
+                    plan.append(("delete", rel, ""))
+                else:
+                    gone.append(f"{rel} (transaction {rec.seq})")
+        if gone:
+            return {"ok": False, "restored": [], "discarded": [],
+                    "note": (
+                        f"Refused: going back to transaction {seq} needs the "
+                        f"saved copies of {', '.join(gone)}, and they have "
+                        f"been pruned — only the last {MAX_SNAPSHOTS} "
+                        f"transactions keep restorable bytes. Nothing was "
+                        f"changed. Undo to a later transaction instead, or "
+                        f"restore these files from your own backup.")}
+
         sentence = (
             f"This will discard {len(doomed)} transaction(s), "
             f"{len(sealed)} of which were verified — meaning they built and "
@@ -652,21 +825,17 @@ class Patcher:
             return {"ok": False, "note": "cancelled; nothing was changed."}
 
         restored: list[str] = []
-        # Newest first, so an older snapshot overwrites a newer one and the
-        # tree ends at the requested point rather than somewhere in between.
+        for action, rel, snap in plan:
+            try:
+                if action == "restore":
+                    self.fs.write_bytes(rel, self.fs.read_bytes(snap))
+                    restored.append(rel)
+                elif self.fs.exists(rel):
+                    self.fs.delete(rel)          # created by that transaction
+                    restored.append(rel)
+            except Exception:                            # noqa: BLE001
+                continue
         for rec in sorted(doomed, key=lambda r: -r.seq):
-            base = self._snapshot_dir(rec.seq, rec.task_id)
-            for rel in rec.files:
-                snap = f"{base}/files/{rel}"
-                try:
-                    if self.fs.exists(snap):
-                        self.fs.write_bytes(rel, self.fs.read_bytes(snap))
-                        restored.append(rel)
-                    elif self.fs.exists(rel):
-                        self.fs.delete(rel)      # it was created by this tx
-                        restored.append(rel)
-                except Exception:                        # noqa: BLE001
-                    continue
             undo_seq = self._next_seq()
             self._write_log(TransactionRecord(
                 seq=undo_seq, task_id=rec.task_id, atomic=rec.atomic,
@@ -701,10 +870,11 @@ class Patcher:
             if edit.kind == "replace":
                 pos = _unique_index(before, textio.normalise(edit.old))
                 if pos < 0:
-                    out.append(f"# {rel}: the anchor "
-                               + ("was not found" if pos == -1
-                                  else "is ambiguous — it matches more than "
-                                       "once, so this would be refused"))
+                    out.append(f"# {rel}: " + (
+                        "the anchor was not found" if pos == MISSING
+                        else _INSIDE_A_NAME if pos == INSIDE_A_NAME
+                        else "the anchor is ambiguous — it matches more "
+                             "than once, so this would be refused"))
                     continue
                 after = (before[:pos] + textio.normalise(edit.new)
                          + before[pos + len(textio.normalise(edit.old)):])

@@ -43,8 +43,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognitive_coder.planner import Planner                   # noqa: E402
-from cognitive_coder.types import Plan, Task                  # noqa: E402
+from cognitive_coder.planner import Planner  # noqa: E402
+from cognitive_coder.types import Plan, Task  # noqa: E402
 
 
 class _FS:

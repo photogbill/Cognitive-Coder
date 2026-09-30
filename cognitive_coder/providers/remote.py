@@ -44,7 +44,10 @@ from ..errors import BudgetExceeded, ConfigurationError
 from ..types import Completion, Message, ModelCapabilities, ToolSpec
 from .base import (
     ProviderBase,
+    as_dict,
     estimate_tokens,
+    first_choice,
+    http_error_detail,
     messages_to_openai,
     parse_tool_calls,
 )
@@ -102,6 +105,12 @@ class RemoteProvider(ProviderBase):
         self._extra = tuple(extra_patterns)
         self._ctx = context_tokens
         self.last_report: redact.RedactionReport | None = None
+        #: One numbering for the life of this provider (a session's
+        #: conversation). Per call, the same key was
+        #: `[REDACTED:aws_key_id_2]` in one request and
+        #: `[REDACTED:aws_key_id]` in the next, and the model
+        #: treated one credential as two. Held in memory only.
+        self._redaction = redact.RedactionState()
 
     # -- the shape each provider fills in --------------------------------
     def _headers(self) -> dict[str, str]:                # pragma: no cover
@@ -133,7 +142,8 @@ class RemoteProvider(ProviderBase):
 
         # 2. Redact EVERYTHING, including tool results (M43).
         clean, report = redact.redact_messages(
-            messages, soft=self._redact_soft, extra=self._extra)
+            messages, soft=self._redact_soft, extra=self._extra,
+            state=self._redaction)
         self.last_report = report
         self.gate.redactions += report.total
 
@@ -156,25 +166,30 @@ class RemoteProvider(ProviderBase):
             data = self._post(payload)
         except urllib.error.HTTPError as exc:
             # M11: never raise on a model refusal, and by extension hand back
-            # something the loop can reason about. The body is NOT read — it
-            # can echo the request, and the request may have contained file
-            # contents.
-            self._emit("error",
-                       f"{self.name} returned HTTP {exc.code}. Nothing was "
-                       f"generated; the session can continue locally.",
-                       {"provider": self.name, "status": exc.code})
-            return Completion(text="", finish_reason="error",
-                              model=self.model)
+            # something the loop can reason about. The body is read only for
+            # its error MESSAGE, redacted and shortened — it can echo the
+            # request, and the request may have contained file contents.
+            # The status used to be all that was kept, and only in an event.
+            detail = http_error_detail(exc)
+            return self.failed(
+                f"{self.name} returned HTTP {exc.code}"
+                + (f": {detail}" if detail else "")
+                + ". Nothing was generated; the session can continue "
+                  "locally.", model=self.model, status=exc.code)
         except (urllib.error.URLError, OSError, TimeoutError, ValueError):
-            self._emit("error",
-                       f"{self.name} could not be reached. Nothing was "
-                       f"generated, and nothing further will be sent unless "
-                       f"you try again.",
-                       {"provider": self.name})
-            return Completion(text="", finish_reason="error",
-                              model=self.model)
+            return self.failed(
+                f"{self.name} could not be reached. Nothing was "
+                f"generated, and nothing further will be sent unless "
+                f"you try again.", model=self.model)
 
-        completion = self._parse(data, int((time.monotonic() - t0) * 1000))
+        try:
+            completion = self._parse(data, int((time.monotonic() - t0)
+                                               * 1000))
+        except _Shape as exc:
+            return self.failed(
+                f"{self.name} answered in a shape that is not a "
+                f"completion ({exc}). Nothing was generated.",
+                model=self.model)
 
         # 4 and 5. Record the cost, then journal it — never the key (M44).
         cost = self._cost(completion.tokens_in, completion.tokens_out)
@@ -200,7 +215,8 @@ class RemoteProvider(ProviderBase):
         req = urllib.request.Request(self.endpoint, data=body, method="POST")
         for key, value in self._headers().items():
             req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+        with urllib.request.urlopen(
+                req, timeout=self._patience(self.timeout)) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
 
     def _cost(self, tokens_in: int, tokens_out: int) -> float:
@@ -233,6 +249,15 @@ class RemoteProvider(ProviderBase):
             self._events.event(kind, message, data)
         except Exception:                                # noqa: BLE001
             pass
+
+
+class _Shape(ValueError):
+    """A body that is not the shape this provider's API documents.
+
+    Raised by `_parse` and turned into an error Completion by `complete()`.
+    The parsers used to chain `.get()` on whatever arrived, so `[]`, `null`
+    or `{"choices": [null]}` raised AttributeError out of `complete()`.
+    """
 
 
 # ==========================================================================
@@ -272,13 +297,18 @@ class Anthropic(RemoteProvider):
         return payload
 
     def _parse(self, data: dict, elapsed_ms: int) -> Completion:
-        blocks = data.get("content") or []
-        text = "".join(b.get("text", "") for b in blocks
+        raw = as_dict(data).get("content")
+        if not isinstance(raw, list):
+            raise _Shape("no content list")
+        blocks = [b for b in raw if isinstance(b, dict)]
+        if raw and not blocks:
+            raise _Shape("no content blocks")
+        text = "".join(str(b.get("text") or "") for b in blocks
                        if b.get("type") == "text")
         raw_calls = [{"id": b.get("id", ""), "name": b.get("name", ""),
                       "arguments": b.get("input", {})}
                      for b in blocks if b.get("type") == "tool_use"]
-        usage = data.get("usage") or {}
+        usage = as_dict(data.get("usage"))
         reason = {"max_tokens": "length", "tool_use": "tool_calls",
                   "end_turn": "stop", "stop_sequence": "stop"}.get(
                       str(data.get("stop_reason", "end_turn")), "stop")
@@ -314,10 +344,13 @@ class _OpenAIShaped(RemoteProvider):
         return payload
 
     def _parse(self, data: dict, elapsed_ms: int) -> Completion:
-        choice = (data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        usage = data.get("usage") or {}
-        calls = parse_tool_calls(message.get("tool_calls") or ())
+        choice = first_choice(data)
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise _Shape("no choices[0].message")
+        usage = as_dict(data.get("usage"))
+        calls = parse_tool_calls([c for c in message.get("tool_calls") or ()
+                                  if isinstance(c, dict)])
         reason = {"length": "length", "tool_calls": "tool_calls"}.get(
             str(choice.get("finish_reason", "stop")), "stop")
         if calls and reason != "length":
@@ -347,7 +380,8 @@ class OpenRouter(_OpenAIShaped):
         headers = super()._headers()
         # OpenRouter asks for these so it can attribute traffic. Both are
         # deliberately generic: the project name, not the operator's.
-        headers["HTTP-Referer"] = "https://github.com/photogbill/cognitive-coder"
+        headers["HTTP-Referer"] = (
+            "https://github.com/photogbill/cognitive-coder")
         headers["X-Title"] = "Cognitive Coder"
         return headers
 
@@ -355,8 +389,8 @@ class OpenRouter(_OpenAIShaped):
         completion = super()._parse(data, elapsed_ms)
         # OpenRouter reports actual cost, which beats any price table we
         # could keep current. Fold it into the budget directly.
-        usage = data.get("usage") or {}
-        if usage.get("cost"):
+        usage = as_dict(data.get("usage"))
+        if isinstance(usage.get("cost"), (int, float)) and usage["cost"]:
             self.budget.spend += float(usage["cost"])
         return completion
 
@@ -394,7 +428,8 @@ class Google(RemoteProvider):
         req = urllib.request.Request(url, data=body, method="POST")
         for key, value in self._headers().items():
             req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+        with urllib.request.urlopen(
+                req, timeout=self._patience(self.timeout)) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
 
     def _payload(self, messages: Sequence[Message], **kw) -> dict:
@@ -414,12 +449,17 @@ class Google(RemoteProvider):
         return payload
 
     def _parse(self, data: dict, elapsed_ms: int) -> Completion:
-        candidates = data.get("candidates") or [{}]
-        parts = ((candidates[0].get("content") or {}).get("parts") or [])
-        text = "".join(p.get("text", "") for p in parts)
-        usage = data.get("usageMetadata") or {}
+        candidates = as_dict(data).get("candidates")
+        first = (candidates[0] if isinstance(candidates, list) and candidates
+                 else None)
+        if not isinstance(first, dict):
+            raise _Shape("no candidates")
+        parts = as_dict(first.get("content")).get("parts") or []
+        text = "".join(str(p.get("text") or "") for p in parts
+                       if isinstance(p, dict))
+        usage = as_dict(data.get("usageMetadata"))
         reason = {"MAX_TOKENS": "length"}.get(
-            str(candidates[0].get("finishReason", "STOP")), "stop")
+            str(first.get("finishReason", "STOP")), "stop")
         return Completion(
             text=text, finish_reason=reason,
             tokens_in=int(usage.get("promptTokenCount", 0) or 0),

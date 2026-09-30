@@ -46,6 +46,11 @@ _BOMS: tuple[tuple[bytes, str], ...] = (
     (b"\xff\xfe", "utf-16-le"),
 )
 
+#: The BOM each base encoding is written with when `TextFile.bom` is set.
+_BOM_FOR = {"utf-8": b"\xef\xbb\xbf", "utf-16-le": b"\xff\xfe",
+            "utf-16-be": b"\xfe\xff", "utf-32-le": b"\xff\xfe\x00\x00",
+            "utf-32-be": b"\x00\x00\xfe\xff"}
+
 CRLF = "\r\n"
 LF = "\n"
 CR = "\r"
@@ -81,18 +86,35 @@ class TextFile:
         body = self.text if text is None else text
         if self.eol != LF:
             body = body.replace(LF, self.eol)
-        enc = self.encoding
-        if self.bom and enc == "utf-8":
-            enc = "utf-8-sig"
+        # The BOM is re-added for EVERY encoding that had one. It used to be
+        # re-added only for UTF-8; for UTF-16/32 it survived only by staying
+        # in the text as U+FEFF, so a whole-file write — new text, no U+FEFF
+        # — dropped it.
+        bom = _BOM_FOR.get(self.encoding, b"") if self.bom else b""
         try:
-            return body.encode(enc)
+            return bom + body.encode(self.encoding)
         except (UnicodeEncodeError, LookupError):
             # The edit introduced a character the original encoding cannot
-            # hold — e.g. an em-dash into a cp1252 file. Widening to UTF-8 is
+            # hold — e.g. an arrow into a cp1252 file. Widening to UTF-8 is
             # the only non-lossy option, and it is a change worth admitting
-            # to rather than performing silently; the caller reports
-            # `assumption` when it is set.
-            return body.encode("utf-8")
+            # to rather than performing silently: `encoding_note` says so,
+            # and the patcher puts that in the result.
+            return (_BOM_FOR["utf-8"] if self.bom else b"") + body.encode(
+                "utf-8")
+
+    def encoding_note(self, text: str | None = None) -> str:
+        """What `encode(text)` will change beyond the text itself, or "".
+
+        Covers the one change `encode` makes silently: widening to UTF-8.
+        """
+        body = self.text if text is None else text
+        try:
+            body.encode(self.encoding)
+            return ""
+        except (UnicodeEncodeError, LookupError):
+            return (f"the edit adds characters {self.encoding} cannot hold, "
+                    f"so the file was written as UTF-8 — its encoding "
+                    f"changed. Undo restores the original bytes.")
 
     def with_text(self, text: str) -> TextFile:
         return TextFile(text=text, encoding=self.encoding, bom=self.bom,
@@ -154,23 +176,44 @@ def _mixed_note(text: str) -> str:
 def decode(raw: bytes) -> TextFile:
     """Bytes → a TextFile that knows how to become those bytes again.
 
-    Order matters: BOM, then strict UTF-8, then UTF-16 heuristics, then a
-    stated fallback. Strict UTF-8 before anything lossy is what makes the
-    common case exact.
+    Order matters: BOM, then the UTF-16 NUL pattern, then strict UTF-8,
+    then a stated fallback. Strict UTF-8 before anything lossy is what makes
+    the common case exact — but NOT before the UTF-16 check: ASCII text in
+    UTF-16-LE is also valid UTF-8 (every other byte a NUL), and trying UTF-8
+    first decoded it as `x\\x00 \\x00=…` with no assumption stated.
+
+    The BOM is stripped from the text for every encoding and recorded in
+    `bom`; U+FEFF is a byte-order mark for UTF-16 and UTF-32 too.
     """
     if not raw:
         return TextFile(text="", encoding="utf-8", bom=False, eol=LF)
 
     for bom, enc in _BOMS:
         if raw.startswith(bom):
+            base = "utf-8" if enc == "utf-8-sig" else enc
             try:
-                text = raw.decode(enc)
-                base = "utf-8" if enc == "utf-8-sig" else enc
+                text = raw[len(bom):].decode(base)
                 return TextFile(text=normalise(text), encoding=base, bom=True,
                                 eol=detect_eol(text),
                                 assumption=_mixed_note(text))
             except UnicodeDecodeError:
                 break
+
+    # UTF-16 without a BOM, common in Windows tooling output: NULs in one
+    # byte position of each pair and (almost) never the other. Positional
+    # rather than a bare NUL count, so a binary blob full of zeroes is not
+    # taken for text.
+    enc16 = _utf16_without_bom(raw)
+    if enc16:
+        try:
+            text = raw.decode(enc16)
+            return TextFile(text=normalise(text), encoding=enc16, bom=False,
+                            eol=detect_eol(text),
+                            assumption=f"decoded as {enc16} (no BOM); "
+                                       f"if the file is something else, "
+                                       f"say so and it will be reread")
+        except UnicodeDecodeError:
+            pass
 
     try:
         text = raw.decode("utf-8")
@@ -178,20 +221,6 @@ def decode(raw: bytes) -> TextFile:
                         eol=detect_eol(text), assumption=_mixed_note(text))
     except UnicodeDecodeError:
         pass
-
-    # A high proportion of NUL bytes in a text file means UTF-16 without a
-    # BOM, which is common in Windows tooling output.
-    if raw.count(b"\x00") > len(raw) // 4:
-        for enc in ("utf-16-le", "utf-16-be"):
-            try:
-                text = raw.decode(enc)
-                return TextFile(text=normalise(text), encoding=enc, bom=False,
-                                eol=detect_eol(text),
-                                assumption=f"decoded as {enc} (no BOM); "
-                                           f"if the file is something else, "
-                                           f"say so and it will be reread")
-            except UnicodeDecodeError:
-                continue
 
     # cp1252 accepts almost any byte, so it is the honest last stop before
     # replacement — and either way the assumption is STATED (C7).
@@ -215,14 +244,33 @@ def decode(raw: bytes) -> TextFile:
                    "corrupt them. It is safer to edit this one by hand.")
 
 
+def _utf16_without_bom(raw: bytes) -> str:
+    """ "utf-16-le" / "utf-16-be" when the NUL pattern says so, else ""."""
+    if len(raw) < 2 or len(raw) % 2:
+        return ""
+    half = len(raw) // 2
+    even, odd = raw[0::2].count(0), raw[1::2].count(0)
+    if odd >= half * 0.3 and even * 4 <= odd:
+        return "utf-16-le"
+    if even >= half * 0.3 and odd * 4 <= even:
+        return "utf-16-be"
+    return ""
+
+
 def read(fs, path: str) -> TextFile:
     """Read through a FileSystemPort and decode (C2)."""
     return decode(fs.read_bytes(path))
 
 
-def write(fs, path: str, tf: TextFile, text: str | None = None) -> None:
-    """Write back in the file's original shape."""
+def write(fs, path: str, tf: TextFile, text: str | None = None) -> str:
+    """Write back in the file's original shape.
+
+    Returns what the write changed beyond the text — widening to UTF-8 —
+    or "", so the caller can say so (C7). Returning a value is new; callers
+    that ignored the old `None` are unaffected.
+    """
     fs.write_bytes(path, tf.encode(text))
+    return tf.encoding_note(text)
 
 
 def project_eol(fs, sample: int = 20) -> str:

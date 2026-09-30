@@ -37,8 +37,9 @@ which is where that bargain is explained and enforced.
 from __future__ import annotations
 
 import builtins
-
 from collections.abc import Callable
+import re
+import sqlite3
 from typing import Any
 
 from .. import langs
@@ -47,6 +48,58 @@ from . import parse_python, parse_regex, parse_treesitter, zoom
 from .store import Store
 
 MAX_TEXT_LOOKUPS = 3          # the fallback's hard cap (M31)
+
+#: Directories never indexed AND never readable through `read_slice`. The
+#: two used to differ: the index skipped `.git/`, the tool happily returned
+#: `.git/config` (a remote URL, perhaps a token) and `.env` to the model —
+#: which, with remote mode on, is outbound context.
+#: The one list of directories nothing indexes, lists or reads as source.
+#: `context.py` extends it rather than keeping copies: it had two of its
+#: own, neither with `.cc_state/` — where the scratch copies autofix works
+#: on and the compiled test harnesses now live — so a project's own build
+#: debris would have been offered to the model as source.
+SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
+             "target", "build", "dist", ".cc_snapshots", ".atk_snapshots",
+             ".cc_journal", ".cc_state", ".ccoder", ".python", ".tools")
+
+#: `read_slice` returns at most this much, whatever it is asked for. One
+#: call returning 400 KB (100 long lines) was observed; that is a context
+#: window spent on one answer.
+READ_SLICE_LINES = 200
+READ_SLICE_BYTES = 16_000
+
+
+def skipped_path(path: str) -> bool:
+    """True for a path under `SKIP_DIRS`, or a `.env` file anywhere.
+
+    By path COMPONENT: the old substring test also skipped `src/rebuild/`
+    because it contains "build/".
+    """
+    parts = [p for p in str(path or "").replace("\\", "/").split("/")
+             if p and p != "."]
+    if not parts:
+        return False
+    return (any(p in SKIP_DIRS for p in parts[:-1])
+            or parts[-1].startswith(".env"))
+
+
+class _BadLine(ValueError):
+    """A line bound the model gave that is not a line number."""
+
+
+def _line_arg(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise _BadLine(str(value))
+    try:
+        return int(str(value).strip())
+    except ValueError as exc:
+        raise _BadLine(str(value)) from exc
+
+
+_BAD_LINE = ("read_slice needs whole line numbers for start and end — for "
+             "example [READ_SLICE: src/app.py, 10, 40]. Nothing was read.")
 
 
 class CodeMap:
@@ -70,6 +123,7 @@ class CodeMap:
         self.force_epoch_per_write = force_epoch_per_write
         self._text_lookups = 0
         self._syntax_corrected = False
+        self._db_error_said = False
 
     def close(self) -> None:
         self.store.close()
@@ -105,30 +159,56 @@ class CodeMap:
             # A parser that throws must not stop an index. The file simply
             # has no symbols known, which the resolution rate will show.
             symbols, edges, unresolved = [], [], []
-        self.store.put_file(path, lang, text, symbols, edges, unresolved)
-        return len(symbols)
+        try:
+            self.store.put_file(path, lang, text, symbols, edges, unresolved)
+        except sqlite3.OperationalError as exc:
+            # Another session holding the lock past busy_timeout, a full
+            # disk, a read-only database: the map is a HINT, and a stale
+            # hint is survivable. An exception out of every write is not.
+            # Said once, not per file, until a write succeeds again.
+            try:
+                self.store.db.rollback()
+            except sqlite3.Error:
+                pass
+            if not self._db_error_said:
+                self._db_error_said = True
+                self._emit("warning",
+                           f"The code map could not be updated ({exc}), so "
+                           f"lookups may describe files as they were. The "
+                           f"build itself is unaffected.")
+            return 0
+        self._db_error_said = False
+        return sum(1 for s in symbols if s.kind != "module")
 
     def index_project(self, *, limit: int = 2000) -> CodemapStats:
-        """Index everything indexable. `.git/` is excluded (M27)."""
-        skip = (".git/", "__pycache__/", "node_modules/", ".venv/", "venv/",
-                "target/", "build/", "dist/", ".cc_snapshots/",
-                ".atk_snapshots/", ".cc_journal/", ".ccoder/",
-                ".python/", ".tools/")
+        """Index everything indexable. `.git/` is excluded (M27).
+
+        And FORGET what is no longer there: `store.forget` existed and
+        nothing called it, so a deleted file stayed indexed — `resolves()`
+        vouched for its functions and the architecture block listed it.
+        Only when the listing itself succeeded: a listing that failed says
+        nothing about what exists.
+        """
         n = 0
         try:
             paths = self.fs.list("*")
+            listed = True
         except Exception:                                # noqa: BLE001
-            paths = []
+            paths, listed = [], False
+        present: set[str] = set()
         for path in sorted(paths):
             norm = str(path).replace("\\", "/")
-            if any(part in norm for part in skip):
+            if skipped_path(norm) or not langs.id_for_path(norm):
                 continue
-            if not langs.id_for_path(norm):
+            present.add(norm)
+            if n >= limit:
                 continue
             self.index_file(norm)
             n += 1
-            if n >= limit:
-                break
+        if listed:
+            for row in self.store.files():
+                if row["path"] not in present:
+                    self.store.forget(row["path"])
         stats = self.store.stats()
         self._emit("status", f"codemap: {zoom.stats_line(stats)}")
         return stats
@@ -159,59 +239,110 @@ class CodeMap:
         invented API here is cheaper than a failed build and far more precise
         — "there is no `parse_config` in this project" is a fixable sentence,
         an ImportError traceback is a puzzle.
-        """
-        if lang_id == "python":
-            _s, _e, unresolved = parse_python.parse(text, "<generated>")
-        else:
-            _s, _e, unresolved = parse_regex.parse(text, "<generated>",
-                                                   lang_id)
-        local = {s.name for s in
-                 (parse_python.parse(text, "<generated>")[0]
-                  if lang_id == "python"
-                  else parse_regex.parse(text, "<generated>", lang_id)[0])}
-        # Names reached THROUGH an import are not invented — `csv.reader` in
-        # a file that says `import csv` is the standard library doing its
-        # job. Flagging it would make this check noise instead of signal,
-        # and a check that cries wolf is a check somebody turns off.
-        if lang_id == "python":
-            imported = set(parse_python.imports_of(text))
-        else:
-            imported = set(parse_regex.imports_of(text, lang_id))
-        import_heads = {str(i).lstrip(".").split(".")[0] for i in imported}
-        import_heads |= {str(i).lstrip(".").rsplit(".", 1)[-1]
-                         for i in imported}
 
-        # Names BOUND in this file — locals, parameters, loop variables — as
-        # opposed to symbols it exports. `screen.fill(...)` where `screen` came
-        # from `pygame.display.set_mode()` is an attribute on a runtime object,
-        # and no static check can say whether `.fill` exists on it. Reporting
-        # it as "a name this project does not define" is both untrue and
-        # noisy: it fired on nearly every generated file, in the same sentence
-        # as the genuinely missing names, which is how `TrackSegment` and
-        # `render_road` went unnoticed until they became ImportErrors.
-        bound = (parse_python.bound_names(text) if lang_id == "python"
-                 else set())
+        A check that cries wolf is a check somebody turns off, so every
+        name the file itself explains is left alone: its own definitions,
+        builtins, locals and parameters (for every language, not just
+        Python — `document.getElementById` and `fmt.Println` used to be
+        reported on nearly every JS and Go file), and names reached through
+        an import of the standard library or an installed package
+        (`import numpy as np; np.array`, `from collections import
+        OrderedDict`). What IS reported: a name that exists nowhere, a name
+        imported from a module that is neither the project's, the standard
+        library's nor installed — even when a local later rebinds it — and
+        a name imported from a project module that does not define it.
+        """
+        python = lang_id == "python"
+        symbols, _e, unresolved = (
+            parse_python.parse(text, "<generated>") if python
+            else parse_regex.parse(text, "<generated>", lang_id))
+        local = {s.name for s in symbols}
+        builtins_ = _BUILTINS.get(lang_id, set())
+
+        # local name → (module, imported name or "")
+        heads: dict[str, tuple[str, str]] = {}
+        if python:
+            for module, name, alias in parse_python.import_bindings(text):
+                if name:
+                    heads[alias or name] = (module, name)
+                else:
+                    heads[alias or module.split(".")[0]] = (module, "")
+            bound = parse_python.bound_names(text)
+        else:
+            for module in parse_regex.imports_of(text, lang_id):
+                tail = re.split(r"[/.:\\]+", str(module).strip("./"))
+                for part in (tail[-1], tail[0]) if tail else ():
+                    if part:
+                        heads.setdefault(part, (str(module), "*"))
+            bound = parse_regex.bound_names(text, lang_id)
 
         out: list[str] = []
-        builtins = _BUILTINS.get(lang_id, set())
         for _src, name, _kind in unresolved:
             raw = str(name)
-            short = raw.split(".")[-1]
-            head = raw.split(".")[0]
-            if head in import_heads or raw in imported:
+            head, short = raw.split(".")[0], raw.split(".")[-1]
+            if head in heads:
+                # Decided by the IMPORT, before the local-binding checks:
+                # `from utils import cfg; cfg = cfg or None; cfg.load()` is
+                # still a name from a module that does not exist.
+                if not self._import_explains(*heads[head], raw):
+                    if raw not in out:
+                        out.append(raw)
                 continue
-            if short in local or short in builtins or raw in local:
+            if raw in local or short in local or head in local:
+                continue      # defined here, or a method on something that is
+            if short in builtins_ or head in builtins_:
                 continue
-            if head in local or head in builtins:
-                continue      # a method on something defined here
-            if "." in raw and head in bound:
-                continue      # attribute on a local object — unknowable, and
-                              # not a claim this check is entitled to make
+            if head in bound:
+                continue      # a local, a parameter, or an attribute on one:
+                              # unknowable, and not a claim this check is
+                              # entitled to make
             if self.store.resolves(raw) or self.store.resolves(short):
                 continue
             if raw not in out:
                 out.append(raw)
         return out
+
+    def _import_explains(self, module: str, name: str, raw: str) -> bool:
+        """Whether an import accounts for a call through `raw`.
+
+        `name` is "" for `import m`, "*" for a non-Python import. Those two
+        are accepted unless `m` is a PROJECT module lacking the attribute:
+        `import pygame` where pygame is not installed beside this engine is
+        still a real dependency, and the run will say so precisely if it
+        is missing. A `from m import n` is judged: standard library or
+        installed → fine; a project module → `n` must exist in the project;
+        anything else is the D4 case, `from utils import parse_config` with
+        no `utils` anywhere, and is reported.
+        """
+        if name == "*":
+            return True
+        status = self._module_status(module)
+        if status == "project":
+            wanted = name or raw.split(".")[-1]
+            return bool(self.store.resolves(wanted))
+        if not name:
+            return True
+        return status in ("stdlib", "installed")
+
+    def _module_status(self, module: str) -> str:
+        """project | stdlib | installed | unknown, for a Python module."""
+        import importlib.util
+        import sys
+
+        module = str(module or "")
+        if module.startswith(".") or self.store._file_for_module(module):
+            return "project"
+        top = module.split(".")[0]
+        if not top.isidentifier():
+            return "unknown"
+        if top in getattr(sys, "stdlib_module_names", ()):
+            return "stdlib"
+        try:
+            if importlib.util.find_spec(top) is not None:
+                return "installed"
+        except (ImportError, ValueError):
+            pass
+        return "unknown"
 
     def blast_radius(self, symbol: str, depth: int = 2) -> dict:
         return self.store.blast_radius(symbol, depth)
@@ -223,7 +354,15 @@ class CodeMap:
             count_tokens=count_tokens)
 
     def prefix_block(self, target: str = "") -> str:
-        """The stable, cacheable architecture block (G.7.1)."""
+        """The stable, cacheable architecture block (G.7.1).
+
+        The epoch's SNAPSHOT (taken by `bump_epoch`), so the bytes change
+        only when the epoch does. Rendered live only before the first
+        epoch, when there is no snapshot yet and nothing cached to protect.
+        """
+        snapshot = self.store.architecture_snapshot()
+        if snapshot is not None:
+            return snapshot
         return zoom.architecture_prefix(self.store, target=target)
 
     def tail_blocks(self, target: str, *, count_tokens=None) -> list[str]:
@@ -321,9 +460,13 @@ class CodeMap:
             if name == "search_codemap":
                 return self._tool_search(str(args.get("name", "")))
             if name == "read_slice":
-                return self._tool_slice(str(args.get("path", "")),
-                                        int(args.get("start", 1) or 1),
-                                        int(args.get("end", 0) or 0))
+                try:
+                    start = _line_arg(args.get("start"), 1)
+                    end = _line_arg(args.get("end"), 0)
+                except _BadLine:
+                    return _BAD_LINE
+                return self._tool_slice(str(args.get("path", "")), start,
+                                        end)
             if name == "list_symbols":
                 return self._tool_symbols(str(args.get("path", "")))
             if name == "run_tests":
@@ -366,6 +509,10 @@ class CodeMap:
         return "\n".join(out)
 
     def _tool_slice(self, path: str, start: int, end: int) -> str:
+        if skipped_path(path):
+            return (f"`{path}` is not something this tool will read: it is "
+                    f"version-control, build, environment or engine state, "
+                    f"not project source. Nothing was read.")
         try:
             text = self.fs.read(path)
         except Exception:                                # noqa: BLE001
@@ -374,14 +521,29 @@ class CodeMap:
                     f"something lives.")
         lines = text.splitlines()
         start = max(1, start)
-        end = min(len(lines), end or (start + 60))
+        end = min(len(lines), end or (start + 60),
+                  start + READ_SLICE_LINES - 1)
         if start > len(lines):
             return f"`{path}` has only {len(lines)} lines."
-        body = "\n".join(f"{n:>5} | {lines[n - 1]}"
-                         for n in range(start, end + 1))
-        tail = ("" if end >= len(lines)
-                else f"\n… {len(lines) - end} more lines follow.")
-        return f"{path} lines {start}-{end} of {len(lines)}:\n{body}{tail}"
+        out: list[str] = []
+        size = 0
+        last = start - 1
+        for n in range(start, end + 1):
+            row = f"{n:>5} | {lines[n - 1]}"
+            if size + len(row) > READ_SLICE_BYTES:
+                if not out:              # one enormous line: show its start
+                    out.append(row[:READ_SLICE_BYTES] + " …(line cut)")
+                    last = n
+                break
+            out.append(row)
+            size += len(row) + 1
+            last = n
+        tail = ""
+        if last < len(lines):
+            tail = (f"\n… {len(lines) - last} more lines follow; ask for "
+                    f"lines {last + 1}-{min(len(lines), last + 60)} next.")
+        return (f"{path} lines {start}-{last} of {len(lines)}:\n"
+                + "\n".join(out) + tail)
 
     def _tool_symbols(self, path: str) -> str:
         rows = self.store.symbols_in(path)
@@ -399,7 +561,7 @@ class CodeMap:
 
     # -- the text-marker fallback (M31) -----------------------------------
     def reset_lookups(self) -> None:
-        """Called at the start of each generation. The cap is PER generation."""
+        """Called at the start of each generation; the cap is PER one."""
         self._text_lookups = 0
         self._syntax_corrected = False
 
@@ -410,14 +572,20 @@ class CodeMap:
         `<search_codemap>x</search_codemap>` all mean the same thing, and a
         model that has drifted between them is not confused about intent.
         """
-        import re
+        # Every form is anchored to the START of a line, and the call form
+        # must be UPPER CASE: case-insensitive and unanchored, the pattern
+        # took `def list_symbols(path):` in the model's own code for a
+        # lookup and spent one of its three on it.
         found: list[tuple[str, str]] = []
         for tool in ("search_codemap", "list_symbols", "read_slice"):
             up = tool.upper()
-            for pattern in (rf"\[{up}:\s*([^\]]+)\]",
-                            rf"\b{up}\(\s*['\"]?([^)'\"]+)['\"]?\s*\)",
-                            rf"<{tool}>\s*(.*?)\s*</{tool}>"):
-                for m in re.finditer(pattern, text, re.I | re.S):
+            for pattern, flags in (
+                    (rf"^[ \t]*\[{up}:\s*([^\]\n]+)\]", re.I),
+                    (rf"^[ \t]*{up}\(\s*['\"]?([^)'\"\n]+)['\"]?\s*\)",
+                     0),
+                    (rf"^[ \t]*<{tool}>\s*(.*?)\s*</{tool}>",
+                     re.I | re.S)):
+                for m in re.finditer(pattern, text or "", flags | re.M):
                     found.append((tool, m.group(1).strip()))
         return found
 
@@ -430,7 +598,8 @@ class CodeMap:
         """
         calls = self.parse_text_lookups(text)
         if not calls:
-            if self._looks_like_broken_call(text) and not self._syntax_corrected:
+            if (self._looks_like_broken_call(text)
+                    and not self._syntax_corrected):
                 self._syntax_corrected = True
                 # Corrected ONCE, and only once (M31). A model told the same
                 # thing three times starts reproducing the correction instead
@@ -453,16 +622,27 @@ class CodeMap:
                 replies.append(self._tool_symbols(arg))
             else:
                 parts = [p.strip() for p in arg.split(",")]
-                replies.append(self._tool_slice(
-                    parts[0], int(parts[1]) if len(parts) > 1 else 1,
-                    int(parts[2]) if len(parts) > 2 else 0))
+                try:
+                    start = _line_arg(parts[1] if len(parts) > 1 else None,
+                                      1)
+                    end = _line_arg(parts[2] if len(parts) > 2 else None, 0)
+                except _BadLine:
+                    replies.append(_BAD_LINE)
+                    continue
+                replies.append(self._tool_slice(parts[0], start, end))
         return "\n\n".join(replies)
 
     @staticmethod
     def _looks_like_broken_call(text: str) -> bool:
-        import re
-        return bool(re.search(r"search[_ ]codemap|list[_ ]symbols",
-                              text or "", re.I))
+        """A malformed MARKER, not the words: a comment saying "list
+        symbols defined here" used to earn the one-time correction."""
+        # The tool's NAME (underscored) not used as a function in code —
+        # `def list_symbols(` and `db.search_codemap(x)` are code — or a
+        # bracket/tag opened around the words.
+        return bool(re.search(
+            r"(?<![\w.])(?:search_codemap|list_symbols|read_slice)\b"
+            r"(?!\s*\()|[\[<][ \t]*(?:search|list|read)[_ ]"
+            r"(?:codemap|symbols|slice)\b", text or "", re.I))
 
     def _emit(self, kind: str, message: str, data: dict | None = None) -> None:
         if self._events is None:
@@ -502,7 +682,14 @@ _BUILTINS: dict[str, set] = {
            "println", "new", "copy", "delete"},
     "javascript": {"console", "require", "JSON", "Math", "Object", "Array",
                    "Promise", "String", "Number", "Boolean", "parseInt",
-                   "parseFloat", "setTimeout", "fetch"},
+                   "parseFloat", "setTimeout", "fetch", "document",
+                   "window", "globalThis", "navigator", "localStorage",
+                   "sessionStorage", "Date", "Map", "Set", "WeakMap",
+                   "Error", "TypeError", "RegExp", "Symbol", "BigInt",
+                   "setInterval", "clearTimeout", "clearInterval", "alert",
+                   "confirm", "prompt", "process", "module", "exports",
+                   "Buffer", "URL", "Reflect", "Proxy", "Intl",
+                   "requestAnimationFrame", "structuredClone"},
     "gdscript": {"print", "printerr", "push_error", "load", "preload",
                  "range", "len", "str", "int", "float", "Vector2", "Vector3",
                  "get_node", "emit_signal", "connect", "is_instance_valid"},

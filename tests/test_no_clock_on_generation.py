@@ -36,12 +36,17 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cognitive_coder import langs, runner                      # noqa: E402
-from cognitive_coder.ports import LocalFileSystem, SubprocessExec   # noqa: E402
-from cognitive_coder.providers.openai_compatible import (      # noqa: E402
-    DEFAULT_TIMEOUT, OpenAICompatible)
-from cognitive_coder.types import PhaseResult, ProcResult, Timeouts  # noqa: E402
-
+from cognitive_coder import langs, runner  # noqa: E402
+from cognitive_coder.ports import LocalFileSystem, SubprocessExec  # noqa: E402
+from cognitive_coder.providers.openai_compatible import (  # noqa: E402
+    DEFAULT_TIMEOUT,
+    OpenAICompatible,
+)
+from cognitive_coder.types import (  # noqa: E402
+    PhaseResult,
+    ProcResult,
+    Timeouts,
+)
 
 # ==========================================================================
 # [1] generation waits as long as it takes

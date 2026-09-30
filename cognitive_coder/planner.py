@@ -55,10 +55,22 @@ from typing import Any
 from . import langs
 from .codemap import parse_python, parse_regex
 from .personas import CONTRACT_LIST, PERSONAS, PromptBuilder, strip_think
-from .types import Plan, Task
+from .types import Edit, Plan, Task
 
 # A file list longer than this is a request that should have been split.
 MAX_FILES = 12
+
+#: WRITTEN INTO EVERY STUB, in the language's own comment syntax, so "is this
+#: still a stub?" has one answer in every language.
+#:
+#: It used to be answered by looking for `NotImplementedError`, which only
+#: the Python stub contains. A JavaScript scaffold — a function with a
+#: `console.log` in it — read as finished work, and after the first file
+#: `replan` marked every remaining task done: a three-file plan built one
+#: file and reported nothing wrong.
+STUB_SENTINEL = "cc-stub:"
+_SENTINEL_TEXT = (f"{STUB_SENTINEL} written by the skeleton; replaced when "
+                  f"this file is built")
 
 
 @dataclass
@@ -85,6 +97,22 @@ class Planner:
     #: that the operator can now raise it instead of rewriting the request
     #: to fit a number they were never told about.
     max_files: int = MAX_FILES
+    #: The skeleton's writes go through this, as ONE transaction: snapshotted,
+    #: approved once, undoable. None only for a planner used on its own (the
+    #: tests do), which falls back to writing directly.
+    patcher: Any = None
+    #: Paths that already had real work in them when the skeleton ran. They
+    #: were NOT stubbed, and `replan` must not mistake their body for this
+    #: session's work and mark their task done.
+    kept_as_found: set = field(default_factory=set)
+    #: Add a tester task for every source file whose test file the plan
+    #: lacks (M39: tests are planned artefacts). The planner prompt has always
+    #: said "Do not list test files — they are paired automatically", and
+    #: nothing paired them. Off by default for one reason, stated plainly: it
+    #: adds a generation per source file, and the committed golden trace and
+    #: several host test suites script their replies for the unpaired plan.
+    #: With it off, a plan no longer PROMISES a test file nothing will write.
+    pair_tests: bool = False
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -99,7 +127,8 @@ class Planner:
         completion = self.host.llm.complete(
             prompt.messages(), temperature=persona.temperature,
             max_tokens=700)
-        rows = _parse_file_list(strip_think(completion.text))
+        rows, not_code = _parse_file_list_with_skipped(
+            strip_think(completion.text))
 
         if not rows:
             # A model that returns nothing usable does not stop the session:
@@ -113,8 +142,20 @@ class Planner:
         #: THE REQUEST NAMED TEST FILES. THE PLAN MUST CONTAIN THEM.
         #: See _required_tests for what this cost when it was missing.
         tasks, added = self._ensure_required_tests(request, tasks, layout)
+        unpaired: list[str] = []
+        if self.pair_tests:
+            tasks, unpaired = self._pair_tests(tasks)
+        tasks = self._unpromise_missing_tests(tasks)
 
         caveats: list[str] = []
+        if unpaired:
+            caveats.append(
+                f"no room to pair {', '.join(unpaired)} with "
+                f"{'a test' if len(unpaired) == 1 else 'tests'} within the "
+                f"plan's limit of {self.max_files} files — "
+                f"{'it' if len(unpaired) == 1 else 'they'} will be built and "
+                f"run, but no test will check "
+                f"{'it' if len(unpaired) == 1 else 'them'}")
         if len(rows) > self.max_files:
             caveats.append(f"the model proposed {len(rows)} files; only the "
                            f"first {self.max_files} were kept — raise the "
@@ -131,13 +172,45 @@ class Planner:
                 f"plan left out: {', '.join(added)} — they were added, "
                 f"because a build that skips the tests it was told to write "
                 f"cannot report whether it worked")
+        planned = {t.path.replace("\\", "/").lower() for t in tasks}
+        unplanned = [p for p in _required_tests(request)
+                     if p.lower() not in planned]
+        if unplanned:
+            caveats.append(
+                f"the request named {', '.join(unplanned)}, but the plan "
+                f"was already at its limit of {self.max_files} files, so "
+                f"{'it was' if len(unplanned) == 1 else 'they were'} NOT "
+                f"added — nothing will check what "
+                f"{'it' if len(unplanned) == 1 else 'they'} would have "
+                f"checked. Raise the plan file limit to include "
+                f"{'it' if len(unplanned) == 1 else 'them'}")
+        if not_code:
+            caveats.append(
+                f"the model also proposed {', '.join(not_code)}, which no "
+                f"language this engine builds owns — left out of the plan; "
+                f"write {'it' if len(not_code) == 1 else 'them'} by hand if "
+                f"the request needs {'it' if len(not_code) == 1 else 'them'}")
+            self.host.emit("warning",
+                           f"the plan left out {', '.join(not_code)}: this "
+                           f"engine only writes source files",
+                           {"phase": "plan", "not_code": not_code})
         plan = Plan(request=request, tasks=tuple(tasks),
                     layout_note=layout.get("note", ""),
                     caveats=tuple(caveats))
         if self.journal is not None:
+            #: `tasks` is what resume rebuilds the plan FROM. The event used
+            #: to carry paths only, and resume invented the rest: every task
+            #: became "(resumed) part of: …", an engineer, in the session's
+            #: language, paired with a test of its own — so a test lost its
+            #: tester and `beta.js` became Python. `files` stays for readers
+            #: of older journals and for `resume_state`.
             self.journal.log("plan", request=request,
                              files=[t.path for t in tasks],
-                             tests=[t.test_path for t in tasks if t.test_path])
+                             tests=[t.test_path for t in tasks if t.test_path],
+                             tasks=[{"path": t.path, "purpose": t.purpose,
+                                     "persona": t.persona, "lang": t.lang,
+                                     "test_path": t.test_path,
+                                     "atomic": t.atomic} for t in tasks])
         self.host.emit("status",
                        f"plan: {len(tasks)} file(s) proposed",
                        {"files": [t.path for t in tasks]})
@@ -186,9 +259,16 @@ class Planner:
             return tasks, []
         have = {t.path.replace("\\", "/").lower() for t in tasks}
         added: list[str] = []
+        no_room: list[str] = []
         out = list(tasks)
         for path in wanted:
-            if path.lower() in have or len(out) >= self.max_files:
+            if path.lower() in have:
+                continue
+            if len(out) >= self.max_files:
+                # Skipped silently, once — the exact omission this method
+                # exists to prevent. Said out loud now; `plan()` also puts
+                # it in the plan's caveats.
+                no_room.append(path)
                 continue
             lang_id = langs.id_for_path(path) or self.lang
             out.append(Task(
@@ -208,7 +288,60 @@ class Planner:
                            f"the plan omitted {len(added)} test file(s) named "
                            f"in the request — added: {', '.join(added)}",
                            {"phase": "plan", "added_tests": added})
+        if no_room:
+            self.host.emit("warning",
+                           f"the request named {', '.join(no_room)}, but the "
+                           f"plan is at its limit of {self.max_files} files "
+                           f"— NOT added",
+                           {"phase": "plan", "tests_not_added": no_room})
         return out, added
+
+    def _pair_tests(self, tasks: list[Task]) -> tuple[list[Task], list[str]]:
+        """(tasks with a tester task per unpaired source file, left out).
+
+        Only where the test file neither exists nor is planned; placed after
+        its module by `derive_order`'s test-follows-its-module rule.
+        """
+        planned = {t.path.replace("\\", "/").lower() for t in tasks}
+        out = list(tasks)
+        unpaired: list[str] = []
+        for task in tasks:
+            if not task.test_path or task.persona == "tester":
+                continue
+            key = task.test_path.replace("\\", "/").lower()
+            if key in planned or self.host.fs.exists(task.test_path):
+                continue
+            if len(out) >= self.max_files:
+                unpaired.append(task.path)
+                continue
+            out.append(Task(
+                id=f"t{len(out) + 1}", path=task.test_path,
+                purpose=f"tests for {task.path}: {task.purpose}",
+                test_path="", persona="tester",
+                lang=langs.id_for_path(task.test_path) or task.lang,
+                atomic=False))
+            planned.add(key)
+        return out, unpaired
+
+    def _unpromise_missing_tests(self, tasks: list[Task]) -> list[Task]:
+        """Clear a `test_path` that nothing will ever write.
+
+        The engineer was told "Its tests live in tests/test_alpha.py and must
+        pass" about a file that was not planned and did not exist — so the
+        claim was false, and a file "verified" under it had been tested by
+        nothing. A test path is kept only when it is planned or on disk.
+        """
+        planned = {t.path.replace("\\", "/").lower() for t in tasks}
+        out = []
+        for t in tasks:
+            if t.test_path and t.test_path.replace("\\", "/").lower() \
+                    not in planned and not self.host.fs.exists(t.test_path):
+                t = Task(id=t.id, path=t.path, purpose=t.purpose,
+                         test_path="", persona=t.persona,
+                         depends_on=t.depends_on, atomic=t.atomic,
+                         lang=t.lang, status=t.status, attempts=t.attempts)
+            out.append(t)
+        return out
 
     # ------------------------------------------------------------------
     def _to_tasks(self, rows: Sequence[tuple[str, str]],
@@ -218,9 +351,10 @@ class Planner:
             path = self.validate_path(path, layout)
             lang_id = langs.id_for_path(path) or self.lang
             is_test = _looks_like_test(path)
+            unpaired = is_test or _in_test_dir(path)
             tasks.append(Task(
                 id=f"t{i + 1}", path=path, purpose=purpose,
-                test_path="" if is_test else self.test_path_for(path, layout),
+                test_path="" if unpaired else self.test_path_for(path, layout),
                 persona="tester" if is_test else "engineer",
                 lang=lang_id, atomic=False))
         return tasks
@@ -281,7 +415,7 @@ class Planner:
         tests = [p for p in code if _looks_like_test(p)]
         dirs: dict[str, int] = {}
         for p in code:
-            if "/" in p and not _looks_like_test(p):
+            if "/" in p and not (_looks_like_test(p) or _in_test_dir(p)):
                 dirs[p.split("/", 1)[0]] = dirs.get(p.split("/", 1)[0], 0) + 1
         src_dir = max(dirs, key=lambda k: dirs[k]) if dirs else \
             (self.src_dir or "")
@@ -325,26 +459,142 @@ class Planner:
         docstrings, `raise NotImplementedError` — no bodies. If the skeleton
         does not import, the ARCHITECTURE is wrong, and finding that out in
         seconds beats finding it out after four files of real work.
+
+        IT IS A WRITE TO SOMEONE'S PROJECT, AND OBEYS THE RULES FOR ONE.
+        This used to call `host.fs.write` for every non-test task,
+        unconditionally. A plan that named an existing file — "extend
+        src/util.py" — replaced the hand-written file with a stub, with no
+        snapshot, no approval and no undo; and under the library default
+        `DenyAll` the stubs and `src/__init__.py` were written anyway while
+        the CLI said "nothing was written". So now:
+
+          * a file that already has real work in it is KEPT AS FOUND: no
+            stub over it, its path stays in the plan, and the caller says so;
+          * every stub and package file goes through ONE patcher
+            transaction, approved once with the whole diff in view,
+            snapshotted, and undoable like any other change;
+          * refused approval means nothing is written, and the result says
+            that rather than reporting a skeleton that does not exist.
         """
-        written: list[str] = []
+        stubs: list[Edit] = []
+        kept: list[str] = []
         for task in plan.tasks:
             if _looks_like_test(task.path):
                 continue
-            stub = self.stub_for(task, plan)
-            self.host.fs.write(task.path, stub)
-            written.append(task.path)
-            if self.codemap is not None:
-                self.codemap.reindex_after_write(task.path)
+            if self._has_real_work(task.path):
+                kept.append(task.path)
+                continue
+            stubs.append(Edit(path=task.path, kind="whole",
+                              new=self.stub_for(task, plan),
+                              note="skeleton stub"))
+        self.kept_as_found = set(kept)
+        if kept:
+            self.host.emit("warning",
+                           f"skeleton: {', '.join(kept)} already "
+                           f"{'has' if len(kept) == 1 else 'have'} real "
+                           f"work in {'it' if len(kept) == 1 else 'them'}, "
+                           f"so no stub was written over "
+                           f"{'it' if len(kept) == 1 else 'them'}",
+                           {"phase": "skeleton", "kept": kept})
 
-        self._make_packages(plan)
+        if self.patcher is None:
+            written, approved = self._write_directly(stubs, plan)
+        else:
+            written, approved = self._write_in_transaction(
+                stubs + self._package_edits(plan))
+
+        if not approved:
+            note = ("the skeleton was not approved, so nothing was written "
+                    "— no stubs and no package files")
+            if self.journal is not None:
+                self.journal.log("skeleton", files=[], ok=True, note=note,
+                                 approved=False, kept=kept)
+            self.host.emit("warning", f"skeleton: {note}",
+                           {"phase": "skeleton", "files": [], "ok": True,
+                            "approved": False})
+            return {"ok": True, "files": [], "note": note,
+                    "approved": False, "kept": kept}
+
+        stub_paths = [e.path for e in stubs]
+        written = [p for p in written if p in stub_paths]
+        if self.codemap is not None:
+            for path in written:
+                self.codemap.reindex_after_write(path)
 
         ok, note = self.verify_skeleton(written)
         if self.journal is not None:
-            self.journal.log("skeleton", files=written, ok=ok, note=note)
+            self.journal.log("skeleton", files=written, ok=ok, note=note,
+                             kept=kept)
         self.host.emit("phase" if ok else "warning",
                        f"skeleton: {note}",
                        {"phase": "skeleton", "files": written, "ok": ok})
-        return {"ok": ok, "files": written, "note": note}
+        return {"ok": ok, "files": written, "note": note, "approved": True,
+                "kept": kept}
+
+    def _has_real_work(self, path: str) -> bool:
+        """Does this path already hold something a stub must not replace?
+
+        Existing, non-empty, and not a stub this engine wrote. Deliberately
+        NOT "has no NotImplementedError": an abstract base class raises it
+        on purpose, and that is exactly the kind of hand-written file a stub
+        would destroy.
+        """
+        try:
+            if not self.host.fs.exists(path):
+                return False
+            text = self.host.fs.read(path)
+        except Exception:                                # noqa: BLE001
+            return False
+        return bool(text.strip()) and not _is_our_stub(text)
+
+    def _write_in_transaction(self, edits: Sequence[Edit]
+                              ) -> tuple[list[str], bool]:
+        """(paths written, approved?) — one transaction, one approval."""
+        if not edits:
+            return [], True
+        parts = []
+        for edit in edits:
+            if not edit.new and not self.host.fs.exists(edit.path):
+                # A preview has nothing to show for an empty new file, and
+                # "no change" beside a file about to be created misleads the
+                # person approving it.
+                parts.append(f"# {edit.path}: new, empty — makes the folder "
+                             f"an importable package")
+            else:
+                parts.append(self.patcher.preview([edit]))
+        summary = (f"skeleton: {len(edits)} stub file"
+                   f"{'s' * (len(edits) != 1)}")
+        try:
+            approved = bool(self.patcher.approval.approve_diff(
+                summary, "\n".join(parts)))
+        except Exception:                                # noqa: BLE001
+            approved = False
+        if not approved:
+            return [], False
+        tx = self.patcher.begin("skeleton", atomic=False)
+        try:
+            results = tx.apply(edits, approve=False, summary=summary)
+        except Exception:
+            tx.rollback("the skeleton could not be written")
+            raise
+        tx.commit(verified=False)        # a stub is written, never verified
+        return [r.path for r in results
+                if r.ok or "no change" in (r.reason or "")], True
+
+    def _write_directly(self, stubs: Sequence[Edit],
+                        plan: Plan) -> tuple[list[str], bool]:
+        """The planner used on its own, with no patcher: the old path."""
+        written = []
+        for edit in stubs:
+            self.host.fs.write(edit.path, edit.new)
+            written.append(edit.path)
+        self._make_packages(plan)
+        return written, True
+
+    def _package_edits(self, plan: Plan) -> list[Edit]:
+        return [Edit(path=p, kind="create", new="",
+                     note="make the folder a package")
+                for p in self._missing_packages(plan)]
 
     def _make_packages(self, plan: Plan) -> None:
         """Give every Python subdirectory an `__init__.py`.
@@ -383,24 +633,34 @@ class Planner:
         being explicit costs nothing and removes the difference between a
         layout that happens to work and one that is meant to.
         """
+        for init in self._missing_packages(plan):
+            try:
+                self.host.fs.write(init, "")
+            except Exception:                                # noqa: BLE001
+                continue          # a folder we cannot write is the write
+                #: jail doing its job, and it is not this method's business
+                #: to argue with it.
+
+    def _missing_packages(self, plan: Plan) -> list[str]:
+        """The `__init__.py` files the plan's Python folders still need."""
         if (self.lang or "python") != "python":
-            return
+            return []
         folders: set[str] = set()
         for task in plan.tasks:
             path = str(task.path).replace("\\", "/")
             if "/" not in path or not path.endswith(".py"):
                 continue
             folders.add(path.rsplit("/", 1)[0])
+        missing = []
         for folder in sorted(folders):
             init = f"{folder}/__init__.py"
             try:
                 if self.host.fs.exists(init):
                     continue
-                self.host.fs.write(init, "")
             except Exception:                                # noqa: BLE001
-                continue          # a folder we cannot write is the write
-                #: jail doing its job, and it is not this method's business
-                #: to argue with it.
+                continue
+            missing.append(init)
+        return missing
 
     def stub_for(self, task: Task, plan: Plan) -> str:
         """A stub that compiles. Written deterministically where possible.
@@ -414,7 +674,7 @@ class Planner:
             imports = [f"from {_module(t.path)} import *"
                        for t in plan.tasks
                        if t.id in task.depends_on]
-            body = [f'"""{task.purpose}"""', ""]
+            body = [f"# {_SENTINEL_TEXT}", f'"""{task.purpose}"""', ""]
             body += imports + ([""] if imports else [])
             body += ["", "def main() -> int:",
                      f'    """{task.purpose}"""',
@@ -424,7 +684,8 @@ class Planner:
             return "\n".join(body)
         scaffold = langs.scaffold_for(lang_id, task.purpose[:40] or "module",
                                       _stem(task.path))
-        return scaffold or f"{_comment(lang_id)} {task.purpose}\n"
+        return _mark_stub(scaffold or f"{_comment(lang_id)} {task.purpose}\n",
+                          lang_id)
 
     def verify_skeleton(self, paths: Sequence[str]) -> tuple[bool, str]:
         """Does the skeleton import/compile? Seconds, not minutes.
@@ -581,7 +842,8 @@ class Planner:
             except Exception:                            # noqa: BLE001
                 continue
             lang_id = task.lang or self.lang
-            names = (parse_python.imports_of(text) if lang_id == "python"
+            names = (_python_import_targets(text, task.path)
+                     if lang_id == "python"
                      else parse_regex.imports_of(text, lang_id))
             for name in names:
                 target = by_module.get(_module(str(name)))
@@ -689,8 +951,8 @@ class Planner:
         #: The dependency runs one way and it is already expressed by the
         #: test-follows-its-module rule in `derive_order`.
         others = [t.id for t in plan.tasks
-                  if t.id not in entries and not _looks_like_test(
-                      next(x.path for x in plan.tasks if x.id == t.id))]
+                  if t.id not in entries and not _looks_like_test(t.path)
+                  and not _in_test_dir(t.path)]
         return {t.id: (set(others) if t.id in entries else set())
                 for t in plan.tasks}
 
@@ -708,8 +970,16 @@ class Planner:
         if not remaining or self.codemap is None:
             return plan
         revised: list[Task] = []
+        kept = getattr(self, "kept_as_found", None) or set()
         for task in plan.tasks:
             if task.status != "pending":
+                revised.append(task)
+                continue
+            if task.path in kept:
+                # Its body was there BEFORE this session: the skeleton kept
+                # it rather than stubbing over it. That is the operator's
+                # work, not evidence the task is done — "extend src/util.py"
+                # must still extend it.
                 revised.append(task)
                 continue
             if self.host.fs.exists(task.path) and _has_body(
@@ -779,28 +1049,47 @@ def _parse_file_list(text: str) -> list[tuple[str, str]]:
     a number, a backtick or an em-dash instead of a hyphen are all fine; a
     "path" with no extension is not a path.
     """
+    return _parse_file_list_with_skipped(text)[0]
+
+
+def _parse_file_list_with_skipped(text: str
+                                  ) -> tuple[list[tuple[str, str]],
+                                             list[str]]:
+    """(rows, paths left out because no language owns them).
+
+    The second list exists because the left-out rows used to vanish:
+    `README.md` and `pyproject.toml` were dropped without a word, and the
+    operator who asked for them found out by their absence.
+    """
     rows: list[tuple[str, str]] = []
+    skipped: list[str] = []
     seen: set[str] = set()
     for m in _LINE.finditer(text or ""):
         path = m.group("path").strip()
         purpose = m.group("purpose").strip(" -—:–\t")
         if not purpose or path in seen:
             continue
-        if not langs.id_for_path(path):
-            continue
         seen.add(path)
+        if not langs.id_for_path(path):
+            skipped.append(path)
+            continue
         rows.append((path, purpose[:200]))
-    return rows
+    return rows, skipped
 
 
 #: A path that is explicitly a test file. Anchored on the FILENAME beginning
 #: `test_`/`spec_` or ending `_test`/`_spec`/`.test`/`.spec`, so `tests/
 #: helpers.py` is not swept up and `src/latest_data.py` is not mistaken for
 #: one. Directory part optional: a request may say `test_math3d.py` alone.
+#: The CamelCase `FooTest.java` / `FooTests.cs` form is included because the
+#: old `_looks_like_test` accepted it and dropping it would be a regression
+#: for Java, Kotlin and C#. It needs a CAPITAL `Test`, so `Contest.java` and
+#: `Attest.kt` stay modules.
 _TEST_PATH = re.compile(
     r"(?<![\w/.\\])"
     r"(?P<path>(?:[\w.-]+[/\\])*"
-    r"(?:(?:test|spec)_[\w-]+|[\w-]+(?:_(?:test|spec)|\.(?:test|spec)))"
+    r"(?:(?:test|spec)_[\w-]+|[\w-]+(?:_(?:test|spec)|\.(?:test|spec))"
+    r"|[A-Z][A-Za-z0-9]*(?:Tests?|Spec))"
     r"\.\w{1,4})"
     r"(?![\w])")
 
@@ -850,11 +1139,30 @@ def _plan_prompt(request: str, lang: str, layout: dict) -> str:
 
 
 def _looks_like_test(path: str) -> bool:
-    name = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
-    stem = name.split(".")[0]
-    return (stem.startswith("test_") or stem.endswith("_test")
-            or stem.endswith("test") and len(stem) > 4
-            or "/test" in str(path).replace("\\", "/").lower())
+    """Is this a test file? ONE definition, shared with `_required_tests`.
+
+    This used to be looser than `_TEST_PATH`: any stem ending in "test", or
+    any path containing "/test". So `src/contest.py`, `src/attest.py` and
+    `src/testimonials.py` got the tester persona and no stub, while the
+    same paths named in a request were (correctly) not required tests. Two
+    definitions of one idea disagree eventually; now there is one.
+    """
+    name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(_TEST_PATH.fullmatch(name)
+                or _TEST_PATH.fullmatch(name.lower()))
+
+
+_TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__"}
+
+
+def _in_test_dir(path: str) -> bool:
+    """Support code that lives with the tests: fixtures, helpers, conftest.
+
+    Not a test file — but not a module that should be paired with a test of
+    its own, or counted when working out where the project keeps sources.
+    """
+    parts = str(path).replace("\\", "/").split("/")[:-1]
+    return any(part.lower() in _TEST_DIRS for part in parts)
 
 
 def _module(path: str) -> str:
@@ -865,6 +1173,52 @@ def _module(path: str) -> str:
     if p.endswith("/__init__"):
         p = p[:-len("/__init__")]
     return p.strip("/").replace("/", ".")
+
+
+def _python_import_targets(text: str, importer: str) -> list[str]:
+    """Every dotted module a Python file's imports could mean, resolved.
+
+    `parse_python.imports_of` returns what an import statement NAMES, which
+    is right for the codemap and not enough for ordering. The two idioms
+    models use most defeated it, and the render-before-track failure in the
+    CHANGELOG survived for exactly those two:
+
+      * `from .track import T` names `.track`, which means nothing until it
+        is resolved against the importer's own package — `src.track`;
+      * `from src import track` names `src`, when the dependency is on
+        `src.track`. So each imported name is also tried as a submodule.
+
+    Candidates that are not project modules simply match nothing.
+    """
+    import ast
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    module = _module(importer)
+    is_package = importer.replace("\\", "/").endswith("/__init__.py")
+    package = module if is_package else (
+        module.rsplit(".", 1)[0] if "." in module else "")
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".") if package else []
+                up = node.level - 1
+                if up > len(parts):
+                    continue                 # climbs out of the project
+                base_parts = parts[:len(parts) - up] if up else parts
+                base = ".".join(base_parts + (
+                    [node.module] if node.module else []))
+            else:
+                base = node.module or ""
+            if base:
+                out.append(base)
+            out.extend(f"{base}.{alias.name}" if base else alias.name
+                       for alias in node.names if alias.name != "*")
+    return out
 
 
 def _stem(path: str) -> str:
@@ -878,12 +1232,63 @@ def _comment(lang_id: str) -> str:
 
 
 def _has_body(fs: Any, path: str, lang_id: str) -> bool:
-    """Is this a real implementation or still a stub?"""
+    """Is this a real implementation or still a stub?
+
+    The sentinel answers it in every language. The `NotImplementedError`
+    check stays as the fallback for Python stubs written before the
+    sentinel existed.
+    """
     try:
         text = fs.read(path)
     except Exception:                                    # noqa: BLE001
         return False
+    if STUB_SENTINEL in text:
+        return False
     return bool(text.strip()) and "NotImplementedError" not in text
+
+
+def _is_our_stub(text: str) -> bool:
+    """Did this engine's skeleton write this file?
+
+    The sentinel, or the old Python stub's own marker line — so a stub left
+    by an earlier run can be replaced while an abstract base class that
+    raises NotImplementedError on purpose cannot.
+    """
+    return STUB_SENTINEL in text or (
+        "NotImplementedError(" in text and "is not written yet" in text)
+
+
+def _mark_stub(text: str, lang_id: str) -> str:
+    """The stub with its sentinel comment, placed where it cannot hurt.
+
+    After a shebang or `@echo off`, never before: a script whose first line
+    is a comment is no longer a script. The block form is used where the
+    language declares one, because C's scaffold avoids `//` for a reason.
+    """
+    lang = langs.get(lang_id)
+    if lang and lang.block_comment:
+        line = f"{lang.block_comment[0]} {_SENTINEL_TEXT} " \
+               f"{lang.block_comment[1]}"
+    else:
+        line = f"{_comment(lang_id)} {_SENTINEL_TEXT}"
+    lines = text.split("\n")
+    first = lines[0].strip().lower() if lines else ""
+    at = 1 if first.startswith(("#!", "@echo off", "<?php")) else 0
+    return "\n".join(lines[:at] + [line] + lines[at:])
+
+
+def strip_stub_sentinel(code: str) -> str:
+    """Generated code, minus a copied stub marker.
+
+    A model shown the stub may echo its marker line into the real file,
+    which would then read as a stub forever: `replan` would treat its task
+    as unwritten and a later skeleton as replaceable. Only a line carrying
+    the full sentinel text is removed.
+    """
+    if _SENTINEL_TEXT not in code:
+        return code
+    return "\n".join(ln for ln in code.split("\n")
+                     if _SENTINEL_TEXT not in ln)
 
 
 def _topological(tasks: Sequence[Task],

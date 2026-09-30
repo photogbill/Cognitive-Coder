@@ -42,6 +42,7 @@ Placeholders in command templates:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
 from typing import Any
 
 
@@ -62,16 +63,44 @@ class Lang:
     build_cmd: list = field(default_factory=list)
     run_cmd: list = field(default_factory=list)
     test_cmd: list = field(default_factory=list)
+    # A SECOND test step, run only when `test_cmd` succeeds, for toolchains
+    # whose test command merely BUILDS a harness. Rust's `rustc --test`
+    # exits 0 having run nothing, and a `#[test]` asserting false used to
+    # verify ok because the harness was compiled and never executed (C4).
+    test_run_cmd: list = field(default_factory=list)
+    # Test files are FOUND and appended to `test_cmd` when this is set
+    # (basename patterns; a file under a `test`/`tests`/`__tests__`
+    # directory also counts). For runners that take files, not a folder:
+    # Node >= 21 reads `node --test <dir>` as one file name and fails with
+    # "Could not find", so JavaScript could never verify.
+    test_files: tuple[str, ...] = ()
+    # How to run ONE test file — the task's own (`Task.test_path`). With
+    # only a whole-suite command, one failing test anywhere was attributed
+    # to every later file and blocked the rest of the build. `{test}` is the
+    # file, `{testdir}` its folder, `{testname}` its basename.
+    test_one_cmd: list = field(default_factory=list)
     syntax_cmd: list = field(default_factory=list)   # cheap pre-check
     fmt_tools: tuple[str, ...] = ()
     fmt_cmd: list = field(default_factory=list)
     lint_tools: tuple[str, ...] = ()
     lint_cmd: list = field(default_factory=list)
     fix_cmd: list = field(default_factory=list)      # `--fix`-able rules (F1)
+    # Per-tool argv, for a slot whose tools do not share a command line.
+    # Keyed "role:tool" ("lint:ruff"); `cmd_for` falls back to the slot's
+    # generic template. Python's slots accept black/ruff and ruff/flake8,
+    # and one template cannot serve both: `ruff file` has been rejected
+    # since ruff 0.5 ("unrecognized subcommand"), so Python linting and
+    # formatting silently did nothing whenever ruff was the tool found.
+    tool_cmds: dict = field(default_factory=dict)
     entry: str = "main"            # conventional entry filename stem
     scaffold: str = ""             # a file that compiles and runs as-is
     test_scaffold: str = ""        # a test file the loop can run
     stub_style: str = "raise"      # raise | todo | empty — how stubs are made
+    # Run on the interpreter running THIS engine when the ExecPort can see
+    # it. Python's note promised that "no toolchain detection can fail", but
+    # `run_tools` probed PATH, where `python` may be absent, a different
+    # version, or 3.12+ turning a zero-test run into exit status 5.
+    prefer_self: bool = False
     cascades: bool = False         # one error produces many (F7)
     # HOW LONG TO WAIT ON THE PROGRAM — never on the model. These three are
     # the only clocks left in a build, they apply to the code being verified,
@@ -114,6 +143,10 @@ class Lang:
     def which_run(self, ex: Any) -> str:
         if not self.run_tools:            # compiled: the artefact IS the exe
             return "-"
+        if self.prefer_self and sys.executable:
+            found = ex.which(sys.executable)
+            if found:
+                return found
         for t in self.run_tools:
             found = ex.which(t)
             if found:
@@ -126,6 +159,37 @@ class Lang:
             if found:
                 return found
         return ""
+
+    def cmd_for(self, role: str, tool: str) -> list:
+        """The argv template for `role` ("lint", "fmt", "fix") run by
+        `tool` — its own entry in `tool_cmds`, else the slot's generic one.
+        """
+        name = str(tool).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        own = self.tool_cmds.get(f"{role}:{name}")
+        if own is not None:
+            return list(own)
+        return list(getattr(self, f"{role}_cmd", []) or [])
+
+    def fix_command(self, ex: Any) -> tuple[str, list]:
+        """(tool, argv template) for the auto-fixer, or ("", []).
+
+        The template names its own slot — `{lint}` or `{fmt}` — and the
+        tool is taken from THAT slot. Go's fixer is `{fmt} -w` (gofmt), but
+        the fixer used to be chosen from the lint tools first, so it ran
+        `go -w file`: an error dressed up as a fix.
+        """
+        for slot, tools in (("{lint}", self.lint_tools),
+                            ("{fmt}", self.fmt_tools)):
+            tool = self.which_tool(ex, tools)
+            if not tool:
+                continue
+            cmd = self.cmd_for("fix", tool)
+            if cmd and any(slot in str(part) for part in cmd):
+                return tool, cmd
+        return "", []
 
     def available(self, ex: Any) -> bool:
         """Is at least one usable toolchain present RIGHT NOW?"""
@@ -160,13 +224,26 @@ def _add(lang: Lang) -> Lang:
 
 _add(Lang(
     id="python", label="Python", ext=".py", exts=(".py", ".pyw"),
-    comment="#", run_tools=("python", "python3", "py"),
+    comment="#", run_tools=("python", "python3", "py"), prefer_self=True,
     run_cmd=["{run}", "{src}"],
     test_cmd=["{run}", "-m", "unittest", "discover", "-s", "{dir}", "-p",
               "test_*.py", "-v"],
+    # discover, narrowed to one file: it imports the file as a top-level
+    # module from its own folder, so `tests/` needs no `__init__.py`, and
+    # the project root is on PYTHONPATH for `from src.x import y`.
+    test_one_cmd=["{run}", "-m", "unittest", "discover", "-s", "{testdir}",
+                  "-p", "{testname}", "-v"],
     fmt_tools=("black", "ruff"), fmt_cmd=["{fmt}", "-q", "{src}"],
     lint_tools=("ruff", "pyflakes", "flake8"), lint_cmd=["{lint}", "{src}"],
-    fix_cmd=["{lint}", "check", "--fix", "--quiet", "{src}"],
+    # No generic fixer: of the lint tools only ruff has --fix, and
+    # `flake8 check --fix` is not a fix. See `tool_cmds`.
+    tool_cmds={
+        "fmt:ruff": ["{fmt}", "format", "--quiet", "--no-cache", "{src}"],
+        "lint:ruff": ["{lint}", "check", "--output-format=concise",
+                      "--no-cache", "{src}"],
+        "fix:ruff": ["{lint}", "check", "--fix", "--quiet", "--no-cache",
+                     "{src}"],
+    },
     stub_style="raise",
     notes="The safe default: the interpreter running this engine can always "
           "run Python, so no toolchain detection can fail.",
@@ -267,11 +344,12 @@ int main() {{
 
 _add(Lang(
     id="rust", label="Rust", ext=".rs", exts=(".rs",), compiled=True,
-    cascades=True, build_tools=("rustc",),
+    block_comment=("/*", "*/"), cascades=True, build_tools=("rustc",),
     build_cmd=["{build}", "--edition", "2021", "-o", "{out}", "{src}"],
     run_cmd=["{out}"],
     test_cmd=["{build}", "--edition", "2021", "--test", "-o", "{out}",
               "{src}"],
+    test_run_cmd=["{out}"],
     fmt_tools=("rustfmt",), fmt_cmd=["{fmt}", "{src}"],
     lint_tools=("clippy-driver",), lint_cmd=["{lint}", "{src}"],
     notes="Single-file rustc, not cargo — cargo wants a network for the "
@@ -294,7 +372,8 @@ mod tests {{
 
 _add(Lang(
     id="java", label="Java", ext=".java", exts=(".java",), compiled=True,
-    cascades=True, build_tools=("javac",), run_tools=("java",),
+    block_comment=("/*", "*/"), cascades=True, build_tools=("javac",),
+    run_tools=("java",),
     build_cmd=["{build}", "-d", "{dir}", "{src}"],
     run_cmd=["{run}", "-cp", "{dir}", "{stem}"],
     entry="Main",
@@ -312,7 +391,7 @@ public class {stem} {{
 
 _add(Lang(
     id="go", label="Go", ext=".go", exts=(".go",), compiled=True,
-    build_tools=("go",),
+    block_comment=("/*", "*/"), build_tools=("go",),
     build_cmd=["{build}", "build", "-o", "{out}", "{src}"],
     syntax_cmd=["{build}", "vet", "{src}"],
     run_cmd=["{out}"],
@@ -333,6 +412,7 @@ func main() {{
 
 _add(Lang(
     id="csharp", label="C#", ext=".cs", exts=(".cs",), compiled=True,
+    block_comment=("/*", "*/"),
     build_tools=("dotnet", "csc"), run_tools=("dotnet",),
     build_cmd=["{build}", "build"],
     run_cmd=["{run}", "run", "--project", "{dir}"],
@@ -346,15 +426,19 @@ Console.WriteLine("hello from {title}");
 
 _add(Lang(
     id="javascript", label="JavaScript (Node)", ext=".js",
-    exts=(".js", ".mjs", ".cjs"),
+    exts=(".js", ".mjs", ".cjs"), block_comment=("/*", "*/"),
     run_tools=("node",), run_cmd=["{run}", "{src}"],
     syntax_cmd=["{run}", "--check", "{src}"],
-    test_cmd=["{run}", "--test", "{dir}"],
+    test_cmd=["{run}", "--test"],
+    test_files=("*.test.js", "*.test.mjs", "*.test.cjs", "*_test.js",
+                "*_test.mjs", "*-test.js", "*-test.mjs", "test_*.js",
+                "test_*.mjs", "test-*.js", "test-*.mjs", "test.js"),
     fmt_tools=("prettier",), fmt_cmd=["{fmt}", "--write", "{src}"],
     lint_tools=("eslint",), lint_cmd=["{lint}", "{src}"],
     fix_cmd=["{lint}", "--fix", "{src}"],
     notes="Node's built-in test runner (--test) is used, so no npm install "
-          "and no network.",
+          "and no network. The test files are found and named explicitly: "
+          "Node reads a bare directory argument as a file.",
     install_hint="Node.js LTS.",
     scaffold='''// {title}
 function main() {{
@@ -376,7 +460,8 @@ test("main runs", () => {{
 
 _add(Lang(
     id="typescript", label="TypeScript", ext=".ts", exts=(".ts", ".tsx"),
-    compiled=True, build_tools=("tsc",), run_tools=("node",),
+    block_comment=("/*", "*/"), compiled=True, build_tools=("tsc",),
+    run_tools=("node",),
     build_cmd=["{build}", "--outDir", "{dir}", "--target", "es2022",
                "--module", "es2022", "{src}"],
     syntax_cmd=["{build}", "--noEmit", "{src}"],
@@ -453,7 +538,7 @@ main "$@"
 
 _add(Lang(
     id="powershell", label="PowerShell", ext=".ps1", exts=(".ps1", ".psm1"),
-    comment="#", run_tools=("pwsh", "powershell"),
+    comment="#", block_comment=("<#", "#>"), run_tools=("pwsh", "powershell"),
     run_cmd=["{run}", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
              "{src}"],
     notes="Always present on Windows. Useful for the automation a Windows "
@@ -468,7 +553,8 @@ Main
 
 _add(Lang(
     id="lua", label="Lua", ext=".lua", exts=(".lua",),
-    comment="--", run_tools=("lua", "luajit"), run_cmd=["{run}", "{src}"],
+    comment="--", block_comment=("--[[", "]]"),
+    run_tools=("lua", "luajit"), run_cmd=["{run}", "{src}"],
     syntax_cmd=["{run}", "-e", "loadfile('{src}')"],
     install_hint="A single small binary — the easiest toolchain here.",
     scaffold='''-- {title}
@@ -482,9 +568,11 @@ return main()
 
 _add(Lang(
     id="ruby", label="Ruby", ext=".rb", exts=(".rb",),
-    comment="#", run_tools=("ruby",), run_cmd=["{run}", "{src}"],
+    comment="#", block_comment=("=begin", "=end"), run_tools=("ruby",),
+    run_cmd=["{run}", "{src}"],
     syntax_cmd=["{run}", "-c", "{src}"],
     test_cmd=["{run}", "-Itest", "{src}"],
+    test_one_cmd=["{run}", "-Itest", "{test}"],
     lint_tools=("rubocop",), lint_cmd=["{lint}", "{src}"],
     fix_cmd=["{lint}", "-a", "{src}"],
     scaffold='''# {title}
@@ -498,7 +586,7 @@ main if __FILE__ == $PROGRAM_NAME
 
 _add(Lang(
     id="sql", label="SQL (SQLite)", ext=".sql", exts=(".sql",),
-    comment="--", run_tools=("sqlite3",),
+    comment="--", block_comment=("/*", "*/"), run_tools=("sqlite3",),
     run_cmd=["{run}", "-batch", "{dir}/scratch.db"],
     notes="Runs against a scratch database inside the workspace, never "
           "against the host's own state. Statements are piped in on stdin.",
@@ -603,12 +691,49 @@ def test_scaffold_for(lang_id: str, title: str = "scratch",
     return lang.test_scaffold.format(title=title, stem=stem)
 
 
+#: Directories never searched for tests: dependencies, and the engine's own
+#: state — a scratch copy left by a crash must not be run as a test.
+_NOT_TESTS = ("node_modules", "target", "build", "dist", "venv")
+
+
+def find_test_files(fs: Any, lang: Lang) -> list[str]:
+    """Root-relative test files for a language that takes them explicitly.
+
+    Matched on the basename against `lang.test_files`, or by living under a
+    `test`, `tests` or `__tests__` directory. Dot-directories are skipped:
+    `.git`, `.cc_state`, `.cc_snapshots` hold nothing that should run.
+    """
+    import fnmatch
+    if not lang.test_files:
+        return []
+    try:
+        paths = fs.list("*")
+    except Exception:                                    # noqa: BLE001
+        return []
+    exts = tuple({p.rsplit(".", 1)[-1] for p in lang.test_files})
+    out = []
+    for raw in paths:
+        rel = str(raw).replace("\\", "/")
+        parts = rel.split("/")
+        if any(p.startswith(".") or p in _NOT_TESTS for p in parts[:-1]):
+            continue
+        name = parts[-1]
+        if any(fnmatch.fnmatch(name, pat) for pat in lang.test_files) or (
+                name.rsplit(".", 1)[-1] in exts
+                and any(p in ("test", "tests", "__tests__")
+                        for p in parts[:-1])):
+            out.append(rel)
+    return sorted(out)
+
+
 def render(cmd: list, *, build: str = "", run: str = "", fmt: str = "",
            lint: str = "", src: str = "", out: str = "", dirpath: str = "",
-           stem: str = "") -> list[str]:
+           stem: str = "", test: str = "", testdir: str = "",
+           testname: str = "") -> list[str]:
     """Fill a command template. Returns a real argv list, never a string."""
     subs = {"build": build, "run": run, "fmt": fmt, "lint": lint,
-            "src": src, "out": out, "dir": dirpath, "stem": stem}
+            "src": src, "out": out, "dir": dirpath, "stem": stem,
+            "test": test, "testdir": testdir, "testname": testname}
     return [str(part).format(**subs) for part in cmd]
 
 

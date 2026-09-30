@@ -188,11 +188,14 @@ def make_provider(name: str, *, gate: RemoteGate | None = None,
     ctor, declared_remote, _why = _REGISTRY[key]
 
     # A provider that is remote BY DESIGN checks the gate in its own
-    # constructor, so it has to be handed one. Passing it only where the
-    # constructor accepts it keeps the local providers' signatures clean —
-    # `OpenAICompatible` has no business knowing what a gate is when it is
-    # pointed at 127.0.0.1.
-    if declared_remote and "gate" not in kwargs:
+    # constructor, so it has to be handed one. So does one that is remote
+    # BY URL: `openai_compatible` used to be left without it, on the theory
+    # that it had no business knowing what a gate is at 127.0.0.1 — and at a
+    # public URL it then sent the raw prompt with no approval, no redaction
+    # and no byte count, because the gate below is consulted once, here, and
+    # never again. It is handed to every constructor that accepts one.
+    if "gate" not in kwargs and (declared_remote
+                                 or _accepts(ctor, "gate")):
         kwargs["gate"] = gate
 
     try:
@@ -216,6 +219,18 @@ def make_provider(name: str, *, gate: RemoteGate | None = None,
             f"sent. Turn on remote mode for this session if that is what "
             f"you want.")
     return provider
+
+
+def _accepts(ctor: Callable[..., Any], name: str) -> bool:
+    """Whether `ctor` takes keyword `name` (or **kwargs)."""
+    import inspect
+
+    try:
+        params = inspect.signature(ctor).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def register(name: str, ctor: Callable[..., Any], *, remote: bool,

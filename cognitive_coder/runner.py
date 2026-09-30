@@ -48,9 +48,16 @@ from .types import Diagnostic, PhaseResult, ProcResult, RunResult, Timeouts
 # Environment handed to every child process. Deliberately minimal: whatever is
 # in the operator's environment — tokens, proxies, licence servers — has no
 # business in a build of generated code.
+#
+# Kept: what a toolchain needs merely to START. Go on Windows fails without
+# LOCALAPPDATA (its build cache lives there), .NET and npm read APPDATA and
+# ProgramData, a compiler linked against a private libdir needs
+# LD_LIBRARY_PATH, and Windows tools look for SystemDrive. None of them is
+# a credential or a network path.
 _KEEP_FROM_ENV = ("PATH", "SystemRoot", "windir", "COMSPEC", "HOME",
                   "USERPROFILE", "LANG", "LC_ALL", "PATHEXT", "NUMBER_OF_"
-                  "PROCESSORS", "PROCESSOR_ARCHITECTURE")
+                  "PROCESSORS", "PROCESSOR_ARCHITECTURE", "LOCALAPPDATA",
+                  "APPDATA", "ProgramData", "LD_LIBRARY_PATH", "SystemDrive")
 
 _FORCED_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
@@ -62,6 +69,10 @@ _FORCED_ENV = {
     "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
     "DOTNET_NOLOGO": "1",
     "GODOT_SUPPRESS_UPDATE_CHECK": "1",
+    # ruff otherwise drops `.ruff_cache/` into its working directory or the
+    # project root — observed as three files appearing in the operator's
+    # tree after one autofix, written without anybody approving anything.
+    "RUFF_NO_CACHE": "true",
     # Explicitly emptied rather than merely absent, so a child that reads
     # them gets "" instead of inheriting from a parent shell.
     "HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "",
@@ -152,38 +163,48 @@ def _phase(ex: Any, name: str, argv: Sequence[str], *, cwd: str,
 # this earns is narrow and gets said out loud in a caveat: the program STARTED
 # and STAYED UP. Nobody watched it play.
 
-#: Import names that mean "this process is designed to outlive its launch".
-#: Keyed by language, matched against the source. Deliberately imports and
-#: call signatures rather than heuristics like `while True` — a marker that
-#: guesses would eventually excuse a real hang.
-_MAIN_LOOP_MARKERS: dict[str, tuple[str, ...]] = {
+#: What means "this process is designed to outlive its launch", per language:
+#: (pattern, view). Imports and loop calls, never heuristics like `while
+#: True` — a marker that guesses would eventually excuse a real hang.
+#:
+#: Matched against CODE: comments and strings are blanked first (`view` is
+#: "bare"), except where the marker IS a string — a JS module name, a Go
+#: import path ("text": comments blanked only). And with word boundaries.
+#: Observed: `# TODO: port the UI to tkinter later` made a deadlocked
+#: script "ok — still running", and `wx` matched inside `bwxyz`.
+_PY_LOOP_MODULES = (
+    "pygame", "pyglet", "arcade", "panda3d", "ursina", "raylib", "pyray",
+    "tkinter", "Tkinter", "PySide6", "PySide2", "PyQt6", "PyQt5", "wx",
+    "kivy", "dearpygui", "customtkinter", "flask", "fastapi", "uvicorn",
+    "gunicorn", "waitress", "aiohttp", r"http\.server", "socketserver",
+    "SimpleHTTPServer", "django", "streamlit", "gradio")
+_JS_LOOP = (
+    (r"(?:\brequire\s*\(\s*|\bfrom\s+)['\"](?:express|fastify|koa|"
+     r"socket\.io|@hapi/hapi)['\"]", "text"),
+    (r"\bcreateServer\s*\(|\bapp\.listen\s*\(", "bare"))
+_MAIN_LOOP_MARKERS: dict[str, tuple[tuple[str, str], ...]] = {
     "python": (
-        # games / graphics
-        "pygame", "pyglet", "arcade", "panda3d", "ursina", "raylib",
-        # GUI toolkits
-        "tkinter", "Tkinter", "PySide6", "PySide2", "PyQt6", "PyQt5",
-        "wx", "kivy", "dearpygui", "customtkinter",
-        # servers
-        "flask", "fastapi", "uvicorn", "gunicorn", "waitress", "aiohttp",
-        "http.server", "socketserver", "SimpleHTTPServer", "django",
-        "streamlit", "gradio",
-        # explicit loop calls
-        ".mainloop(", ".exec()", ".exec_()", "serve_forever(", "run_forever(",
-    ),
-    "javascript": ("express", "http.createServer", "app.listen(",
-                   "createServer(", "fastify", "koa", "socket.io"),
-    "typescript": ("express", "http.createServer", "app.listen(",
-                   "createServer(", "fastify", "koa", "socket.io"),
-    "go": ("http.ListenAndServe", "ListenAndServe(", "ebiten", "raylib"),
-    "rust": ("actix_web", "axum", "rocket", "warp", "bevy", "ggez",
-             "macroquad", "winit"),
-    "csharp": ("Application.Run", "MonoGame", "Microsoft.Xna",
-               "WebApplication.", "app.Run("),
-    "java": ("ServerSocket", "SpringApplication.run", "JFrame",
-             "Application.launch"),
-    "cpp": ("SDL_Init", "glfwInit", "glutMainLoop", "QApplication"),
-    "c": ("SDL_Init", "glfwInit", "glutMainLoop"),
+        (r"^[ \t]*(?:from[ \t]+|import[ \t]+(?:[\w.]+[ \t]*(?:as[ \t]+\w+)?"
+         r"[ \t]*,[ \t]*)*)(?:" + "|".join(_PY_LOOP_MODULES) + r")\b",
+         "bare"),
+        (r"\.mainloop\s*\(|\.exec_?\s*\(\s*\)|\bserve_forever\s*\(|"
+         r"\brun_forever\s*\(", "bare")),
+    "javascript": _JS_LOOP,
+    "typescript": _JS_LOOP,
+    "go": ((r"\"[^\"\n]*\b(?:ebiten|raylib)\b[^\"\n]*\"", "text"),
+           (r"\bListenAndServe\w*\s*\(", "bare")),
+    "rust": ((r"\b(?:actix_web|axum|rocket|warp|bevy|ggez|macroquad|"
+              r"winit)\b", "bare"),),
+    "csharp": ((r"\bApplication\.Run\b|\bMonoGame\b|\bMicrosoft\.Xna\b|"
+                r"\bWebApplication\.|\bapp\.Run\s*\(", "bare"),),
+    "java": ((r"\bServerSocket\b|\bSpringApplication\.run\b|\bJFrame\b|"
+              r"\bApplication\.launch\b", "bare"),),
+    "cpp": ((r"\bSDL_Init\b|\bglfwInit\b|\bglutMainLoop\b|"
+             r"\bQApplication\b", "bare"),),
+    "c": ((r"\bSDL_Init\b|\bglfwInit\b|\bglutMainLoop\b", "bare"),),
 }
+_LOOP_COMPILED = {k: tuple((re.compile(p, re.M), v) for p, v in rules)
+                  for k, rules in _MAIN_LOOP_MARKERS.items()}
 
 #: Text that means the program was already in trouble when the clock ran out.
 #: Lowercased substring match against combined output.
@@ -194,9 +215,12 @@ _CRASHED = ("traceback (most recent call last)", "segmentation fault",
 
 
 def has_main_loop(code: str, lang_id: str) -> bool:
-    """Is this a program designed not to exit?"""
-    markers = _MAIN_LOOP_MARKERS.get(lang_id, ())
-    return any(m in code for m in markers)
+    """Is this a program designed not to exit? Judged on code, not prose."""
+    rules = _LOOP_COMPILED.get(lang_id, ())
+    if not rules or not code:
+        return False
+    text, bare = guard.views(code, lang_id)
+    return any(p.search(text if v == "text" else bare) for p, v in rules)
 
 
 def _still_running(phase: PhaseResult, code: str, lang_id: str) -> bool:
@@ -335,7 +359,7 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
     if not already:
         fs.write(src_rel, code)
     src = _join(root, src_rel)
-    out_path = _join(root, stem + (".exe" if os.name == "nt" else ".bin"))
+    out_path = _artefact(fs, root, stem + _EXE)
     phases: list[PhaseResult] = []
     caveats: list[str] = []
 
@@ -354,8 +378,10 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
                 or "\n".join(p.output for p in phases))
         diags: tuple[Diagnostic, ...] = ()
         if not ok:
+            # `root`, so a traceback raised inside a library is located in
+            # the project's own deepest frame — one the model can fix.
             diags = tuple(diagnostics.attach_source(
-                diagnostics.parse(text, lang_id), fs,
+                diagnostics.parse(text, lang_id, root=root), fs,
                 sources={src_rel: code}))
         return RunResult(ok=ok, lang=lang_id, phases=tuple(phases),
                          diagnostics=diags,
@@ -426,9 +452,66 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
     return finish(phases[-1].ok)
 
 
+#: Where compiled artefacts go — the program's binary and a test harness.
+#: Not the project root: `<root>/main.bin` was litter beside the operator's
+#: sources, and a harness written to `<root>/<stem>` collides with any file
+#: or folder of that name. Beside the scratch copies, in the engine's state.
+BUILD_DIR = ".cc_state/build"
+_EXE = ".exe" if os.name == "nt" else ".bin"
+
+
+def _artefact(fs: Any, root: str, name: str) -> str:
+    """The exec-side path for a build artefact, its folder made to exist.
+
+    Compilers do not create the parent of `-o` (rustc: "couldn't create a
+    temp dir"), and the only directory-making primitive a FileSystemPort
+    has is writing a file — so the folder is made by writing its
+    `.gitignore`, which is also the right thing to leave there. If even
+    that fails, the root is the fallback: litter, but a working build.
+    """
+    marker = f"{BUILD_DIR}/.gitignore"
+    try:
+        if not fs.exists(marker):
+            fs.write(marker, "# build artefacts of programs Cognitive Coder "
+                             "verified; safe to delete\n*\n")
+        return _join(root, f"{BUILD_DIR}/{name}")
+    except Exception:                                    # noqa: BLE001
+        return _join(root, name)
+
+
+def _test_phase(ex: Any, argv: Sequence[str], run_argv: Sequence[str], *,
+                cwd: str, timeout: float) -> PhaseResult:
+    """The test phase: one command, or build-the-harness THEN run it.
+
+    Two commands, ONE phase named `test`: a harness that does not compile
+    is a failed test, and `RunResult.tested` must mean the tests RAN — a
+    separate, passing "compile the tests" phase would make it true for a
+    harness that was built and never executed, which is the bug this
+    exists to fix.
+    """
+    first = _phase(ex, "test", argv, cwd=cwd, timeout=timeout)
+    if not run_argv or not first.ok or first.proc is None:
+        return first
+    left = timeout
+    if timeout and timeout > 0:
+        left = max(1.0, timeout - (first.proc.duration_s or 0.0))
+    second = _phase(ex, "test", run_argv, cwd=cwd, timeout=left)
+    if second.proc is None:
+        return second
+    a, b = first.proc, second.proc
+    joined = ProcResult(
+        exit_code=b.exit_code,
+        stdout="\n".join(s for s in (a.stdout, b.stdout) if s),
+        stderr="\n".join(s for s in (a.stderr, b.stderr) if s),
+        duration_s=(a.duration_s or 0.0) + (b.duration_s or 0.0),
+        timed_out=b.timed_out, truncated=a.truncated or b.truncated)
+    return replace(second, proc=joined)
+
+
 def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
               workdir: str = "", timeout: float | None = None,
-              test_source: str = "") -> RunResult:
+              test_source: str = "", path: str = "",
+              test_path: str = "") -> RunResult:
     """Run the language's test command, honestly.
 
     Two honesty obligations are discharged here:
@@ -439,6 +522,19 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     * A headless Godot pass on a test that touches the scene tree, physics or
       rendering carries the headless caveat (M40). "The tests passed" may be
       said; "this works" may not.
+
+    ``path`` is the file's real location, as for `build_and_run`; without
+    it `{src}` is `<root>/<stem><ext>`, which for `src/lib.rs` is a file
+    that does not exist.
+
+    ``test_path`` is the TASK's own test file (`Task.test_path`, M39). When
+    it exists and the language can run one file (`test_one_cmd`, or
+    `test_files`), only that file decides the verdict and supplies the
+    diagnostics. The whole suite is then run once more, only if this file
+    passed, and anything failing elsewhere becomes a caveat naming those
+    files — never this file's diagnostics. Before this, one failing test
+    anywhere in the project was fed back as the error of every file
+    verified after it, and blocked the rest of the build.
     """
     lang = langs.get(lang_id)
     root = workdir or fs.root()
@@ -447,7 +543,17 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 
     caveats: list[str] = []
     argv: list[str] = []
+    run_argv: list[str] = []
+    files: list[str] = []
     test_timeout = Timeouts.resolve(timeout, lang.test_timeout)
+    scoped = ""
+    if test_path and lang_id != "gdscript" and (lang.test_one_cmd
+                                                or lang.test_files):
+        rel = str(test_path).replace("\\", "/")
+        try:
+            scoped = rel if fs.exists(rel) else ""
+        except Exception:                                # noqa: BLE001
+            scoped = ""
 
     if lang_id == "gdscript":
         tool = lang.which_run(ex)
@@ -470,25 +576,115 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                 blocked=(f"no test runner is configured for {lang.label} — "
                          f"the loop will verify by running the code instead, "
                          f"which is weaker evidence"))
-        argv = langs.render(
-            lang.test_cmd, build=lang.which_build(ex), run=lang.which_run(ex),
-            src=_join(root, f"{stem}{lang.ext}"), out=_join(root, stem),
-            dirpath=root, stem=stem)
-        if any("{" in str(p) or not str(p) for p in argv):
+        subs = {"build": lang.which_build(ex), "run": lang.which_run(ex),
+                "src": _join(root, path or f"{stem}{lang.ext}"),
+                "out": (_artefact(fs, root, f"{stem}.test{_EXE}")
+                        if lang.test_run_cmd else _join(root, stem)),
+                "dirpath": root, "stem": stem}
+        if scoped:
+            folder, _, name = scoped.rpartition("/")
+            subs.update(test=_join(root, scoped), testname=name,
+                        testdir=_join(root, folder) if folder else root)
+        cmd = (lang.test_one_cmd if scoped and lang.test_one_cmd
+               else lang.test_cmd)
+        argv = langs.render(cmd, **subs)
+        run_argv = langs.render(lang.test_run_cmd, **subs)
+        if any("{" in str(p) or not str(p) for p in argv + run_argv):
             return RunResult(False, lang_id,
                              blocked="the test command could not be resolved "
                                      "— a required toolchain is missing")
+        if lang.test_files:
+            files = [scoped] if scoped else langs.find_test_files(fs, lang)
+            if not files:
+                return RunResult(
+                    False, lang_id,
+                    blocked=(f"no {lang.label} test file was found (looked "
+                             f"for {', '.join(lang.test_files[:4])}, … and "
+                             f"anything under test/ or tests/) — the loop "
+                             f"will verify by running the code instead, "
+                             f"which is weaker evidence"))
+            # Relative to the cwd, so Node names each file the way the
+            # zero-test check below expects.
+            argv = argv + files
 
-    phase = _phase(ex, "test", argv, cwd=root, timeout=test_timeout)
+    phase = _test_phase(ex, argv, run_argv, cwd=root, timeout=test_timeout)
+    if (not phase.ok and lang_id == "python" and phase.proc is not None
+            and phase.proc.exit_code == 5 and zero_tests(phase.output)):
+        # Python 3.12+ `unittest` exits 5 when it ran nothing. That is the
+        # zero-test case — said in a caveat below — not a failing test,
+        # and treating it as one fed "NO TESTS RAN" to the model as an
+        # error in code that was fine.
+        phase = replace(phase, ok=True,
+                        note="exit status 5: unittest found no tests")
     diags: tuple[Diagnostic, ...] = ()
     if not phase.ok:
         diags = tuple(diagnostics.attach_source(
-            diagnostics.parse(phase.output, lang_id), fs))
-    empty = zero_tests(phase.output)
+            diagnostics.parse(phase.output, lang_id, root=root), fs))
+    # The file-based signal only means something on a passing run: a
+    # test file that failed to LOAD is also listed under its own name.
+    empty = zero_tests(phase.output, files if phase.ok else ())
     if empty:
         caveats.append(empty)
+    if scoped and phase.ok:
+        elsewhere = _failing_elsewhere(lang_id, lang, fs=fs, ex=ex,
+                                       stem=stem, workdir=workdir,
+                                       timeout=timeout, path=path,
+                                       mine=scoped)
+        if elsewhere:
+            caveats.append(elsewhere)
     return RunResult(ok=phase.ok, lang=lang_id, phases=(phase,),
                      diagnostics=diags, caveats=tuple(caveats))
+
+
+# Lines of a test log that report a failure, per runner: unittest, pytest,
+# a Python traceback frame, node's TAP, go test, and a Rust panic.
+_FAILURE_LINE = re.compile(
+    r"^\s*(?:FAIL:|ERROR:|FAILED\b|not ok\b|File \"|location:|--- FAIL|"
+    r"thread '.*' panicked)", re.M)
+
+
+def _failing_elsewhere(lang_id: str, lang: Any, *, fs: Any, ex: Any,
+                       stem: str, workdir: str, timeout: float | None,
+                       path: str, mine: str) -> str:
+    """The caveat for failures OUTSIDE this task's test file, or "".
+
+    Runs the whole suite once; the verdict has already been decided by the
+    task's own file. Names the failing files where the log says which they
+    are — a module name in `FAIL: test_add (test_calc.C.test_add)`, a path
+    in a traceback frame or TAP `location:` — and otherwise quotes the
+    first failure line, so the operator can always find it.
+    """
+    full = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
+                     timeout=timeout, path=path)
+    if full.ok or full.blocked or not full.phases:
+        return ""
+    log = full.phases[0].output
+    failing = "\n".join(ln for ln in log.splitlines()
+                        if _FAILURE_LINE.match(ln))
+    names: list[str] = []
+    try:
+        candidates = fs.list("*")
+    except Exception:                                    # noqa: BLE001
+        candidates = []
+    exts = set(lang.exts or (lang.ext,))
+    for raw in candidates:
+        rel = str(raw).replace("\\", "/")
+        base = rel.rsplit("/", 1)[-1]
+        module, dot, ext = base.rpartition(".")
+        if (not dot or f".{ext}" not in exts or rel == mine
+                or "test" not in base.lower()
+                or any(p.startswith(".") for p in rel.split("/")[:-1])):
+            continue
+        if rel in failing or re.search(rf"\b{re.escape(module)}\b",
+                                       failing):
+            names.append(rel)
+    first = next((ln.strip() for ln in failing.splitlines()
+                  if ln.strip()), "")
+    which = (", ".join(names[:5]) if names
+             else f"the first failure reads: {first[:120]}")
+    return (f"{mine} passes. Other tests in this project fail ({which}); "
+            f"they are reported here rather than as this file's errors, "
+            f"because they belong to other tasks.")
 
 
 # A test runner that collected nothing exits 0. That is the most dangerous
@@ -506,26 +702,38 @@ _EMPTY_RUN = (
 )
 
 
-def zero_tests(output: str) -> str:
+def zero_tests(output: str, files: Sequence[str] = ()) -> str:
     """The caveat a zero-test run earns, or "" when tests actually ran.
 
     Separate and public because the loop needs the same judgement: a task
     whose tests "passed" without existing has not been verified, and F2's
     "the test must FAIL first" check depends on telling the two apart.
+
+    ``files`` are the test files handed to a runner that takes them. Node
+    reports a file with no `test()` calls in it as ONE passing test named
+    after the file (`# Subtest: main.test.js` / `# tests 1`), so "# tests 0"
+    never appears; when every file passed shows up that way, nothing ran.
     """
     text = output or ""
-    for pattern in _EMPTY_RUN:
-        if pattern.search(text):
-            return ("the test command succeeded but ran ZERO tests — that is "
-                    "not evidence the code works, only that nothing "
-                    "contradicted it")
+    empty = any(pattern.search(text) for pattern in _EMPTY_RUN)
+    if not empty and files:
+        named = set(re.findall(r"^# Subtest: (.+?)\s*$", text, re.M))
+        hollow = [f for f in files
+                  if {f, f.replace("/", "\\"),
+                      f.rsplit("/", 1)[-1]} & named]
+        empty = len(hollow) == len(files)
+    if empty:
+        return ("the test command succeeded but ran ZERO tests — that is "
+                "not evidence the code works, only that nothing "
+                "contradicted it")
     return ""
 
 
 def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
            workdir: str = "", project_mode: bool = False,
            test_source: str = "", skip_guard: bool = False,
-           path: str = "", timeouts: Timeouts | None = None) -> RunResult:
+           path: str = "", timeouts: Timeouts | None = None,
+           test_path: str = "") -> RunResult:
     """The C4 definition of done: it builds AND the tests run (M4).
 
     This is the function the loop calls, and the one place where "done" is
@@ -535,6 +743,9 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 
     ``timeouts`` bounds the generated PROGRAM, never the model. `None` on any
     field takes the language default; `0` waits indefinitely.
+
+    ``test_path`` scopes the test phase to the task's own test file; see
+    `run_tests`. Failures elsewhere come back as caveats, not diagnostics.
     """
     clocks = timeouts or Timeouts()
     built = build_and_run(code, lang_id, fs=fs, ex=ex, stem=stem,
@@ -545,7 +756,8 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
         return built
 
     tested = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
-                       test_source=test_source, timeout=clocks.test)
+                       test_source=test_source, timeout=clocks.test,
+                       path=path, test_path=test_path)
     if tested.blocked:
         # No test runner is not a pass and not a failure — it is a stated
         # weakness in the evidence. C4 requires saying so out loud.
@@ -565,6 +777,84 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 # format and lint — deterministic, and therefore free (C5, F1)
 # ---------------------------------------------------------------------------
 
+#: Where format, lint and autofix put the candidate they are asked about.
+#:
+#: NOT the project path. Those three used to write `<stem><ext>` at the
+#: project ROOT before the guard and before the transaction, so with the
+#: library default `DenyAll` a task for `main.py` overwrote the operator's
+#: `main.py` with unapproved model output, and `src/util.py` clobbered a root
+#: `util.py`. The only road from a candidate to a project file is the
+#: patcher's approval gate (M18); everything else works on a copy.
+#:
+#: Inside the project, beside the engine's other state, rather than in the
+#: system temp directory, for two reasons: it goes through the host's
+#: FileSystemPort like every other write (C2), so a host whose ExecPort only
+#: sees the project still works; and a formatter run here still finds the
+#: project's own `pyproject.toml` / `.clang-format` / `rustfmt.toml` by
+#: walking up, so the house style it applies is the operator's, not the
+#: tool's default. A temp dir outside would reformat to the wrong line
+#: length and hand the model a whole-file diff.
+SCRATCH_DIR = ".cc_state/scratch"
+
+
+def _scratch_rel(stem: str, ext: str) -> str:
+    safe = re.sub(r"[\\/:]+", "_", str(stem or "")).strip(".") or "main"
+    return f"{SCRATCH_DIR}/{safe}{ext}"
+
+
+def _scratch_tool(code: str, lang: Any, *, fs: Any, ex: Any, stem: str,
+                  workdir: str, name: str, cmd: Sequence[str], tool: str,
+                  timeout: float) -> tuple[str | None, PhaseResult | None,
+                                           str]:
+    """Run one fixer/formatter/linter over a COPY. (text, phase, output).
+
+    ``workdir`` keeps its existing meaning — where the ExecPort sees the
+    project root, when that differs from `fs.root()` — so the copy's
+    exec-side path is `workdir/.cc_state/scratch/…`. The copy is deleted
+    afterwards, along with the build artefact a compiler-driven linter such
+    as clippy-driver drops beside it; nothing is left for the codemap, the
+    planner or a test runner to mistake for source.
+
+    ``output`` has the scratch path rewritten to the plain file name: the
+    model is shown the file it is working on, never the engine's scratch
+    directory, which it would otherwise try to import from.
+    """
+    root = workdir or fs.root()
+    rel = _scratch_rel(stem, lang.ext)
+    here = rel.rsplit("/", 1)[-1]
+    scratch = _join(root, SCRATCH_DIR)
+    try:
+        fs.write(rel, code)
+    except Exception:                                    # noqa: BLE001
+        return None, None, ""
+    try:
+        src = _join(root, rel)
+        argv = langs.render(list(cmd), fmt=tool, lint=tool, src=src,
+                            dirpath=scratch, stem=here.rsplit(".", 1)[0])
+        phase = _phase(ex, name, argv, cwd=scratch, timeout=timeout,
+                       project_root=root)
+        try:
+            after: str | None = fs.read(rel)
+        except Exception:                                # noqa: BLE001
+            after = None
+        output = phase.output
+        # Longest spelling first: the relative path is a suffix of the
+        # absolute one, and replacing it first leaves `/root/main.py`.
+        for spelling in sorted({src, src.replace("\\", "/"), rel,
+                                rel.replace("/", "\\")}, key=len,
+                               reverse=True):
+            output = output.replace(spelling, here)
+        return after, phase, output
+    finally:
+        base = rel[:-len(lang.ext)] if lang.ext else rel
+        for leftover in (rel, base, base + ".exe", base + ".pdb"):
+            try:
+                if fs.exists(leftover):
+                    fs.delete(leftover)
+            except Exception:                            # noqa: BLE001
+                pass
+
+
 def format_code(code: str, lang_id: str, *, fs: Any, ex: Any,
                 stem: str = "main", workdir: str = "") -> tuple[str, str]:
     """Run the language's formatter. Returns (text, note).
@@ -572,6 +862,10 @@ def format_code(code: str, lang_id: str, *, fs: Any, ex: Any,
     Formatting happens before the model ever sees a file: consistent layout
     means the model spends its attention on logic rather than on guessing the
     house style. A missing formatter is a note, not a failure (C7).
+
+    Code in, code out: the formatter runs on a copy in `SCRATCH_DIR` and no
+    project file is touched. Writing the result is the caller's business,
+    through the patcher and its approval gate.
     """
     lang = langs.get(lang_id)
     if lang is None or not lang.fmt_cmd:
@@ -580,16 +874,12 @@ def format_code(code: str, lang_id: str, *, fs: Any, ex: Any,
     if not tool:
         return code, (f"no formatter installed ({', '.join(lang.fmt_tools)}) "
                       f"— layout is left as the model wrote it")
-    root = workdir or fs.root()
-    src_rel = f"{stem}{lang.ext}"
-    fs.write(src_rel, code)
-    argv = langs.render(lang.fmt_cmd, fmt=tool, src=_join(root, src_rel),
-                        dirpath=root, stem=stem)
-    phase = _phase(ex, "format", argv, cwd=root, timeout=30.0)
-    try:
-        return fs.read(src_rel), ("" if phase.ok else phase.output[:200])
-    except Exception:                                    # noqa: BLE001
+    after, phase, output = _scratch_tool(
+        code, lang, fs=fs, ex=ex, stem=stem, workdir=workdir, name="format",
+        cmd=lang.cmd_for("fmt", tool), tool=tool, timeout=30.0)
+    if after is None or phase is None:
         return code, "the formatter produced no readable output"
+    return after, ("" if phase.ok else output[:200])
 
 
 def autofix(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
@@ -604,6 +894,10 @@ def autofix(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     Every auto-fix is returned so the caller can log it (M35). If the same one
     recurs constantly, the PROMPT needs changing, and the log is how anyone
     finds out.
+
+    Code in, code out: the fixer runs on a copy in `SCRATCH_DIR`. It used to
+    run on `<root>/<stem><ext>`, which wrote unapproved model output over the
+    operator's file before the patcher had asked anyone (M18).
     """
     lang = langs.get(lang_id)
     if lang is None:
@@ -616,25 +910,19 @@ def autofix(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
         text += "\n"
         done.append("added the missing trailing newline")
 
-    if lang.fix_cmd:
-        tool = lang.which_tool(ex, lang.lint_tools or lang.fmt_tools)
-        if tool:
-            root = workdir or fs.root()
-            src_rel = f"{stem}{lang.ext}"
-            fs.write(src_rel, text)
-            argv = langs.render(lang.fix_cmd, lint=tool, fmt=tool,
-                                src=_join(root, src_rel), dirpath=root,
-                                stem=stem)
-            phase = _phase(ex, "autofix", argv, cwd=root, timeout=60.0)
-            try:
-                fixed = fs.read(src_rel)
-            except Exception:                            # noqa: BLE001
-                fixed = text
-            if fixed != text:
-                text = fixed
-                done.append(f"ran {argv[0]} --fix over the file")
-            elif not phase.ok and phase.output:
-                pass       # the fixer had nothing to offer; not worth a note
+    # The fixer is chosen by the slot its template names (Lang.fix_command):
+    # Go's `{fmt} -w` must run gofmt, not the first lint tool (`go`).
+    tool, fix_cmd = lang.fix_command(ex)
+    if tool:
+        fixed, _phase_run, _out = _scratch_tool(
+            text, lang, fs=fs, ex=ex, stem=stem, workdir=workdir,
+            name="autofix", cmd=fix_cmd, tool=tool, timeout=60.0)
+        # A fixer that had nothing to offer, or failed, leaves the text
+        # as it was; neither is worth a note.
+        if fixed is not None and fixed != text:
+            text = fixed
+            name = str(tool).replace("\\", "/").rsplit("/", 1)[-1]
+            done.append(f"ran {name} --fix over the file")
     return text, done
 
 
@@ -646,6 +934,9 @@ def lint_code(code: str, lang_id: str, *, fs: Any, ex: Any,
     No linter installed is a degraded mode, not a crash (C7, M6) — and the
     note says what the absence costs, so the operator knows which mode they
     are in.
+
+    Lints a copy in `SCRATCH_DIR`; no project file is written. Diagnostics
+    name `<stem><ext>`, not the scratch path.
     """
     lang = langs.get(lang_id)
     if lang is None or not lang.lint_cmd:
@@ -655,13 +946,13 @@ def lint_code(code: str, lang_id: str, *, fs: Any, ex: Any,
         return [], (f"no linter installed ({', '.join(lang.lint_tools)}) — "
                     f"style and unused-symbol problems will only surface if "
                     f"they break the build")
-    root = workdir or fs.root()
-    src_rel = f"{stem}{lang.ext}"
-    fs.write(src_rel, code)
-    argv = langs.render(lang.lint_cmd, lint=tool, src=_join(root, src_rel),
-                        dirpath=root, stem=stem)
-    phase = _phase(ex, "lint", argv, cwd=root, timeout=60.0)
-    return diagnostics.parse(phase.output, lang_id), ""
+    _after, phase, output = _scratch_tool(
+        code, lang, fs=fs, ex=ex, stem=stem, workdir=workdir, name="lint",
+        cmd=lang.cmd_for("lint", tool), tool=tool, timeout=60.0)
+    if phase is None:
+        return [], ("the linter could not be run: the scratch copy could "
+                    "not be written")
+    return diagnostics.parse(output, lang_id), ""
 
 
 def _join(root: str, rel: str) -> str:

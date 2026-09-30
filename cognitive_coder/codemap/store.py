@@ -40,6 +40,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import hashlib
 import sqlite3
+import threading
 import time
 
 from ..types import CodemapStats, Symbol
@@ -96,6 +97,119 @@ CREATE INDEX IF NOT EXISTS ix_fixes_sig ON fixes(signature);
 """
 
 
+def _enclosing_class(src: str, kinds: dict) -> str:
+    """The class `src` is a method of, from its dotted name."""
+    parts = str(src).split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        prefix = ".".join(parts[:i])
+        if kinds.get(prefix) == "class":
+            return prefix
+    return ""
+
+
+def _import_names(edges: Sequence[tuple], kinds: dict) -> dict[str, str]:
+    """Local name → imported target, from this file's `imports` edges.
+
+    `import pkg.util` makes `pkg.util` usable; `from pkg import util` makes
+    `util` mean `pkg.util`; `from pkg.util import helper` makes `helper`
+    mean `pkg.util.helper`. The edge does not say which form it came from,
+    so both the full target and its last component are mapped — harmless,
+    because a target outside the project binds to nothing either way.
+    """
+    out: dict[str, str] = {}
+    for src, dst, kind in edges:
+        if kind != "imports" or kinds.get(src) != "module":
+            continue
+        target = str(dst)
+        out.setdefault(target, target)
+        out.setdefault(target.rsplit(".", 1)[-1], target)
+    return out
+
+
+def _module_names(path: str) -> list[str]:
+    """The names other files may use for this module: `a/b/c.py` →
+    `a.b.c`, `b.c`, `c` (a src layout imports without its first part)."""
+    p = str(path or "").replace("\\", "/").strip("/")
+    for suffix in ("/__init__.py", ".py"):
+        if p.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
+    else:
+        return []
+    parts = [x for x in p.split("/") if x]
+    return [".".join(parts[i:]) for i in range(len(parts))]
+
+
+#: Bumped when the on-disk shape changes. 1 was the spec's schema (no
+#: `approximate` columns); 2 added them, module rows and the per-epoch
+#: architecture snapshot. Recorded in `meta` so the next change can tell
+#: what it is opening instead of crashing on it — an older database made
+#: `put_file` raise "table files has no column named approximate".
+SCHEMA_VERSION = 2
+
+#: Columns added after a table first shipped: (table, column, DDL). Adding
+#: a column to an existing SQLite table needs a default, which each has.
+_ADDED_COLUMNS = (
+    ("files", "lang", "TEXT NOT NULL DEFAULT ''"),
+    ("files", "mtime", "REAL NOT NULL DEFAULT 0"),
+    ("files", "hash", "TEXT NOT NULL DEFAULT ''"),
+    ("files", "approximate", "INTEGER NOT NULL DEFAULT 0"),
+    ("files", "indexed_at", "REAL NOT NULL DEFAULT 0"),
+    ("symbols", "kind", "TEXT NOT NULL DEFAULT ''"),
+    ("symbols", "line", "INTEGER NOT NULL DEFAULT 0"),
+    ("symbols", "end_line", "INTEGER NOT NULL DEFAULT 0"),
+    ("symbols", "signature", "TEXT NOT NULL DEFAULT ''"),
+    ("symbols", "docstring", "TEXT NOT NULL DEFAULT ''"),
+    ("symbols", "parent_id", "INTEGER"),
+    ("symbols", "approximate", "INTEGER NOT NULL DEFAULT 0"),
+    ("fixes", "hits", "INTEGER NOT NULL DEFAULT 1"),
+    ("fixes", "last_seen", "REAL NOT NULL DEFAULT 0"),
+)
+
+#: Milliseconds a writer waits for another's lock before failing. Two
+#: sessions on one project are a normal thing for a host to allow.
+BUSY_TIMEOUT_MS = 5000
+
+
+class _SharedConnection(sqlite3.Connection):
+    """A connection any thread may use, one statement at a time.
+
+    A host builds the Session where its UI lives and runs it on a worker —
+    ATK's panel does exactly that. The default connection belongs to the
+    thread that opened it, so every codemap call from the build raised
+    `ProgrammingError: SQLite objects created in a thread can only be used
+    in that same thread`: the tools answered "That tool call failed", and
+    indexing silently stopped. With `check_same_thread=False` the module
+    allows sharing when SQLite is serialized (`sqlite3.threadsafety == 3`),
+    and the lock keeps one thread's statements and commits from
+    interleaving with another's.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.lock = threading.RLock()
+
+    def execute(self, *args, **kwargs):
+        with self.lock:
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self.lock:
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self.lock:
+            return super().executescript(*args, **kwargs)
+
+    def commit(self) -> None:
+        with self.lock:
+            super().commit()
+
+    def rollback(self) -> None:
+        with self.lock:
+            super().rollback()
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:32]
 
@@ -105,10 +219,42 @@ class Store:
 
     def __init__(self, path: str) -> None:
         self.path = path
-        self.db = sqlite3.connect(path)
+        shared = sqlite3.threadsafety == 3
+        self.db = sqlite3.connect(
+            path, timeout=BUSY_TIMEOUT_MS / 1000,
+            factory=_SharedConnection if shared else sqlite3.Connection,
+            check_same_thread=not shared)
         self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
+        # WAL lets a reader proceed while another session writes, and
+        # busy_timeout makes a writer WAIT for a lock rather than fail at
+        # once. Both are best-effort: a database in a read-only or unusual
+        # location may refuse WAL, and still works without it.
+        for pragma in ("PRAGMA journal_mode=WAL",
+                       f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"):
+            try:
+                self.db.execute(pragma)
+            except sqlite3.DatabaseError:
+                pass
+        statements = [x.strip() for x in SCHEMA.split(";") if x.strip()]
+        tables = [x for x in statements if x.startswith("CREATE TABLE")]
+        indexes = [x for x in statements if x.startswith("CREATE INDEX")]
+        self.db.executescript(";\n".join(tables) + ";")
+        self._migrate()
+        self.db.executescript(";\n".join(indexes) + ";")
         self.db.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older database up to `SCHEMA_VERSION`, additively."""
+        for table, column, ddl in _ADDED_COLUMNS:
+            have = {r[1] for r in self.db.execute(
+                f"PRAGMA table_info({table})")}
+            if have and column not in have:
+                self.db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),))
 
     def close(self) -> None:
         try:
@@ -146,7 +292,21 @@ class Store:
         self.set_meta("epoch_reason", why)
         self.set_meta("epoch_at", str(time.time()))
         self.set_meta("changed_since_epoch", "")
+        # The architecture block is SNAPSHOTTED here, and served from the
+        # snapshot until the next bump. It used to be rendered live, so its
+        # bytes changed whenever any file's symbol set changed — i.e. on
+        # every patch — while `should_bump_epoch` said no: the "epoch-
+        # scoped" part of the cached prefix was not epoch-scoped at all.
+        from .zoom import architecture_prefix
+        self.set_meta("architecture_prefix", architecture_prefix(self))
+        self.set_meta("architecture_epoch", str(n))
         return n
+
+    def architecture_snapshot(self) -> str | None:
+        """This epoch's architecture block, or None if none was taken."""
+        if self.meta("architecture_epoch") != str(self.epoch):
+            return None
+        return self.meta("architecture_prefix") or None
 
     def note_change(self, path: str) -> list[str]:
         """Record a file changed since the epoch snapshot was taken.
@@ -226,20 +386,33 @@ class Store:
                 self.db.execute("UPDATE symbols SET parent_id=? WHERE id=?",
                                 (name_to_id[s.parent], name_to_id[s.name]))
 
+        kinds = {s.name: s.kind for s in symbols}
+        imports = _import_names(edges, kinds)
+        # The SOURCE of every edge is in this file by construction, so it is
+        # looked up here and nowhere else. It used to fall back to a project-
+        # wide suffix match, which attributed `import csv` in src/stats.py to
+        # a method `R.stats` in another file.
         for src, dst, kind in edges:
-            src_id = name_to_id.get(src) or self._find_id(src)
-            dst_id = self._find_id(dst) or name_to_id.get(dst)
-            if src_id and dst_id:
+            src_id = name_to_id.get(src)
+            if not src_id:
+                continue
+            if kind == "imports":
+                dst_id = self._resolve_import(str(dst))
+            else:
+                dst_id = (name_to_id.get(dst)
+                          or self._resolve(str(dst), src, file_id, kinds,
+                                           imports))
+            if dst_id and dst_id != src_id:
                 self.db.execute(
                     "INSERT INTO edges(src_symbol_id,dst_symbol_id,kind) "
                     "VALUES(?,?,?)", (src_id, dst_id, kind))
-            elif src_id:
+            else:
                 # It could not be bound. It is KEPT, not dropped (§6.7).
                 self.db.execute(
                     "INSERT INTO unresolved(src_symbol_id,name,kind) "
                     "VALUES(?,?,?)", (src_id, str(dst), kind))
         for src, name, kind in unresolved:
-            src_id = name_to_id.get(src) or self._find_id(src)
+            src_id = name_to_id.get(src)
             if not src_id:
                 continue
             # Binding runs in BOTH directions, and forgetting this one is a
@@ -249,7 +422,7 @@ class Store:
             # this, `callers_of` returns nothing for every cross-file call
             # whose target happened to be indexed first — which looks like a
             # project with no call graph rather than like a bug.
-            dst_id = self._find_id(name)
+            dst_id = self._resolve(str(name), src, file_id, kinds, imports)
             if dst_id and dst_id != src_id:
                 self.db.execute(
                     "INSERT INTO edges(src_symbol_id,dst_symbol_id,kind) "
@@ -260,26 +433,146 @@ class Store:
                     "VALUES(?,?,?)", (src_id, str(name), kind))
         self.db.commit()
         self.note_change(path)
-        self._rebind(name_to_id)
+        self._rebind(path, symbols, name_to_id)
         return file_id
 
-    def _rebind(self, new_symbols: dict[str, int]) -> None:
-        """Late binding: an unresolved call that now HAS a target becomes an edge.
+    # -- binding ------------------------------------------------------------
+    #
+    # WHY THIS IS STRICTER THAN IT WAS. Binding used to fall back to
+    # `name LIKE '%.short'` everywhere, ordered by id — "the first symbol in
+    # the database whose last component matches". Observed: `self.save()` in
+    # `Doc` bound to `Db.save` in another file; `subprocess.run(...)` was
+    # re-bound to a later `class Job: def run`, lifting the resolution rate
+    # from 0% to 67% on an edge that does not exist and fabricating a blast
+    # radius. A wrong edge is worse than an unresolved one: unresolved is
+    # counted and reported, a wrong edge is believed.
+    #
+    # So, in order: `self.x`/`cls.x` against the enclosing class; the exact
+    # name in the same file; for a plain name imported with `from m import
+    # x`, `x` in module m's file (and nothing else — an import from outside
+    # the project is not a licence to bind to a project symbol of the same
+    # name); the exact name project-wide; and for `mod.x` where `mod` is an
+    # imported PROJECT module, `x` in that module's file.
+
+    def _resolve(self, name: str, src: str, file_id: int, kinds: dict,
+                 imports: dict[str, str]) -> int | None:
+        head, _, rest = name.partition(".")
+        if head in ("self", "cls"):
+            cls = _enclosing_class(src, kinds)
+            if cls and rest:
+                return self._symbol_in(file_id, f"{cls}.{rest}")
+            return None
+        local = self._symbol_in(file_id, name)
+        if local:
+            return local
+        if not rest:
+            target = imports.get(name)
+            if target:
+                mod, _, sym = target.rpartition(".")
+                fid = self._file_for_module(mod) if mod else None
+                return self._symbol_in(fid, sym) if fid else None
+            return self._exact(name)
+        exact = self._exact(name)
+        if exact:
+            return exact
+        parts = name.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            target = imports.get(".".join(parts[:i]))
+            if not target:
+                continue
+            fid = self._file_for_module(target)
+            return self._symbol_in(fid, ".".join(parts[i:])) if fid else None
+        return None
+
+    def _resolve_import(self, target: str) -> int | None:
+        """An import target → that module's row, or the symbol it names."""
+        fid = self._file_for_module(target)
+        if fid:
+            return self._module_row(fid)
+        mod, _, sym = target.rpartition(".")
+        fid = self._file_for_module(mod) if mod else None
+        if not fid:
+            return None
+        return self._symbol_in(fid, sym) or self._module_row(fid)
+
+    def _symbol_in(self, file_id: int | None, name: str) -> int | None:
+        if not file_id:
+            return None
+        row = self.db.execute(
+            "SELECT id FROM symbols WHERE file_id=? AND name=? "
+            "AND kind != 'module' ORDER BY id LIMIT 1",
+            (file_id, name)).fetchone()
+        return int(row["id"]) if row else None
+
+    def _exact(self, name: str) -> int | None:
+        row = self.db.execute(
+            "SELECT id FROM symbols WHERE name=? AND kind != 'module' "
+            "ORDER BY id LIMIT 1", (name,)).fetchone()
+        return int(row["id"]) if row else None
+
+    def _module_row(self, file_id: int) -> int | None:
+        row = self.db.execute(
+            "SELECT id FROM symbols WHERE file_id=? AND kind='module' "
+            "LIMIT 1", (file_id,)).fetchone()
+        return int(row["id"]) if row else None
+
+    def _file_for_module(self, module: str) -> int | None:
+        """The indexed file implementing `module` (`pkg.util` → pkg/util.py,
+        pkg/util/__init__.py, or src/pkg/util.py), or a file by the literal
+        name (a C `#include "util.h"`). None for anything outside the
+        project, which is the point."""
+        module = (module or "").strip()
+        if not module or module.startswith("."):
+            return None
+        stem = module.replace(".", "/")
+        exact = (f"{stem}.py", f"{stem}/__init__.py", module)
+        row = self.db.execute(
+            "SELECT id FROM files WHERE path IN (?,?,?) OR path LIKE ? "
+            "OR path LIKE ? OR path LIKE ? ORDER BY length(path) LIMIT 1",
+            (*exact, f"%/{stem}.py", f"%/{stem}/__init__.py",
+             f"%/{module}")).fetchone()
+        return int(row["id"]) if row else None
+
+    def _rebind(self, path: str, symbols: Sequence[Symbol],
+                name_to_id: dict[str, int]) -> None:
+        """Late binding: an unresolved call that now HAS a target → an edge.
 
         This is what makes the graph improve as more of the project is
         indexed. File A calling `B.load` before B was indexed is unresolved;
         the moment B lands, it becomes a real edge — and the resolution rate
         going up is the visible sign the map is getting more complete.
+
+        EXACT names only — the name itself, or the name qualified by this
+        file's module (`util.helper`, `pkg.util.helper`) — plus `self.x` /
+        `cls.x` for a method `x`, since an inherited method is defined in a
+        file the caller never names. A bare suffix match is what rebound
+        `subprocess.run` to `Job.run`.
         """
-        if not new_symbols:
+        if not name_to_id:
             return
-        for name, sym_id in new_symbols.items():
-            short = name.split(".")[-1]
+        modules = _module_names(path)
+        for s in symbols:
+            sym_id = name_to_id.get(s.name)
+            if not sym_id:
+                continue
+            if s.kind == "module":
+                names = list(modules)
+                where = "kind='imports'"
+            else:
+                names = [s.name] + [f"{m}.{s.name}" for m in modules]
+                where = "1=1"
+                if "." in s.name and s.kind == "method":
+                    short = s.name.rsplit(".", 1)[-1]
+                    names += [f"self.{short}", f"cls.{short}"]
+            if not names:
+                continue
+            marks = ",".join("?" * len(names))
             rows = self.db.execute(
-                "SELECT rowid, src_symbol_id, kind FROM unresolved "
-                "WHERE name=? OR name=? OR name LIKE ?",
-                (name, short, f"%.{short}")).fetchall()
+                f"SELECT rowid, src_symbol_id, kind FROM unresolved "
+                f"WHERE name IN ({marks}) AND {where}", names).fetchall()
             for row in rows:
+                if row["src_symbol_id"] == sym_id:
+                    continue
                 self.db.execute(
                     "INSERT INTO edges(src_symbol_id,dst_symbol_id,kind) "
                     "VALUES(?,?,?)",
@@ -288,19 +581,13 @@ class Store:
                                 (row["rowid"],))
         self.db.commit()
 
-    def _find_id(self, name: str) -> int | None:
-        row = self.db.execute(
-            "SELECT id FROM symbols WHERE name=? ORDER BY id LIMIT 1",
-            (str(name),)).fetchone()
-        if row:
-            return int(row["id"])
-        short = str(name).split(".")[-1]
-        row = self.db.execute(
-            "SELECT id FROM symbols WHERE name=? OR name LIKE ? "
-            "ORDER BY id LIMIT 1", (short, f"%.{short}")).fetchone()
-        return int(row["id"]) if row else None
-
     def forget(self, path: str) -> None:
+        """Remove a file that no longer exists from the map.
+
+        Its callers are not silently disconnected: an edge INTO the file
+        becomes an unresolved call again, so the resolution rate drops and
+        `callers_of` stops claiming a target that is gone.
+        """
         row = self.db.execute("SELECT id FROM files WHERE path=?",
                               (path,)).fetchone()
         if not row:
@@ -310,6 +597,13 @@ class Store:
         if ids:
             marks = ",".join("?" * len(ids))
             self.db.execute(
+                f"INSERT INTO unresolved(src_symbol_id,name,kind) "
+                f"SELECT e.src_symbol_id, d.name, e.kind FROM edges e "
+                f"JOIN symbols d ON d.id = e.dst_symbol_id "
+                f"WHERE e.dst_symbol_id IN ({marks}) "
+                f"AND e.src_symbol_id NOT IN ({marks}) "
+                f"AND d.kind != 'module'", ids + ids)
+            self.db.execute(
                 f"DELETE FROM edges WHERE src_symbol_id IN ({marks}) "
                 f"OR dst_symbol_id IN ({marks})", ids + ids)
             self.db.execute(
@@ -318,6 +612,7 @@ class Store:
         self.db.execute("DELETE FROM symbols WHERE file_id=?", (row["id"],))
         self.db.execute("DELETE FROM files WHERE id=?", (row["id"],))
         self.db.commit()
+        self.note_change(path)
 
     # -- queries (live, never stale — M30) --------------------------------
     def find(self, name: str, limit: int = 12) -> list[dict]:
@@ -326,7 +621,8 @@ class Store:
             "SELECT s.name, s.kind, s.line, s.end_line, s.signature, "
             "       s.docstring, s.approximate, f.path, f.lang "
             "FROM symbols s JOIN files f ON f.id = s.file_id "
-            "WHERE s.name = ? OR s.name LIKE ? OR s.name = ? "
+            "WHERE (s.name = ? OR s.name LIKE ? OR s.name = ?) "
+            "AND s.kind != 'module' "
             "ORDER BY (s.name = ?) DESC, s.name LIMIT ?",
             (name, f"%.{short}", short, name, limit)).fetchall()
         return [dict(r) for r in rows]
@@ -336,7 +632,8 @@ class Store:
             "SELECT s.name, s.kind, s.line, s.end_line, s.signature, "
             "       s.docstring, s.approximate "
             "FROM symbols s JOIN files f ON f.id = s.file_id "
-            "WHERE f.path = ? ORDER BY s.line", (path,)).fetchall()
+            "WHERE f.path = ? AND s.kind != 'module' ORDER BY s.line",
+            (path,)).fetchall()
         return [dict(r) for r in rows]
 
     def files(self) -> list[dict]:
@@ -356,9 +653,14 @@ class Store:
         "everything", which is true and useless.
         """
         seen: set[int] = set()
+        # The exact name when it exists. A suffix match on top of it made
+        # `callers_of("Db.save")` report the callers of `Doc.save` too.
         frontier = [int(r["id"]) for r in self.db.execute(
-            "SELECT id FROM symbols WHERE name=? OR name LIKE ?",
-            (symbol, f"%.{str(symbol).split('.')[-1]}"))]
+            "SELECT id FROM symbols WHERE name=? AND kind != 'module'",
+            (symbol,))] or [int(r["id"]) for r in self.db.execute(
+                "SELECT id FROM symbols WHERE name LIKE ? "
+                "AND kind != 'module'",
+                (f"%.{str(symbol).split('.')[-1]}",))]
         out: list[dict] = []
         for level in range(max(1, depth)):
             if not frontier:
@@ -423,11 +725,21 @@ class Store:
         return bool(self.find(name, limit=1))
 
     def stats(self) -> CodemapStats:
+        """Counts for the one-line summary.
+
+        Unresolved IMPORTS are kept (they are how a project module indexed
+        later gets bound) but not counted: `import csv` is a dependency
+        outside the project, not a call the map failed to bind, and counting
+        every stdlib import would make the resolution rate meaningless.
+        Module rows are not counted as symbols for the same reason.
+        """
         one = self.db.execute(
             "SELECT (SELECT COUNT(*) FROM files) AS files, "
-            "       (SELECT COUNT(*) FROM symbols) AS symbols, "
+            "       (SELECT COUNT(*) FROM symbols "
+            "        WHERE kind != 'module') AS symbols, "
             "       (SELECT COUNT(*) FROM edges) AS edges, "
-            "       (SELECT COUNT(*) FROM unresolved) AS unresolved"
+            "       (SELECT COUNT(*) FROM unresolved "
+            "        WHERE kind != 'imports') AS unresolved"
         ).fetchone()
         return CodemapStats(files=one["files"], symbols=one["symbols"],
                             edges=one["edges"], unresolved=one["unresolved"],

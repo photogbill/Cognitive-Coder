@@ -111,6 +111,10 @@ class SkillLoad:
                  "chars": len(s.body)} for s in self.skills]
 
 
+#: The keys that make a `---` fence pair a header rather than two rules.
+_HEADER_KEYS = ("name", "description", "lang")
+
+
 def parse_skill(path: str, text: str) -> Skill:
     """Parse one file. Header optional; a malformed header is BODY.
 
@@ -122,26 +126,34 @@ def parse_skill(path: str, text: str) -> Skill:
     stem = posixpath.basename(path)
     stem = stem[:-3] if stem.lower().endswith(".md") else stem
     name, description, langs = stem, "", ()
+    # A UTF-8 BOM (what Windows editors write) made `\ufeff---` fail the
+    # fence test, so the header went into the cached prefix as rule text.
+    text = (text or "").lstrip("\ufeff")
     body = text
     lines = text.splitlines()
     if lines and lines[0].strip() == "---":
         for i in range(1, min(len(lines), 30)):
-            if lines[i].strip() == "---":
-                for raw in lines[1:i]:
-                    if ":" not in raw:
-                        continue
-                    key, _, val = raw.partition(":")
-                    key, val = key.strip().lower(), val.strip()
-                    if key == "name" and val:
-                        name = val
-                    elif key == "description":
-                        description = val
-                    elif key == "lang" and val:
-                        langs = tuple(sorted(
-                            t.strip().lower()
-                            for t in val.split(",") if t.strip()))
-                body = "\n".join(lines[i + 1:])
+            if lines[i].strip() != "---":
+                continue
+            fields = {}
+            for raw in lines[1:i]:
+                key, sep, val = raw.partition(":")
+                if sep and key.strip().lower() in _HEADER_KEYS:
+                    fields[key.strip().lower()] = val.strip()
+            if not fields:
+                # A fence pair with none of our keys inside is markdown —
+                # two horizontal rules — not a header. Taking it for one
+                # silently discarded everything up to the second rule.
                 break
+            if fields.get("name"):
+                name = fields["name"]
+            description = fields.get("description", "")
+            if fields.get("lang"):
+                langs = tuple(sorted(
+                    t.strip().lower()
+                    for t in fields["lang"].split(",") if t.strip()))
+            body = "\n".join(lines[i + 1:])
+            break
     return Skill(path=path, name=name, description=description,
                  langs=langs, body=body.strip("\n"))
 
@@ -195,8 +207,15 @@ def load_skills(fs: FileSystemPort, *, lang: str = "",
         active.append(skill)
     if events is not None:
         for path, reason in skipped:
-            if not reason.startswith("scoped to"):
-                events.event("warning", f"skill {path} not loaded: {reason}")
+            # A skill scoped to another language is the scope working, and
+            # stays quiet. One skipped because the session never SAID its
+            # language is not: the operator wrote rules for rust, ran a
+            # session without `lang`, and the rules vanished unannounced.
+            if reason.startswith("scoped to") and lang:
+                continue
+            events.event("warning", f"skill {path} not loaded: {reason}"
+                         + (" — set the session language to apply it"
+                            if reason.startswith("scoped to") else ""))
     return SkillLoad(skills=tuple(active), skipped=tuple(skipped))
 
 

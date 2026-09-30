@@ -209,6 +209,67 @@ def test_a_provider_knows_whether_it_is_remote_from_its_url():
     assert OpenAICompatible("https://api.example.com").is_remote
 
 
+@pytest.fixture
+def no_dns(monkeypatch):
+    """Classification must not resolve names — before consent, a lookup is
+    already traffic, and its answer is not evidence of locality."""
+    import socket
+
+    lookups: list[str] = []
+
+    def answer(host, *args, **kwargs):
+        lookups.append(host)
+        # What split-horizon DNS and a rebinding domain would say.
+        return "127.0.0.1"
+
+    monkeypatch.setattr(socket, "gethostbyname", answer)
+    monkeypatch.setattr(socket, "getaddrinfo", answer)
+    return lookups
+
+
+@pytest.mark.parametrize("url,local", [
+    ("http://localhost:8080", True),
+    ("http://LOCALHOST:8080", True),
+    ("http://llm.localhost:8080", True),
+    ("http://127.0.0.1:8080", True),
+    ("http://[::1]:8080", True),
+    ("http://[::ffff:127.0.0.1]:8080", True),
+    ("http://169.254.1.1:8080", True),
+    ("http://0.0.0.0:8080", True),
+    # A NAME is remote, whatever a resolver would say about it: a rebinding
+    # domain resolved to 127.0.0.1 at classification and was called local.
+    ("http://rebind.example:8080", False),
+    ("http://llm.corp.example:8080", False),
+    ("http://mybox.local:8080", False),
+    ("http://localhost.example.com", False),
+    ("http://127.0.0.1@api.openai.com/", False),     # userinfo trick
+    ("http://[::ffff:8.8.8.8]:8080", False),         # v4-mapped public
+    ("http://100.64.0.1:8080", False),               # CGNAT is not a LAN
+    # Scheme-less strings used to parse with an EMPTY host, which counted as
+    # local: "api.openai.com" was classified as this machine.
+    ("api.openai.com", False),
+    ("api.openai.com:443/v1", False),
+    ("", False),
+    ("not a url", False),
+    ("file:///etc/passwd", False),
+    ("ftp://127.0.0.1/", False),
+])
+def test_classification_uses_no_dns(no_dns, url, local):
+    assert is_local_url(url) is local
+    assert no_dns == [], f"classifying {url!r} resolved {no_dns}"
+
+
+@pytest.mark.parametrize("url", ["api.openai.com", "", "not a url",
+                                 "ftp://127.0.0.1/", "file:///etc/passwd",
+                                 "http://"])
+def test_an_unusable_url_is_refused_with_a_sentence(url):
+    from cognitive_coder.errors import ConfigurationError
+    with pytest.raises(ConfigurationError) as exc:
+        OpenAICompatible(url)
+    text = str(exc.value)
+    assert "http://" in text and "Traceback" not in text
+
+
 def test_a_provider_that_cannot_reach_its_endpoint_says_so_calmly():
     """M11's neighbour: a dead endpoint is a Completion with
     finish_reason="error", not an exception the loop has to special-case."""
@@ -224,3 +285,130 @@ def test_capabilities_of_an_unreachable_endpoint_report_nothing_loaded():
     caps = provider.capabilities()
     assert not caps.loaded
     assert caps.context_tokens > 0        # a budget still has an answer
+
+
+# --------------------------------------------------------------------------
+# local_llamacpp timings (M55, G.7.5)
+# --------------------------------------------------------------------------
+
+class _FakeLlama:
+    """Enough of llama-cpp-python's `Llama` to time a call.
+
+    Note what is absent: `get_timings()`. The provider called it, it does
+    not exist on `Llama`, and the fallback was the whole call's wall time.
+    """
+    model_path = "/models/devstral.gguf"
+
+    def __init__(self, stream_refuses_tools=False):
+        self.calls: list[dict] = []
+        self.stream_refuses_tools = stream_refuses_tools
+
+    def n_ctx(self):
+        return 16384
+
+    def create_chat_completion(self, **kw):
+        import time
+        self.calls.append(kw)
+        if not kw.get("stream"):
+            time.sleep(0.5)
+            return {"choices": [{"message": {"content": "whole"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+        if self.stream_refuses_tools and kw.get("tools"):
+            raise ValueError("streaming is not supported with tools")
+
+        def gen():
+            time.sleep(0.2)
+            for piece in ("a", "b", "c", "d", "e"):
+                yield {"choices": [{"delta": {"content": piece},
+                                    "finish_reason": None}]}
+                time.sleep(0.1)
+            yield {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                   "usage": {"prompt_tokens": 3, "completion_tokens": 5}}
+        return gen()
+
+
+def test_local_llamacpp_measures_prefill_and_decode_apart():
+    from cognitive_coder.providers.local_llamacpp import LocalLlamaCpp
+    out = LocalLlamaCpp(llama=_FakeLlama()).complete(
+        [Message(role="user", content="hi")])
+    assert out.text == "abcde"
+    assert 0 < out.prompt_ms < out.decode_ms, (out.prompt_ms, out.decode_ms)
+    assert (out.tokens_in, out.tokens_out) == (3, 5)
+
+
+def test_local_llamacpp_falls_back_when_streaming_is_refused():
+    from cognitive_coder.providers.local_llamacpp import LocalLlamaCpp
+    llama = _FakeLlama(stream_refuses_tools=True)
+    out = LocalLlamaCpp(llama=llama).complete(
+        [Message(role="user", content="hi")],
+        tools=[ToolSpec(name="x", description="d",
+                        parameters={"type": "object"})])
+    assert out.text == "whole"
+    assert [bool(c.get("stream")) for c in llama.calls] == [True, False]
+
+
+def test_local_llamacpp_cancel_is_checked_per_chunk():
+    from cognitive_coder.providers.local_llamacpp import LocalLlamaCpp
+
+    class After:
+        def __init__(self):
+            self.n = 2
+
+        def is_set(self):
+            self.n -= 1
+            return self.n < 0
+
+    out = LocalLlamaCpp(llama=_FakeLlama()).complete(
+        [Message(role="user", content="hi")], cancel=After())
+    assert out.finish_reason == "cancelled"
+
+
+# --------------------------------------------------------------------------
+# JSON repair must not rewrite string contents (item 9)
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,key,expected", [
+    # The observed corruption: an `apply_patch` argument whose OLD text
+    # contained `[1, 2,]` came back as `[1, 2]` and no longer matched.
+    ('{"old": "xs = [1, 2,]", "new": "ys = []",}', "old", "xs = [1, 2,]"),
+    ('{"old": "f(a, b,)\\n}", "n": 1,}', "old", "f(a, b,)\n}"),
+    ('{"url": "http://h//x", "n": 1,}', "url", "http://h//x"),
+    ('{"c": "a // not a comment", "n": 1,}', "c", "a // not a comment"),
+    ("{'old': 'a = [1,]', 'n': 1,}", "old", "a = [1,]"),
+])
+def test_repair_leaves_string_contents_alone(text, key, expected):
+    value, repaired = base.repair_json(text)
+    assert repaired
+    assert value[key] == expected
+
+
+def test_repair_still_strips_comments_and_commas_outside_strings():
+    value, repaired = base.repair_json(
+        '{\n  "a": [1, 2,], // trailing\n  /* block */ "b": "x",\n}')
+    assert value == {"a": [1, 2], "b": "x"} and repaired
+
+
+def test_find_json_object_takes_the_answer_not_the_echoed_schema():
+    """A reasoning model restates the schema it was shown before answering;
+    the FIRST balanced object is the example, not the answer."""
+    text = ('The schema is {"security": [{"title": "one line", '
+            '"severity": "high|medium|low"}], "performance": []}. '
+            'Looking at the code... here is my answer:\n'
+            '```json\n{"security": [{"title": "SQL injection", '
+            '"severity": "high"}], "performance": []}\n```\n'
+            'Hope that helps {"note": "x"}')
+    found = base.find_json_object(text, keys=("security", "performance"))
+    assert found["security"][0]["title"] == "SQL injection"
+
+
+def test_find_json_object_without_keys_takes_the_last():
+    assert base.find_json_object('{"a": 1} then {"a": 2}') == {"a": 2}
+    assert base.find_json_object("no json here") == {}
+    assert base.find_json_object('{"s": "a } b"} x') == {"s": "a } b"}
+
+
+def test_find_json_object_an_empty_answer_beats_the_echo():
+    text = ('Schema: {"security": [{"title": "one line"}], '
+            '"performance": []}\nNothing to report: {}')
+    assert base.find_json_object(text, keys=("security",)) == {}

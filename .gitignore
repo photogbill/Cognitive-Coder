@@ -20,8 +20,9 @@ build/
 dist/
 *.egg-info/
 
-# Written by the install scripts to prove the target is writable, then left
-# behind. Harmless, but it is not source.
+# Left behind by installers before 2026-09, which wrote it to prove the
+# folder was writable. Neither installer writes it now; it stays ignored so
+# an older clone's leftover does not show up as an untracked file.
 .writetest
 
 # Screenshots and scratch notes kept beside the repo while working
@@ -40,8 +41,10 @@ dist/
 .DS_Store
 Thumbs.db
 
-# The drafted commit message, staged for `git commit -F`
+# The drafted commit message, staged for `git commit -F` — and the used one,
+# which push.bat renames after committing so it cannot be committed twice.
 .git-commit-message.txt
+.git-commit-message.last.txt
 
 # Session state written by MemoryStorage when the engine is run with the repo
 # as its project root — codemap SQLite and its journal. Test debris, not

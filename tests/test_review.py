@@ -387,3 +387,253 @@ def test_a_full_session_writes_the_recommendation_document(tmp_path):
     assert "Do not deploy this yet" in doc
     assert any(r.get("event") == "review" for r in session.journal.events())
 
+
+
+# --------------------------------------------------------------------------
+# the model pass must fail CLOSED (item 10)
+# --------------------------------------------------------------------------
+
+def _reviewed(answer: str, code: str = "x = 1\n"):
+    return review.review(code, "m.py", llm=ScriptedLLM([answer]),
+                         prompts=PromptBuilder())
+
+
+def test_a_restated_schema_is_not_taken_as_the_answer():
+    """Observed: the model restated REVIEW_SCHEMA before answering; the
+    first object was taken, findings were titled "one line" with severity
+    "high|medium|low", the real high finding was lost, and the document
+    said nothing should stop the code being used."""
+    answer = ("Here is the shape I will use:\n" + review.REVIEW_SCHEMA
+              + "\n\nAnd my actual review:\n"
+              '{"security": [{"severity": "high", "title": "shell=True with '
+              'user input", "detail": "d", "line": 3, "fix": "use argv"}], '
+              '"performance": [], "overall": "one real problem"}')
+    result = _reviewed(answer)
+    titles = [f.title for f in result.findings if f.source == "model"]
+    assert titles == ["shell=True with user input"]
+    doc = review.recommendation_document(result)
+    assert "Nothing was found that should stop" not in doc
+
+
+def test_a_line_range_does_not_raise_through_the_session():
+    """`int("3-4")` raised ValueError out of `session.review()`."""
+    result = _reviewed('{"security": [{"severity": "high", "title": "rce", '
+                       '"line": "3-4"}], "performance": []}')
+    assert [f.line for f in result.findings if f.source == "model"] == [3]
+    result = _reviewed('{"security": [{"severity": "high", "title": "x", '
+                       '"line": "near the top"}], "performance": []}')
+    assert [f.line for f in result.findings if f.source == "model"] == [0]
+
+
+@pytest.mark.parametrize("given,expected", [
+    ("CRITICAL", "high"), ("High", "high"), ("severe", "high"),
+    ("MEDIUM", "medium"), ("moderate", "medium"), ("low", "low"),
+    ("info", "low"), ("banana", "high"), ("", "high"),
+])
+def test_severity_is_normalised_and_unknowns_fail_closed(given, expected):
+    """"CRITICAL" was lower-cased and then ranked as LOW."""
+    result = _reviewed('{"security": [{"severity": "' + given
+                       + '", "title": "t"}], "performance": []}')
+    assert [f.severity for f in result.findings
+            if f.source == "model"] == [expected]
+
+
+def test_an_empty_object_means_nothing_found_and_says_so():
+    """`{}` is a valid "nothing to report", not an unusable answer."""
+    result = _reviewed("{}")
+    assert result.model_reviewed
+    assert not any("did not produce a usable answer" in n
+                   for n in result.notes)
+    assert any("found nothing" in n for n in result.notes)
+
+
+def test_no_all_clear_above_a_zero_test_caveat():
+    result = review.review("def add(a, b):\n    return a + b\n", "m.py",
+                           use_model=False)
+    doc = review.recommendation_document(
+        result, caveats=("the test command succeeded but ran ZERO tests",))
+    assert "Nothing was found that should stop" not in doc
+    assert "no tests ran" in doc.lower()
+    doc = review.recommendation_document(result, tests_ran=False)
+    assert "Nothing was found that should stop" not in doc
+    doc = review.recommendation_document(result)
+    assert "Nothing was found that should stop" in doc
+
+
+def test_the_independence_line_comes_before_a_pasted_spec():
+    """With a pasted spec as the request, the M41 line landed 75% of the
+    way down the page."""
+    spec = "\n".join(f"Requirement {i}: the thing shall do {i}."
+                     for i in range(200))
+    doc = review.recommendation_document(_model_result(), request=spec,
+                                         files=["src/x.py"])
+    assert doc.index("not independent") < doc.index("What was asked for")
+    assert doc.index("not independent") / len(doc) < 0.1
+
+
+def test_a_long_file_says_the_model_saw_only_part_of_it():
+    code = "\n".join(f"x{i} = {i}" for i in range(450)) + "\n"
+    result = _reviewed('{"security": [], "performance": []}', code=code)
+    assert any("first 400 lines" in n and "450" in n for n in result.notes)
+
+
+# --------------------------------------------------------------------------
+# external scanners must fail CLOSED and stay offline (item 11)
+# --------------------------------------------------------------------------
+
+class _FakeExec:
+    """An ExecPort with chosen scanners 'installed' and a canned result."""
+
+    def __init__(self, installed, proc):
+        self.installed = set(installed)
+        self.proc = proc
+        self.argvs: list[list[str]] = []
+
+    def which(self, name):
+        return f"/usr/bin/{name}" if name in self.installed else None
+
+    def run(self, argv, *, cwd, timeout, stdin="", env=None):
+        self.argvs.append(list(argv))
+        return self.proc
+
+
+def _bandit_json():
+    import json
+    return json.dumps({"results": [{
+        "issue_severity": "HIGH", "test_id": "B602", "filename": "m.py",
+        "issue_text": "subprocess call with shell=True", "line_number": 3}]})
+
+
+def test_a_scanner_warning_on_stderr_does_not_hide_its_findings():
+    """`proc.output` joined stderr to the JSON, `json.loads` failed, the
+    findings were dropped in silence and the report said "No security
+    findings" with bandit listed as run."""
+    from cognitive_coder.ports import MemoryFileSystem
+    from cognitive_coder.types import ProcResult
+    ex = _FakeExec({"bandit"}, ProcResult(
+        exit_code=1, stdout=_bandit_json(),
+        stderr="[main]\tWARNING\tcould not load plugin foo"))
+    result = review.review("x = 1\n", "m.py",
+                           fs=MemoryFileSystem({"m.py": b"x = 1\n"}),
+                           ex=ex, use_model=False)
+    assert "bandit" in result.scanners_run
+    assert any(f.source == "bandit" and "shell=True" in f.title
+               for f in result.findings)
+
+
+def test_a_timed_out_scanner_is_not_listed_as_run():
+    from cognitive_coder.ports import MemoryFileSystem
+    from cognitive_coder.types import ProcResult
+    ex = _FakeExec({"bandit"}, ProcResult(exit_code=-9, timed_out=True))
+    result = review.review("x = 1\n", "m.py",
+                           fs=MemoryFileSystem({"m.py": b"x = 1\n"}),
+                           ex=ex, use_model=False)
+    assert "bandit" not in result.scanners_run
+    assert any("bandit" in n and "timed out" in n
+               for n in result.scanners_failed)
+    assert any("bandit" in n for n in result.notes)
+    doc = review.recommendation_document(result)
+    assert "did not produce a result" in doc
+
+
+def test_unreadable_scanner_output_is_a_failure_not_a_clean_bill():
+    from cognitive_coder.ports import MemoryFileSystem
+    from cognitive_coder.types import ProcResult
+    ex = _FakeExec({"bandit"}, ProcResult(exit_code=0, stdout="Traceback…"))
+    result = review.review("x = 1\n", "m.py",
+                           fs=MemoryFileSystem({"m.py": b"x = 1\n"}),
+                           ex=ex, use_model=False)
+    assert "bandit" not in result.scanners_run
+    assert result.scanners_failed
+
+
+def test_semgrep_never_fetches_rules_or_sends_metrics():
+    """`--config=auto` downloads rules from the registry and reports
+    metrics: network traffic from a stage built to be offline."""
+    from cognitive_coder.ports import MemoryFileSystem
+    from cognitive_coder.types import ProcResult
+    ex = _FakeExec({"semgrep"}, ProcResult(exit_code=0,
+                                           stdout='{"results": []}'))
+    fs = MemoryFileSystem({"m.py": b"x = 1\n"})
+    result = review.review("x = 1\n", "m.py", fs=fs, ex=ex,
+                           use_model=False)
+    assert ex.argvs == [], "semgrep ran with no local rules"
+    assert any("semgrep" in n and "local rules" in n
+               for n in result.scanners_absent)
+    fs = MemoryFileSystem({"m.py": b"x = 1\n", ".semgrep.yml": b"rules: []"})
+    result = review.review("x = 1\n", "m.py", fs=fs, ex=ex,
+                           use_model=False)
+    argv = " ".join(ex.argvs[-1])
+    assert "--metrics=off" in argv and "auto" not in argv
+    assert ".semgrep.yml" in argv
+    assert "semgrep" in result.scanners_run
+
+
+# --------------------------------------------------------------------------
+# the session's side of the review (integration hooks)
+# --------------------------------------------------------------------------
+
+def _one_file_session(tmp_path, *, extra_replies=()):
+    from cognitive_coder import (
+        AutoApprove,
+        Host,
+        MemoryStorage,
+        RecordingEvents,
+        Session,
+        SessionConfig,
+    )
+    replies = [
+        "src/report.py — build a report\n",
+        '```python\ndef build(rows):\n    """Build."""\n'
+        '    return len(rows)\n```',
+        '{"security": [], "performance": [], "overall": "fine"}',
+        *extra_replies,
+    ]
+    host = Host(llm=ScriptedLLM(replies, supports_tools=False),
+                fs=LocalFileSystem(str(tmp_path)), exec=SubprocessExec(),
+                storage=MemoryStorage(str(tmp_path / ".s")),
+                events=RecordingEvents(), approval=AutoApprove())
+    return Session(host, config=SessionConfig(attempts=1,
+                                              skeleton_first=False))
+
+
+def test_a_scanner_that_failed_is_reported_by_the_session(tmp_path,
+                                                          monkeypatch):
+    """`review()` reports a timed-out scanner in `scanners_failed`; the
+    session merged `scanners_run` and `scanners_absent` and dropped that
+    list, so the document said "No security findings" on the strength of a
+    tool that never produced an answer."""
+    real = review.review
+
+    def with_a_failed_scanner(*a, **kw):
+        result = real(*a, **kw)
+        result.scanners_failed.append("bandit timed out after 60 s")
+        return result
+
+    monkeypatch.setattr(review, "review", with_a_failed_scanner)
+    session = _one_file_session(tmp_path)
+    session.run("a report builder", {"skill_level": "senior"})
+    doc = (tmp_path / "Recommendation.md").read_text(encoding="utf-8")
+    assert "bandit timed out after 60 s" in doc
+    assert "did not produce a result" in doc
+
+
+def test_the_verification_line_does_not_claim_tests_that_never_ran(
+        tmp_path):
+    """The session wrote "N of M file(s) built and their tests ran" for a
+    build with no test file at all, and the all-clear followed it."""
+    session = _one_file_session(tmp_path)
+    session.run("a report builder", {"skill_level": "senior"})
+    doc = (tmp_path / "Recommendation.md").read_text(encoding="utf-8")
+    assert "their tests ran" not in doc
+    assert "no tests ran" in doc
+    assert "Nothing was found that should stop this being used" not in doc
+
+
+def test_a_partly_tested_build_names_the_untested_files():
+    doc = review.recommendation_document(
+        review.ReviewResult(), files=["a.py", "b.py"],
+        build_summary="2 of 2 file(s) built; 1 of them have no tests",
+        tests_ran=True, untested=["b.py"])
+    assert "Nothing was found that should stop this being used" not in doc
+    assert "`b.py`" in doc and "have no tests" in doc

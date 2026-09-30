@@ -37,6 +37,18 @@ TOOLS="$HERE/.tools"
 MIN_MAJOR=3
 MIN_MINOR=11
 
+# uv, PINNED, and its installer script verified before it runs. It was
+# `curl https://astral.sh/uv/install.sh | sh`: whatever that URL served on
+# the day, unverified, executed. Now a fixed release's installer is fetched
+# to a file and its SHA-256 compared with the one below; a mismatch, or no
+# sha256 tool to check with, means it is NOT run. What remains trusted:
+# that installer downloads the uv archive itself, over HTTPS from the same
+# GitHub release, and 0.8.22's installer carries no checksum for it.
+# To move to a newer uv: change both lines, from the release's own asset.
+UV_VERSION="0.8.22"
+UV_INSTALLER_SHA256="f1ac30b1849f90b17ca93a9c2d40f74d7ad79cf57ad5a179bc5c9948848a70cd"
+UV_INSTALLER_URL="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-installer.sh"
+
 WANT_PROVIDERS=0
 WANT_TREESITTER=0
 WANT_DEV=0
@@ -60,6 +72,46 @@ note() { SUMMARY="${SUMMARY}$1
 "; }
 
 say() { printf '%s\n' "$1"; }
+
+# pip's stderr, kept so a failure can SAY something. It went to /dev/null,
+# and a failed core install was then the single line "[!!] FAILED" — with
+# the one sentence that explained it thrown away.
+PIP_ERR="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/cc-pip-err.$$")"
+# pip's download cache, too, stays in the clone (rule 4); it was the one
+# thing a run left in $HOME.
+export PIP_CACHE_DIR="$TOOLS/pip-cache"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+trap 'rm -f "$PIP_ERR" "$PIP_ERR.tail"' EXIT
+
+# pip install, offline-first. `pip install -e .` builds in an ISOLATED env
+# by default, and that env fetches setuptools from PyPI even when every
+# wheel the project needs is already present — so an offline machine with
+# a perfectly good venv failed here. --no-build-isolation uses the venv's
+# own setuptools; only if that cannot build does the isolated way run.
+pip_install() {
+    "$VPY" -m pip install --quiet --no-build-isolation "$@" \
+        >/dev/null 2>"$PIP_ERR" && return 0
+    "$VPY" -m pip install --quiet "$@" >/dev/null 2>"$PIP_ERR"
+}
+
+# The last five lines pip wrote to stderr, indented, into the summary.
+# Read from a file, not a pipe: `tail | while` runs the loop in a subshell
+# in POSIX sh, and every `note` it made would vanish with it.
+pip_tail() {
+    tail -n 5 "$PIP_ERR" > "$PIP_ERR.tail" 2>/dev/null || return 0
+    while IFS= read -r line; do
+        note "        | $line"
+    done < "$PIP_ERR.tail"
+    rm -f "$PIP_ERR.tail"
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
 
 say "Cognitive Coder — installing into this folder only."
 say "Nothing outside $HERE will be changed."
@@ -97,6 +149,16 @@ else
     say "No Python $MIN_MAJOR.$MIN_MINOR or later was found. Fetching one into"
     say "$PYDIR — nothing is installed system-wide."
     mkdir -p "$TOOLS"
+    # INTO THE CLONE, all of it. Without these, uv puts the interpreter in
+    # its global data directory, its cache in ~/.cache and (from 0.8) a
+    # python3.x shim in ~/.local/bin — while this script, the README and
+    # CONFORMANCE M46 all said "into the clone", and PYDIR was only ever
+    # echoed. Deleting the clone must remove every trace (rule 4).
+    export UV_PYTHON_INSTALL_DIR="$PYDIR"
+    export UV_PYTHON_BIN_DIR="$TOOLS/bin"
+    export UV_CACHE_DIR="$TOOLS/uv-cache"
+    export UV_PYTHON_PREFERENCE="only-managed"
+    UV_WHY=""
     if command -v curl >/dev/null 2>&1; then
         FETCH="curl -fsSL -o"
     elif command -v wget >/dev/null 2>&1; then
@@ -109,29 +171,46 @@ else
         # and create the venv. It is by far the least code, works identically
         # on Windows and Linux, and never touches the system Python.
         if [ ! -x "$TOOLS/uv" ]; then
-            $FETCH "$TOOLS/uv-installer.sh" https://astral.sh/uv/install.sh \
+            rm -f "$TOOLS/uv-installer.sh"
+            $FETCH "$TOOLS/uv-installer.sh" "$UV_INSTALLER_URL" \
                 2>/dev/null || true
-            if [ -f "$TOOLS/uv-installer.sh" ]; then
-                UV_INSTALL_DIR="$TOOLS" UV_NO_MODIFY_PATH=1 \
+            GOT="$(sha256_of "$TOOLS/uv-installer.sh" 2>/dev/null || true)"
+            if [ ! -f "$TOOLS/uv-installer.sh" ]; then
+                UV_WHY="the download of $UV_INSTALLER_URL failed"
+            elif [ -z "$GOT" ]; then
+                UV_WHY="there is no sha256sum or shasum to verify it with,"
+                UV_WHY="$UV_WHY so it was not run"
+            elif [ "$GOT" != "$UV_INSTALLER_SHA256" ]; then
+                UV_WHY="its SHA-256 was $GOT, not the pinned"
+                UV_WHY="$UV_WHY $UV_INSTALLER_SHA256, so it was not run"
+            else
+                # UV_UNMANAGED_INSTALL: into this folder, no receipt, no
+                # PATH edit, no self-update — uv's documented CI mode.
+                UV_UNMANAGED_INSTALL="$TOOLS" UV_NO_MODIFY_PATH=1 \
                     sh "$TOOLS/uv-installer.sh" >/dev/null 2>&1 || true
+                [ -x "$TOOLS/uv" ] || UV_WHY="its installer did not produce $TOOLS/uv"
             fi
+            [ -z "$UV_WHY" ] || rm -f "$TOOLS/uv-installer.sh"
         fi
         if [ -x "$TOOLS/uv" ]; then
             "$TOOLS/uv" python install "$MIN_MAJOR.$MIN_MINOR" \
                 >/dev/null 2>&1 || true
             PYTHON="$("$TOOLS/uv" python find "$MIN_MAJOR.$MIN_MINOR" \
                 2>/dev/null || true)"
-            PY_SOURCE="fetched by uv into this clone"
+            PY_SOURCE="fetched by uv into this clone's .python/"
         fi
+    else
+        UV_WHY="there is neither curl nor wget to download it with"
     fi
     if [ -z "$PYTHON" ]; then
         # Rule 5: say exactly what was tried and what to install by hand.
         say ""
         say "FAILED: no usable Python, and one could not be fetched."
         say "  Tried: python3.11, python3.12, python3.13, python3, python"
-        say "  Then:  downloading uv from https://astral.sh/uv/install.sh"
+        say "  Then:  uv $UV_VERSION from $UV_INSTALLER_URL"
+        [ -z "$UV_WHY" ] || say "         — $UV_WHY."
         say "  Fix:   install Python $MIN_MAJOR.$MIN_MINOR or later, then run"
-        say "         this again. Nothing was changed."
+        say "         this again. Nothing outside .tools/ was changed."
         exit 1
     fi
 fi
@@ -152,13 +231,14 @@ VPY="$VENV/bin/python"
 # --------------------------------------------------------------------------
 # 3. the core: zero required runtime dependencies
 # --------------------------------------------------------------------------
-if "$VPY" -m pip install --quiet -e "$HERE" >/dev/null 2>&1; then
+if pip_install -e "$HERE"; then
     CORE_OK=1
     note "  [OK] core engine          .venv ready, 0 required deps"
 else
     note "  [!!] core engine          pip install -e . FAILED — the engine"
     note "                            will not import. Everything below is"
-    note "                            moot until that is fixed."
+    note "                            moot until that is fixed. pip said:"
+    pip_tail
 fi
 note "  [OK] Python               $("$VPY" --version 2>&1 | cut -d' ' -f2) — $PY_SOURCE"
 
@@ -168,11 +248,23 @@ note "  [OK] Python               $("$VPY" --version 2>&1 | cut -d' ' -f2) — $
 # langs.py probes again at runtime (§6.1), so a compiler installed the week
 # after install day simply works. This record is for the summary, nothing
 # more.
+# Not every tool spells it --version: `go --version` prints "flag provided
+# but not defined", and that sentence used to BE the Go line of the summary.
+version_of() {
+    case "$1" in
+        go|zig)     "$1" version ;;
+        lua|luajit) "$1" -v ;;
+        javac)      "$1" -version ;;
+        *)          "$1" --version ;;
+    esac 2>&1 | sed '/^Picked up /d' | head -n1 | cut -c1-40
+    # (a JVM with JAVA_TOOL_OPTIONS set announces it before the version)
+}
+
 detect() {   # $1 = label, $2 = binaries, $3 = what its absence costs
     label="$1"; bins="$2"; cost="$3"
     for b in $bins; do
         if command -v "$b" >/dev/null 2>&1; then
-            note "  [OK] $label$("$VPY" -c "print(' ' * max(1, 22 - len('$label')), end='')")$("$b" --version 2>&1 | head -n1 | cut -c1-40)"
+            note "  [OK] $label$("$VPY" -c "print(' ' * max(1, 22 - len('$label')), end='')")$(version_of "$b")"
             return 0
         fi
     done
@@ -196,10 +288,11 @@ detect "Godot"            "godot godot4"  "GDScript degrades to outline-and-edit
 # 5. optional extras — only on an explicit flag, and each degrades (rule 5)
 # --------------------------------------------------------------------------
 optional() {   # $1 = extra, $2 = label, $3 = cost of absence
-    if "$VPY" -m pip install --quiet -e "$HERE[$1]" >/dev/null 2>&1; then
+    if pip_install -e "$HERE[$1]"; then
         note "  [OK] $2"
     else
-        note "  [--] $2 — could not be installed. $3"
+        note "  [--] $2 — could not be installed. $3 pip said:"
+        pip_tail
     fi
 }
 

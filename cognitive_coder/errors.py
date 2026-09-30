@@ -42,16 +42,47 @@ class CognitiveCoderError(Exception):
         return self.sentence
 
     @classmethod
-    def wrap(cls, exc: BaseException, sentence: str) -> CognitiveCoderError:
+    def wrap(cls, exc: BaseException, sentence: str = ""
+             ) -> CognitiveCoderError:
         """Turn an internal exception into an operator-facing one.
 
         The traceback is preserved in ``detail`` for the journal — this is the
         mechanism by which C6 loses nothing. A swallowed traceback is a
-        different bug from a displayed one, and both are bad.
+        different bug from a displayed one, and both are bad. The original is
+        also chained as ``__cause__``, so `raise err` shows both.
+
+        Works for EVERY subclass. It used to call ``cls(sentence, detail)``,
+        which is the base signature only: `PathEscape.wrap(...)` produced
+        "Refused to touch 'could not load the plan'" and
+        `NoModelLoadedError.wrap(...)` raised TypeError — an error path that
+        errors. Subclass fields keep their class defaults.
+
+        ``sentence`` is made a sentence (capitalised, closed with a full
+        stop). Without one, the exception's own message is used — never its
+        type name or traceback, which belong in ``detail``.
         """
         detail = "".join(traceback.format_exception(
             type(exc), exc, exc.__traceback__))
-        return cls(sentence, detail)
+        if isinstance(exc, CognitiveCoderError) and exc.detail:
+            detail = exc.detail.rstrip("\n") + "\n\n" + detail
+        err = Exception.__new__(cls)
+        CognitiveCoderError.__init__(err, _as_sentence(sentence, exc),
+                                     detail)
+        err.__cause__ = exc
+        return err
+
+
+def _as_sentence(text: str, exc: BaseException) -> str:
+    """A plain sentence: capitalised, ending in . ! or ? (C6)."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        said = " ".join(str(exc).split()) if not isinstance(
+            exc, CognitiveCoderError) else exc.sentence
+        body = (f"The engine stopped: {said.rstrip('.')}" if said else
+                "The engine stopped on an internal error; the details are "
+                "in the journal")
+    body = body[0].upper() + body[1:]
+    return body if body.endswith((".", "!", "?")) else body + "."
 
 
 class PortError(CognitiveCoderError):
@@ -89,6 +120,8 @@ class GuardRefusal(CognitiveCoderError):
     is the engine declining to run something that looks like an accident.
     """
 
+    findings: tuple = ()            # a wrapped instance keeps defaults
+
     def __init__(self, reason: str, findings: tuple = ()) -> None:
         super().__init__(
             f"The generated code was refused before it ran: {reason}.")
@@ -102,6 +135,9 @@ class PathEscape(CognitiveCoderError):
     retried, softened, or handled generically. Every mode, every caller, no
     exceptions.
     """
+
+    path: str = ""
+    root: str = ""
 
     def __init__(self, path: str, root: str) -> None:
         super().__init__(
@@ -136,6 +172,9 @@ class BudgetExceeded(CognitiveCoderError):
     Carries what was achieved, because "it stopped" without "and here is what
     you got" is the unhelpful half of the message.
     """
+
+    kind: str = ""
+    limit: str = ""
 
     def __init__(self, kind: str, limit: str, achieved: str = "") -> None:
         got = f" What was finished: {achieved}." if achieved else ""
