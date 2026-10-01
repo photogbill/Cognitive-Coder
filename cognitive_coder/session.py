@@ -39,7 +39,7 @@ from typing import Any
 import uuid
 
 from . import journal as journal_mod
-from . import langs, personas
+from . import langs, models, personas, runner
 from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import (
@@ -47,6 +47,7 @@ from .errors import (
     Cancelled,
     CognitiveCoderError,
     NoModelLoadedError,
+    NotACodingModelError,
 )
 from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
@@ -103,6 +104,11 @@ class SessionConfig:
     skills_dir: str = skills_mod.SKILLS_DIR
     model_system_prompt: str = ""        # the model's OWN shipped prompt
     journal_dir: str = ".cc_journal"
+    #: Build with a model whose name says it is NOT a coding model (a
+    #: roleplay or fiction merge). Off: such a model is refused at start, in
+    #: one sentence, instead of burning twenty minutes. Models the engine
+    #: merely does not recognise are allowed either way, under a warning.
+    allow_any_model: bool = False
     #: HOW LONG TO WAIT ON THE GENERATED PROGRAM. Not on the model — nothing
     #: in this config bounds generation, by design (see `Timeouts`). `None`
     #: takes the language default; `0` waits indefinitely.
@@ -210,6 +216,7 @@ class Session:
         self._where = "planning"
         self.profile = dict(profile or {})
         caps = self._capabilities(boundary="session start")
+        earlier_sessions = self._count_earlier_sessions()
         self.journal.log("session_start", request=request,
                          model=caps.name, session=self.id,
                          profile=dict(profile or {}),
@@ -217,6 +224,9 @@ class Session:
                                  "temperature": self.config.temperature,
                                  "max_tokens": self.config.max_tokens,
                                  "lang": self.config.lang})
+        # Right after the start record, so a refused session leaves a
+        # journal that says it started and why it stopped.
+        self._check_model(caps)
         if self.skill_load.skills or self.skill_load.skipped:
             # C8: which guidance shaped this session, at which revision —
             # and equally which guidance did NOT load, so a session that
@@ -238,6 +248,8 @@ class Session:
                          edges=stats.edges, unresolved=stats.unresolved,
                          resolution=round(stats.resolution_rate, 3))
         self.codemap.maybe_bump_epoch(operator_asked=True)
+        self._previous_build_warning(earlier_sessions)
+        self._baseline_existing_tests()
 
         self.plan = self.planner.plan(request, profile)
         self.log.rule("PLAN")
@@ -375,7 +387,8 @@ class Session:
         self._where = task.path
         covers = self._covered_module(task)
         outcome = self.loop.run_task(task, request=self.plan.request,
-                                     covers=covers.path if covers else "")
+                                     covers=covers.path if covers else "",
+                                     planned=self._planned_paths(task))
         self.outcomes.append(outcome)
         blamed = self.loop.blamed.pop(task.path, None)
         if blamed and covers is not None and covers.path not in self._repaired:
@@ -398,12 +411,13 @@ class Session:
             task.with_status("done" if outcome.ok else "failed",
                              attempts=len(outcome.attempts)))
         self.log.event(
-            f"{'DONE' if outcome.ok else 'FAILED'} {task.path}",
+            f"{outcome.label} {task.path}",
             f"{len(outcome.attempts)} attempt(s)"
             + (f" — {outcome.stopped_because}" if outcome.stopped_because
                else ""))
         self.journal.log("verify", task=task.path,
                          verify={"ok": outcome.ok,
+                                 "verified": outcome.verified,
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
@@ -447,14 +461,15 @@ class Session:
                    purpose=module.purpose, test_path=test.path,
                    persona=module.persona, lang=module.lang, atomic=False)
         outcome = self.loop.run_task(fix, request=self.plan.request,
-                                     seed=failing)
+                                     seed=failing,
+                                     planned=self._planned_paths(module))
         self._record(fix, outcome, label="REPAIRED" if outcome.ok
                      else "NOT REPAIRED")
         if not outcome.ok:
             return outcome
         again = self.loop.reverify(
             test, because=f"{module.path} was repaired against it")
-        self._record(test, again, label="DONE" if again.ok else "FAILED")
+        self._record(test, again, label=again.label)
         self.plan = self.plan.replace(test.with_status(
             "done" if again.ok else "failed"))
         return again
@@ -471,6 +486,164 @@ class Session:
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
+
+    def _check_model(self, caps: ModelCapabilities) -> None:
+        """Refuse a model that is not for code; warn about one that is
+        unknown or short of context. Before anything is planned."""
+        verdict = models.judge(caps.name, caps.context_tokens)
+        self.journal.log("model_check", model=caps.name,
+                         verdict=verdict.verdict,
+                         context_tokens=caps.context_tokens,
+                         context_ok=verdict.context_ok,
+                         allowed=verdict.verdict != "not_coding"
+                         or self.config.allow_any_model)
+        if verdict.refuse and not self.config.allow_any_model:
+            self.host.emit("warning", verdict.reason,
+                           {"phase": "model_check", "model": caps.name,
+                            "verdict": verdict.verdict, "refused": True})
+            raise NotACodingModelError(verdict.reason)
+        if verdict.refuse:
+            self.host.emit("warning",
+                           verdict.reason + " Continuing because "
+                           "allow_any_model is set.",
+                           {"phase": "model_check", "model": caps.name,
+                            "verdict": verdict.verdict, "refused": False})
+        elif verdict.verdict == "unknown":
+            self.host.emit("warning", verdict.reason,
+                           {"phase": "model_check", "model": caps.name,
+                            "verdict": verdict.verdict})
+        if not verdict.context_ok:
+            self.host.emit("warning", verdict.context_note,
+                           {"phase": "model_check", "model": caps.name,
+                            "context_tokens": caps.context_tokens})
+
+    def _count_earlier_sessions(self) -> int:
+        """How many builds the folder's log already records. Read BEFORE
+        this session writes its own header into the same file."""
+        try:
+            if not self.host.fs.exists(journal_mod.SessionLog.FILENAME):
+                return 0
+            text = self.host.fs.read(journal_mod.SessionLog.FILENAME) or ""
+        except Exception:                                    # noqa: BLE001
+            return 0
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        return text.count("\nSESSION ")
+
+    def _previous_build_warning(self, earlier: int) -> None:
+        """Say so when this folder already holds an earlier build.
+
+        The tests it left are baselined (`_baseline_existing_tests`); the
+        files it left are kept or stubbed over by the planner's own rules.
+        What neither does is tell the operator the plain fact: this is a
+        rebuild on top of a build, and a clean folder gives a clean answer.
+        """
+        if earlier <= 0:
+            return
+        self.host.emit(
+            "warning",
+            f"This folder already holds {earlier} earlier build "
+            f"session{'s' * (earlier != 1)} (see {journal_mod.SessionLog.FILENAME}). "
+            f"Files and tests left by them are in play: tests that already "
+            f"fail are not charged to this build, and files with real work "
+            f"are kept rather than stubbed over. For a clean result, build "
+            f"into an empty folder.",
+            {"phase": "previous_build", "sessions": earlier})
+        self.log.line(f"  NOTE: {earlier} earlier build session(s) in this "
+                      f"folder — building on top of them")
+
+    def _baseline_existing_tests(self) -> None:
+        """Run the tests that are ALREADY in the folder, before building.
+
+        A project folder is rarely empty: a previous session left its tests
+        behind, or the operator's own are there. Whatever fails before a
+        line is written is not this build's doing, and it must never be
+        charged to the files this build writes — on Aug 8 and Oct 1 a stale
+        `tests/test_physics.py` failed every module of the next build in
+        turn, each regenerated correctly, each stopped by stagnation.
+
+        The failing test modules go to the loop as `known_failing`; the
+        operator is told, by name, in one sentence.
+        """
+        lang_id = self.config.lang or "python"
+        lang = langs.get(lang_id)
+        if lang is None or not lang.test_cmd:
+            return
+        existing = self._existing_test_files(lang)
+        if not existing:
+            return
+        self._where = "checking the tests already in the folder"
+        try:
+            before = runner.run_tests(lang_id, fs=self.host.fs,
+                                      ex=self.host.exec,
+                                      timeout=self.config.test_timeout,
+                                      whole_suite=True)
+        except Exception as exc:                             # noqa: BLE001
+            self.host.emit("warning",
+                           f"the tests already in the folder could not be "
+                           f"run before the build ({_plain_cause(exc)}); "
+                           f"failures in them may be charged to new files",
+                           {"phase": "baseline"})
+            return
+        if before.blocked or before.ok or not before.phases:
+            self.journal.log("baseline", existing=list(existing),
+                             failing=[], ok=bool(before.ok))
+            return
+        failing = runner.failing_test_modules(before.phases[0].output)
+        if not failing:
+            failing = [str(p).replace("\\", "/") for p in existing]
+        self.loop.config.known_failing = tuple(failing)
+        self.journal.log("baseline", existing=list(existing),
+                         failing=list(failing), ok=False)
+        names = ", ".join(failing[:6]) + (" …" if len(failing) > 6 else "")
+        self.host.emit(
+            "warning",
+            f"{len(failing)} test module(s) were already failing before "
+            f"this build started: {names}. They were left by an earlier "
+            f"session or written by hand; their failures will be reported "
+            f"as caveats, never as errors in the files this build writes. "
+            f"For a clean result, build into an empty folder.",
+            {"phase": "baseline", "failing": list(failing)})
+        self.log.line(f"  BASELINE: {len(failing)} test module(s) already "
+                      f"failing before the build: {names}")
+
+    def _existing_test_files(self, lang: Any) -> list[str]:
+        """Test files already on disk for this language, dot-dirs skipped."""
+        try:
+            paths = self.host.fs.list("*")
+        except Exception:                                    # noqa: BLE001
+            return []
+        exts = set(lang.exts or (lang.ext,))
+        out: list[str] = []
+        for raw in paths:
+            rel = str(raw).replace("\\", "/")
+            parts = rel.split("/")
+            if any(p.startswith(".") for p in parts[:-1]):
+                continue
+            name = parts[-1]
+            ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+            if ext in exts and runner.is_test_path(rel):
+                out.append(rel)
+        return sorted(out)
+
+    def _planned_paths(self, task: Task) -> tuple[str, ...]:
+        """The PATHS of the plan's tasks that `task` depends on.
+
+        `depends_on` holds task ids; the codemap's interface block matches
+        paths. Resolving here is what lets a file's first attempt see the
+        real signatures of what it imports (F9). A test task always gets the
+        module it covers, even when the plan's edge is missing.
+        """
+        if self.plan is None:
+            return ()
+        by_id = {t.id: t.path for t in self.plan.tasks}
+        paths = [by_id[d] for d in task.depends_on
+                 if d in by_id and by_id[d] != task.path]
+        covers = self._covered_module(task)
+        if covers is not None and covers.path not in paths \
+                and covers.path != task.path:
+            paths.append(covers.path)
+        return tuple(paths)
 
     def _covered_module(self, task: Task) -> Task | None:
         """For a test task, the planned module it tests; else None."""

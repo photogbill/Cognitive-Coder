@@ -64,7 +64,7 @@ import time
 from typing import Any
 
 from . import diagnostics as dx
-from . import guard, langs, personas, runner, textio
+from . import enrich, guard, langs, personas, runner, textio
 from .context import CHARS_PER_TOKEN, Piece, build_context
 from .errors import Cancelled
 from .personas import (
@@ -116,6 +116,12 @@ class LoopConfig:
     #: Clocks on the generated PROGRAM's build/run/test. Nothing here bounds
     #: generation — a model is given as long as it needs.
     timeouts: Timeouts = field(default_factory=Timeouts)
+    #: Test modules that were failing BEFORE this build started — the
+    #: session's baseline. Their failures are other files' problems and are
+    #: reported as caveats, never as the diagnostics of the file under
+    #: construction. Without this, a stale `tests/test_physics.py` from an
+    #: earlier session failed every module of the next build in turn.
+    known_failing: tuple[str, ...] = ()
 
 
 @dataclass
@@ -157,10 +163,13 @@ class Loop:
     #: Set by `_fit_to_context` when the file being repaired cannot be shown
     #: whole: the sentence the attempt stops with. Consumed at once.
     _too_big: str = field(default="", repr=False)
+    #: Paths of the current task's planned dependencies (set per run_task).
+    _planned: tuple = field(default=(), repr=False)
 
     # ------------------------------------------------------------------
     def run_task(self, task: Task, *, request: str = "", covers: str = "",
-                 seed: Sequence[Diagnostic] = ()) -> TaskOutcome:
+                 seed: Sequence[Diagnostic] = (),
+                 planned: Sequence[str] = ()) -> TaskOutcome:
         """Generate, verify and repair one file until it works or it stops.
 
         Every phase boundary checks the cancel token (M21). A cancelled task
@@ -170,8 +179,13 @@ class Loop:
         ``covers`` is, for a test task, the module it tests. ``seed`` makes
         attempt 1 a REPAIR against diagnostics that already exist — the
         failing output of a test this file must now pass (see
-        `_test_disagrees_with_code`).
+        `_test_disagrees_with_code`). ``planned`` is the PATHS of the files
+        the plan says this one depends on, so their interfaces reach the
+        very first attempt. `task.depends_on` holds task IDs (`t3`), and
+        handing those to the codemap — which matches paths — meant the
+        planned-dependency injection never fired on any build.
         """
+        self._planned = tuple(p for p in planned if p and p != task.path)
         lang = task.lang or langs.id_for_path(task.path) or "python"
         persona = PERSONAS.get(task.persona, personas.ENGINEER)
         is_test = task.persona == "tester" or _looks_like_test(task.path)
@@ -212,6 +226,22 @@ class Loop:
                         lang_obj.feedback_cap if lang_obj else 3,
                         extra_context=bool(lang_obj and lang_obj.cascades))
                     autofixed = last.autofixes if last is not None else ()
+                    # Rung 1 of the escalation ladder: change the INPUT.
+                    # The error names a symbol; the codemap knows that
+                    # symbol; put the truth about it under the error. A
+                    # retry at temperature 0.15 with the same prompt is the
+                    # same answer — this is what makes the prompt different.
+                    facts = enrich.facts_for(carried, codemap=self.codemap,
+                                             fs=self.host.fs, lang=lang)
+                    if facts:
+                        diag_text = f"{diag_text}\n\n{facts}"
+                        self._emit("status",
+                                   f"{task.path}: attempt {n} is enriched, "
+                                   f"not retried — the prompt now carries "
+                                   f"the real definitions the last error "
+                                   f"named",
+                                   {"task": task.path, "attempt": n,
+                                    "enriched": True})
 
                 # A REPAIR needs something to repair: code the previous
                 # attempt wrote, or errors it produced. After an empty
@@ -388,6 +418,8 @@ class Loop:
                 self.unverified.add(task.path)
                 self._emit("warning", f"{task.path}: {unverified}",
                            {"task": task.path, "verified": False})
+            verified = ok and not unverified and self._tests_ran(
+                task, is_test, result)
             if tx is not None:
                 if ok:
                     # committed AND verified: SEALED — unless the tests that
@@ -420,10 +452,31 @@ class Loop:
         outcome = TaskOutcome(
             task_id=task.id, path=task.path,
             ok=bool(result and result.ok), attempts=tuple(attempts),
-            result=result, stopped_because=stopped, caveats=caveats)
+            result=result, stopped_because=stopped, caveats=caveats,
+            verified=verified)
         self._emit("status", outcome.summary(),
-                   {"task": task.path, "ok": outcome.ok})
+                   {"task": task.path, "ok": outcome.ok,
+                    "verified": outcome.verified})
         return outcome
+
+    def _tests_ran(self, task: Task, is_test: bool,
+                   result: RunResult | None) -> bool:
+        """Did THIS file's tests run, at least one of them, and pass?
+
+        The definition of verified. A module whose test file does not exist
+        is built, not verified; so is one whose test run collected nothing;
+        so is a test file that collected nothing (which is also a failure,
+        see `runner.run_tests`). "Nothing contradicted it" is `ok`; this is
+        the claim a green row is allowed to make.
+        """
+        if result is None or not result.ok or not result.tested:
+            return False
+        test_file = task.test_path or (task.path if is_test else "")
+        if not test_file or not self._read(test_file):
+            return False
+        log = "\n".join(p.output for p in result.phases
+                        if p.name == "test" and p.ok)
+        return not runner.zero_tests(log)
 
     def reverify(self, task: Task, *, because: str = "") -> TaskOutcome:
         """Verify a file again WITHOUT generating anything.
@@ -455,9 +508,13 @@ class Loop:
                        + (f": {first.one_line()}" if first else ""))
         outcome = TaskOutcome(task_id=task.id, path=task.path, ok=result.ok,
                               result=result, stopped_because=stopped,
-                              caveats=caveats)
+                              caveats=caveats,
+                              verified=(result.ok and not unverified
+                                        and self._tests_ran(task, is_test,
+                                                            result)))
         self._emit("status", outcome.summary(),
-                   {"task": task.path, "ok": outcome.ok})
+                   {"task": task.path, "ok": outcome.ok,
+                    "verified": outcome.verified})
         return outcome
 
     def _ran_no_tests(self, task: Task, is_test: bool,
@@ -506,9 +563,15 @@ class Loop:
         interfaces = examples = staleness = ""
         if self.codemap is not None:
             arch = self.codemap.prefix_block(task.path)
+            # Planned dependencies by PATH. The session resolves the plan's
+            # task IDs for us; anything in `depends_on` that already looks
+            # like a path (a host driving the loop directly) is honoured too.
+            planned = tuple(self._planned) + tuple(
+                d for d in task.depends_on
+                if ("/" in d or "." in d) and d != task.path)
             blocks = self.codemap.tail_blocks(
                 task.path, count_tokens=self.host.llm.count_tokens,
-                planned=task.depends_on)
+                planned=planned)
             for b in blocks:
                 if b.startswith("# INTERFACES"):
                     interfaces = b
@@ -680,7 +743,7 @@ class Loop:
             text = strip_commentary(text, lang)
 
         # A copied stub marker would make a finished file read as a stub.
-        code = strip_stub_sentinel(_extract(text, lang))
+        code = strip_stub_sentinel(_extract(text, lang, task.path))
         # The prompt that produced the answer: after tool round-trips and
         # the text-lookup fallback, before any continuation (a continuation
         # is derived from this prompt, not a different one).
@@ -925,6 +988,7 @@ class Loop:
             ex=self.host.exec, stem=_stem(task.path), path=task.path,
             project_mode=self.config.project_mode, test_source=test_source,
             timeouts=self.config.timeouts, test_path=task.test_path,
+            known_failing=self.config.known_failing,
             skip_guard=True)      # already screened above; don't pay twice
 
     def _write(self, tx: Any, task: Task, code: str) -> bool:
@@ -1454,7 +1518,7 @@ def _change_task_text(task: Task, request: str, lang: str) -> str:
 _FENCE = re.compile(r"```[\w+#.-]*\n(.*?)```", re.S)
 
 
-def _extract(text: str, lang_id: str) -> str:
+def _extract(text: str, lang_id: str, path: str = "") -> str:
     """Model reply → the file's contents (D5).
 
     Fence confusion is real: three backticks inside a docstring, a language
@@ -1475,7 +1539,8 @@ def _extract(text: str, lang_id: str) -> str:
         except SyntaxError:
             return False
 
-    return patcher.extract_code(text, lang_id, validator=validates)
+    return patcher.extract_code(text, lang_id, validator=validates,
+                                path=path)
 
 
 def _verify_dict(result: RunResult) -> dict:

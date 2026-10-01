@@ -116,8 +116,15 @@ def test_discover_skips_a_directory_that_is_not_a_package(tmp_path):
 
     before = discover()
     assert "Ran 0 tests" in before.stderr, before.stderr
-    #: And it EXITS ZERO. That is what made a silent no-op look like a pass.
-    assert before.returncode == 0
+    #: And on Python ≤ 3.11 it EXITS ZERO. That is what made a silent no-op
+    #: look like a pass. Python 3.12 changed unittest to exit 5 and print
+    #: "NO TESTS RAN" — a different signal for the same nothing, and the
+    #: runner has to read both (`runner.zero_tests`, exit status 5).
+    if sys.version_info >= (3, 12):
+        assert before.returncode == 5, before.returncode
+        assert "NO TESTS RAN" in before.stderr
+    else:
+        assert before.returncode == 0
 
     (tmp_path / "tests" / "__init__.py").write_text("")
     after = discover()

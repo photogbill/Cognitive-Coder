@@ -157,20 +157,87 @@ _FENCE_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-def extract_code(text: str, lang_id: str = "", validator=None) -> str:
+#: Words just before a fence that mean "this is context, not my answer":
+#: the model narrating a file it imagines it is reading. On Aug 8 a reply
+#: began "Let me check the math3d.py file" + a fence holding an invented
+#: class, then "Here's the corrected file:" + the real test — and the first
+#: fence was written to disk as tests/test_math3d.py.
+_CONTEXT_CUES = re.compile(
+    r"(?:let me|i'll|i will|i need to)\s+(?:check|look|read|see|inspect)|"
+    r"\b(?:existing|current(?:ly)?|as it stands|for reference|looks like "
+    r"this|the original|before the (?:fix|change))\b", re.I)
+#: Words just before a fence that mean "this is the answer".
+_ANSWER_CUES = re.compile(
+    r"\b(?:corrected|complete|fixed|updated|final|rewritten|full)\b|"
+    r"here(?:'s| is) the", re.I)
+#: What a test file contains, by framework. A reply for `tests/test_x.py`
+#: that holds one fence with these and one without should keep the one with.
+_TEST_MARKERS = re.compile(
+    r"\bimport unittest\b|\bunittest\.TestCase\b|^\s*def test_\w+|"
+    r"\bimport pytest\b|#\[test\]|\bfunc Test\w+\(|\b(?:describe|it|test)\("
+    r"|\[Test(?:Method|Case)?\]|@Test\b", re.M)
+
+
+def _looks_like_test_path(path: str) -> bool:
+    rel = str(path or "").replace("\\", "/").lower()
+    name = rel.rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return (stem.startswith("test_") or stem.endswith("_test")
+            or ".test" in name or ".spec" in name
+            or any(f in ("test", "tests", "spec", "__tests__")
+                   for f in rel.split("/")[:-1]))
+
+
+def _rank_fences(text: str, fences: list, *, path: str = "") -> list:
+    """Order same-language fences by how likely each is THE file.
+
+    The signals, strongest first: a test file is expected and the fence
+    holds tests (or does not); the words before the fence say it is context
+    ("let me check the existing file") or the answer ("here's the corrected
+    file"); then length, since a whole file beats a fragment. Document
+    order breaks ties — the old rule, now the last word instead of the only
+    one.
+    """
+    want_test = _looks_like_test_path(path)
+
+    def score(item: tuple[int, re.Match]) -> tuple:
+        i, m = item
+        body = m.group("body")
+        lead = text[max(0, m.start() - 220):m.start()]
+        pts = 0
+        has_test = bool(_TEST_MARKERS.search(body))
+        if path:
+            pts += 100 if has_test == want_test else -40
+        if _CONTEXT_CUES.search(lead):
+            pts -= 50
+        if _ANSWER_CUES.search(lead):
+            pts += 20
+        pts += min(len(body.splitlines()), 200) / 10
+        return (-pts, i)
+
+    return [m for _i, m in sorted(enumerate(fences), key=score)]
+
+
+def extract_code(text: str, lang_id: str = "", validator=None, *,
+                 path: str = "") -> str:
     """The code from a model reply, when the whole reply should be one file.
 
     Fence confusion is D5: three backticks inside a docstring, a language tag
     that isn't a language, no fence at all, two fences with different content.
-    So, in order: fences TAGGED for the target language; then untagged
-    fences, longest first; then fences tagged for something else, longest
-    first; then the whole reply — and **validate by parsing** where a
-    validator is supplied, trying the next candidate before giving up. Never
-    assume the first fence.
+    So, in order: fences TAGGED for the target language, ranked by how much
+    each looks like the file asked for (`_rank_fences`: a test file holds
+    tests; "let me check the existing file" marks context, "here's the
+    corrected file" marks the answer; longer beats shorter; document order
+    last); then untagged fences, longest first; then fences tagged for
+    something else, longest first; then the whole reply — and **validate by
+    parsing** where a validator is supplied, trying the next candidate
+    before giving up. Never assume the first fence.
 
     Untagged is never "tagged for the target". Observed: "Build with:
     ```cargo run```" followed by a ```rust fence wrote `main.rs` as
     `cargo run`, because the untagged command came first and counted.
+
+    ``path`` is the file this reply is meant to be; it drives the ranking.
     """
     body = text or ""
     fences = list(_FENCE.finditer(body))
@@ -182,7 +249,9 @@ def extract_code(text: str, lang_id: str = "", validator=None) -> str:
     by_length = sorted(fences, key=lambda m: -len(m.group("body")))
     if lang_id:
         aliases = {lang_id.lower(), *_FENCE_ALIASES.get(lang_id.lower(), ())}
-        candidates += [m.group("body") for m in fences if tag(m) in aliases]
+        tagged = [m for m in fences if tag(m) in aliases]
+        candidates += [m.group("body")
+                       for m in _rank_fences(body, tagged, path=path)]
     candidates += [m.group("body") for m in by_length if not tag(m)]
     candidates += [m.group("body") for m in by_length if tag(m)]
     candidates.append(body)

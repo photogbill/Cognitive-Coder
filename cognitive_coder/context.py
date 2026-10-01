@@ -272,17 +272,127 @@ def interface(text: str, lang_id: str = "python", path: str = "") -> str:
     and predictable, and the model cannot hallucinate around a signature it
     has been handed verbatim.
     """
-    syms = [s for s in symbols(text, lang_id)
-            if not s.name.split(".")[-1].startswith("_")]
-    if not syms:
+    body, approx = interface_lines(symbols(text, lang_id))
+    if not body:
         return f"# {path or 'file'}: no public symbols"
     lines = [f"# interface of {path or 'file'} — signatures only, no bodies"]
-    for s in syms:
-        doc = f"  # {s.docstring}" if s.docstring else ""
-        lines.append(f"{s.signature or s.name}{doc}")
-    if any(s.approximate for s in syms):
+    lines.extend(body)
+    if approx:
         lines.append("# (pattern-matched, so it may be incomplete)")
     return "\n".join(lines)
+
+
+#: Dunder methods that ARE the interface: how a thing is constructed, called,
+#: iterated, compared, sized. Everything else starting with `_` is private.
+#: `__init__` is the one that mattered: filtering it out as private is why
+#: three builds of the same spec called `CarState(speed=…)` on a constructor
+#: that takes nothing — the model was never shown that it takes nothing.
+_PUBLIC_DUNDERS = frozenset({
+    "__init__", "__new__", "__call__", "__enter__", "__exit__", "__aenter__",
+    "__aexit__", "__iter__", "__next__", "__aiter__", "__anext__",
+    "__getitem__", "__setitem__", "__delitem__", "__len__", "__contains__",
+    "__eq__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__", "__bool__",
+    "__repr__", "__str__", "__add__", "__sub__", "__mul__", "__truediv__",
+    "__floordiv__", "__neg__", "__await__"})
+
+_CLASS_KINDS = ("class", "struct", "trait", "interface", "enum")
+
+
+def is_public_symbol(name: str) -> bool:
+    """Public = not underscored, or a dunder that defines how it is used."""
+    last = name.split(".")[-1]
+    return not last.startswith("_") or last in _PUBLIC_DUNDERS
+
+
+def interface_lines(rows: Sequence[Any], *, indent: str = "    "
+                    ) -> tuple[list[str], bool]:
+    """Render symbol rows as an interface: (lines, any_approximate).
+
+    `rows` are `Symbol`s or the codemap store's dicts (name, kind, signature,
+    docstring, approximate); both callers share this so the model sees the
+    same surface whichever path built it. Members sit indented under their
+    class; a class's fields and instance attributes are each ONE comment
+    line, and a class without an explicit constructor gets a `# construct:`
+    line, because that is the call every test and caller must get right.
+    """
+    def get(r: Any, key: str, default: Any = "") -> Any:
+        if isinstance(r, dict):
+            return r.get(key, default)
+        return getattr(r, key, default)
+
+    rows = [r for r in rows if get(r, "kind") != "module"]
+    names = {get(r, "name"): get(r, "kind") for r in rows}
+
+    def parent_of(r: Any) -> str:
+        p = get(r, "parent")
+        if p:
+            return p
+        name = get(r, "name")
+        head = name.rsplit(".", 1)[0] if "." in name else ""
+        return head if names.get(head) in _CLASS_KINDS else ""
+
+    children: dict[str, list] = {}
+    for r in rows:
+        p = parent_of(r)
+        if p:
+            children.setdefault(p, []).append(r)
+
+    lines: list[str] = []
+    approx = False
+
+    def one(r: Any, prefix: str) -> str:
+        nonlocal approx
+        doc = get(r, "docstring")
+        mark = "  ~approx" if get(r, "approximate") else ""
+        approx = approx or bool(mark)
+        sig = get(r, "signature") or get(r, "name")
+        return f"{prefix}{sig}{'  # ' + doc if doc else ''}{mark}"
+
+    def short(r: Any) -> str:
+        return get(r, "signature") or get(r, "name").split(".")[-1]
+
+    def emit(r: Any, prefix: str) -> None:
+        kind, name = get(r, "kind"), get(r, "name")
+        if kind in ("field", "attribute") or not is_public_symbol(name):
+            return
+        lines.append(one(r, prefix))
+        if kind not in _CLASS_KINDS:
+            return
+        kids = children.get(name, [])
+        fields = [k for k in kids if get(k, "kind") == "field"
+                  and is_public_symbol(get(k, "name"))]
+        attrs = [k for k in kids if get(k, "kind") == "attribute"
+                 and is_public_symbol(get(k, "name"))]
+        members = [k for k in kids
+                   if get(k, "kind") not in ("field", "attribute")]
+        has_ctor = any(get(k, "name").split(".")[-1] in ("__init__", "__new__")
+                       for k in members)
+        inner = prefix + indent
+        cls = name.split(".")[-1]
+        if fields:
+            lines.append(f"{inner}# fields (constructor arguments, in this "
+                         f"order): " + ", ".join(short(f) for f in fields))
+            if not has_ctor:
+                args = ", ".join(get(f, "name").split(".")[-1]
+                                 for f in fields)
+                lines.append(f"{inner}# construct: {cls}({args})")
+        elif not has_ctor and kind == "class" and "(" not in (
+                get(r, "signature") or ""):
+            # No fields, no __init__, no base class: the constructor is
+            # object's. Said outright, because the alternative is a guess
+            # like `CarState(speed=0.0)`. A class WITH bases inherits its
+            # constructor and nothing here can see it, so nothing is claimed.
+            lines.append(f"{inner}# construct: {cls}()  — takes no arguments")
+        if attrs:
+            lines.append(f"{inner}# instance attributes: "
+                         + ", ".join(short(a) for a in attrs))
+        for k in members:
+            emit(k, inner)
+
+    for r in rows:
+        if not parent_of(r):
+            emit(r, "")
+    return lines, approx
 
 
 def slice_around(text: str, line: int, before: int = 40,

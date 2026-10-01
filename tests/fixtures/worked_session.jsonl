@@ -1,5 +1,6 @@
 {"event": "epoch"}
 {"event": "session_start"}
+{"event": "model_check"}
 {"event": "codemap"}
 {"event": "plan"}
 {"event": "skeleton"}

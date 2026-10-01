@@ -62,7 +62,7 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "generate", "continuation", "guard", "prefix", "verify",
                   "autofix", "patch", "rollback", "codemap", "review",
                   "budget", "cancel", "epoch", "error", "skills",
-                  "blocked", "audit")
+                  "blocked", "audit", "model_check", "baseline")
 
 
 # --------------------------------------------------------------------------
@@ -659,7 +659,14 @@ class AttemptRecord:
 
 @dataclass(frozen=True)
 class TaskOutcome:
-    """The end state of one task, in words an operator can act on."""
+    """The end state of one task, in words an operator can act on.
+
+    ``ok`` means the file was written and nothing contradicted it: it
+    parsed, it ran, no test it has failed. ``verified`` is the stronger
+    claim — its own tests ran, at least one of them, and passed. The two
+    used to be one word, "DONE", and that word was earned by four files
+    whose tests had never been collected.
+    """
     task_id: str
     path: str
     ok: bool
@@ -667,12 +674,22 @@ class TaskOutcome:
     result: RunResult | None = None
     stopped_because: str = ""    # the cycle report, when there is one (M34)
     caveats: tuple[str, ...] = ()
+    verified: bool = False
+
+    @property
+    def label(self) -> str:
+        """The one word a log line starts with: VERIFIED, BUILT or FAILED."""
+        if not self.ok:
+            return "FAILED"
+        return "VERIFIED" if self.verified else "BUILT (not verified)"
 
     def summary(self) -> str:
         if self.ok:
             n = len(self.attempts)
             tail = " · " + " · ".join(self.caveats) if self.caveats else ""
-            return f"{self.path}: done in {n} attempt{'s' * (n != 1)}{tail}"
+            state = "verified" if self.verified else "built, not verified"
+            return (f"{self.path}: {state} in {n} attempt{'s' * (n != 1)}"
+                    f"{tail}")
         why = self.stopped_because or "gave up"
         last = ""
         if self.attempts and self.attempts[-1].diagnostics:

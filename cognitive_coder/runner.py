@@ -511,7 +511,9 @@ def _test_phase(ex: Any, argv: Sequence[str], run_argv: Sequence[str], *,
 def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
               workdir: str = "", timeout: float | None = None,
               test_source: str = "", path: str = "",
-              test_path: str = "") -> RunResult:
+              test_path: str = "",
+              known_failing: Sequence[str] = (),
+              whole_suite: bool = False) -> RunResult:
     """Run the language's test command, honestly.
 
     Two honesty obligations are discharged here:
@@ -526,6 +528,10 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     ``path`` is the file's real location, as for `build_and_run`; without
     it `{src}` is `<root>/<stem><ext>`, which for `src/lib.rs` is a file
     that does not exist.
+
+    ``whole_suite`` runs everything with no scoping and no attribution —
+    the baseline before a build, and the "anything failing elsewhere?"
+    pass after a scoped success.
 
     ``test_path`` is the TASK's own test file (`Task.test_path`, M39). When
     it exists and the language can run one file (`test_one_cmd`, or
@@ -547,9 +553,16 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     files: list[str] = []
     test_timeout = Timeouts.resolve(timeout, lang.test_timeout)
     scoped = ""
-    if test_path and lang_id != "gdscript" and (lang.test_one_cmd
-                                                or lang.test_files):
-        rel = str(test_path).replace("\\", "/")
+    # A TEST task has no `test_path` of its own — the file IS the test. It
+    # is scoped to itself, so its verdict comes from the file it wrote and a
+    # stale neighbour cannot fail it (nor pass for it).
+    own_test = (bool(path) and not test_path and not whole_suite
+                and is_test_path(path))
+    scope_to = "" if whole_suite else (test_path or (path if own_test
+                                                      else ""))
+    if scope_to and lang_id != "gdscript" and (lang.test_one_cmd
+                                               or lang.test_files):
+        rel = str(scope_to).replace("\\", "/")
         try:
             scoped = rel if fs.exists(rel) else ""
         except Exception:                                # noqa: BLE001
@@ -623,6 +636,27 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     # The file-based signal only means something on a passing run: a
     # test file that failed to LOAD is also listed under its own name.
     empty = zero_tests(phase.output, files if phase.ok else ())
+    if empty and own_test and phase.ok:
+        # The task WAS the test file, and the runner found no tests in it.
+        # That is a failed task, not a caveat: a test file that collects
+        # nothing is the model's mistake (wrong names, no TestCase, an
+        # "existing file" pasted in place of the test), and it is the one
+        # mistake a retry can fix — if it is told. Three builds of one spec
+        # sealed such files as DONE; one of them was not even a test.
+        return RunResult(
+            ok=False, lang=lang_id, phases=(replace(phase, ok=False),),
+            diagnostics=(Diagnostic(
+                file=path, line=1, severity="error", tool="unittest",
+                code="no-tests-collected",
+                message=(f"{path} ran, but the test runner collected ZERO "
+                         f"tests from it. A test file must define tests the "
+                         f"runner can find: for unittest, methods named "
+                         f"test_* on a class that subclasses "
+                         f"unittest.TestCase, ending with "
+                         f"`if __name__ == '__main__': unittest.main()`. "
+                         f"Return the complete test file — not the module "
+                         f"it tests.")),),
+            caveats=tuple(caveats))
     if empty:
         caveats.append(empty)
     if scoped and phase.ok:
@@ -632,8 +666,173 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                                        mine=scoped)
         if elsewhere:
             caveats.append(elsewhere)
+    if (not whole_suite and not scoped and not phase.ok and path
+            and not own_test and (lang.test_one_cmd or lang.test_files)):
+        # The WHOLE suite decided, because this module's own test does not
+        # exist yet. Failures that do not name this module are other
+        # files' — a stale test from an earlier session, a sibling's test
+        # written against a plan that changed. Charged to this file, they
+        # made the model regenerate correct code until stagnation stopped
+        # it (Aug 8 and Oct 1, every module of the racing spec).
+        #
+        # Only for languages whose tests live in separate files: a Rust
+        # module's tests are inside it, and a failure there is its own.
+        # And only when the log NAMES other test modules — an unattributed
+        # failure stays this file's failure, the honest default.
+        mine, others = _attribute_failures(phase.output, path, diags,
+                                           known_failing)
+        if mine:
+            diags = tuple(mine)
+        elif others:
+            which = ", ".join(others[:5])
+            caveats.append(
+                f"other tests in this project fail ({which}); none of them "
+                f"names {path}, so they are not this file's errors and are "
+                f"reported here instead.")
+            return RunResult(ok=True, lang=lang_id,
+                             phases=(replace(phase, ok=True, note=(
+                                 "failures were in other files' tests")),),
+                             caveats=tuple(caveats))
     return RunResult(ok=phase.ok, lang=lang_id, phases=(phase,),
                      diagnostics=diags, caveats=tuple(caveats))
+
+
+def is_test_path(path: str) -> bool:
+    """`tests/test_x.py`, `x_test.go`, `test/x.spec.ts`: a test by name."""
+    rel = str(path or "").replace("\\", "/").lower()
+    name = rel.rsplit("/", 1)[-1]
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    folders = rel.split("/")[:-1]
+    return (stem.startswith("test_") or stem.endswith("_test")
+            or ".test" in name or ".spec" in name
+            or any(f in ("test", "tests", "spec", "__tests__")
+                   for f in folders))
+
+
+def _module_tokens(path: str) -> list[str]:
+    """The names a traceback or a test log uses for a file: its path, both
+    slashes, its dotted module name, and its bare stem when distinctive."""
+    rel = str(path or "").replace("\\", "/").strip("/")
+    stem_path = rel.rsplit(".", 1)[0] if "." in rel.rsplit("/", 1)[-1] \
+        else rel
+    dotted = stem_path.replace("/", ".")
+    out = [rel, rel.replace("/", "\\"), dotted]
+    stem = stem_path.rsplit("/", 1)[-1]
+    if len(stem) >= 4 and stem not in ("main", "test", "init", "util",
+                                       "utils", "core", "base", "app"):
+        out.append(stem)
+    return [t for t in dict.fromkeys(out) if t]
+
+
+def failing_test_modules(log: str) -> list[str]:
+    """The test modules a unittest/pytest log blames, in order, once each.
+
+    `ERROR: tests.test_physics (unittest.loader._FailedTest...)`,
+    `FAIL: test_add (tests.test_calc.T.test_add)`, pytest's
+    `FAILED tests/test_calc.py::test_add`. Used for the pre-build baseline
+    and for the "other files" caveat.
+    """
+    out: list[str] = []
+    for m in re.finditer(
+            r"^(?:ERROR|FAIL):\s+(?P<head>\S+)\s+\((?P<ident>[\w.]+)\)|"
+            r"^FAILED\s+(?P<pytest>[\w./\\-]+\.py)", log or "", flags=re.M):
+        if m.group("pytest"):
+            name = m.group("pytest")
+        else:
+            head, ident = m.group("head"), m.group("ident")
+            if ident.startswith("unittest.loader._FailedTest"):
+                # A test MODULE that failed to import. Python ≤ 3.11:
+                # `ERROR: tests.test_x (unittest.loader._FailedTest)` — the
+                # module is the head. Python 3.12+:
+                # `ERROR: tests.test_x (unittest.loader._FailedTest.tests.test_x)`
+                # — either will do; the head is there in both.
+                name = head
+            else:
+                # `FAIL: test_add (tests.test_calc.C.test_add)` → the module
+                # is the dotted id minus class and method.
+                name = ident.rsplit(".", 2)[0] if ident.count(".") >= 2 \
+                    else ident
+        if "::" in name:
+            name = name.split("::", 1)[0]
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _name_variants(name: str) -> list[str]:
+    """`tests.test_physics` ⇄ `tests/test_physics.py` ⇄ `test_physics`.
+
+    A log names a test module dotted; a diagnostic names its file with
+    slashes; the baseline may hold either. Match all of them.
+    """
+    n = str(name or "").strip().replace("\\", "/")
+    if not n:
+        return []
+    if n.endswith(".py"):
+        path = n
+        dotted = n[:-3].strip("/").replace("/", ".")
+    elif "/" in n:
+        path = n + ".py"
+        dotted = n.strip("/").replace("/", ".")
+    else:
+        dotted = n
+        path = n.replace(".", "/") + ".py"
+    stem = dotted.rsplit(".", 1)[-1]
+    out = [n, dotted, path, path.replace("/", "\\")]
+    if len(stem) >= 6 and (stem.startswith("test") or stem.endswith("test")):
+        out.append(stem)
+    return list(dict.fromkeys(v for v in out if v))
+
+
+def _attribute_failures(log: str, path: str, diags: Sequence[Diagnostic],
+                        known_failing: Sequence[str] = ()
+                        ) -> tuple[list[Diagnostic], list[str]]:
+    """Split a failing suite's evidence into (this file's, other files').
+
+    A diagnostic is this file's when it is located in it, or when the
+    failure block it came from names the file's module — unless that block
+    belongs to a test that was ALREADY failing before the build started
+    (`known_failing`, the session's baseline): a stale test from an earlier
+    session is never this file's problem. Others are listed by the test
+    module that produced them, for the caveat.
+    """
+    tokens = _module_tokens(path)
+    # Path-shaped tokens match anywhere; the bare stem only as a whole word,
+    # so `physics` does not find itself inside `tests/test_physics.py` and
+    # claim a stale test's failure for the module it was written against.
+    pattern = re.compile("|".join(
+        re.escape(t) if ("/" in t or "\\" in t or "." in t)
+        else rf"(?<![\w])(?:{re.escape(t)})(?![\w])" for t in tokens))
+    stale = [v for k in known_failing if k for v in _name_variants(k)]
+    stale_pattern = re.compile("|".join(re.escape(k) for k in stale)) \
+        if stale else None
+
+    def names_me(text: str) -> bool:
+        return bool(text) and bool(pattern.search(text))
+
+    def is_stale(text: str) -> bool:
+        return bool(stale_pattern and text and stale_pattern.search(text))
+
+    blocks = [b for b in re.split(r"^={20,}\s*$", log or "", flags=re.M)
+              if _FAILURE_LINE.search(b)]
+    live_blocks = [b for b in blocks if not is_stale(b)]
+    mine: list[Diagnostic] = []
+    for d in diags:
+        where = " ".join(x for x in (d.file, d.message, d.source_excerpt)
+                         if x)
+        if is_stale(where) and not names_me(d.file):
+            continue
+        if names_me(d.file) or names_me(d.message) \
+                or names_me(d.source_excerpt):
+            mine.append(d)
+    # unittest/pytest headers name the test module; if a LIVE block names
+    # this module, every non-stale diagnostic is this file's to answer.
+    if not mine and any(names_me(b) for b in live_blocks):
+        mine = [d for d in diags if not is_stale(
+            " ".join(x for x in (d.file, d.message, d.source_excerpt)
+                     if x))]
+    others = failing_test_modules(log)
+    return mine, others
 
 
 # Lines of a test log that report a failure, per runner: unittest, pytest,
@@ -655,7 +854,7 @@ def _failing_elsewhere(lang_id: str, lang: Any, *, fs: Any, ex: Any,
     first failure line, so the operator can always find it.
     """
     full = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
-                     timeout=timeout, path=path)
+                     timeout=timeout, path=path, whole_suite=True)
     if full.ok or full.blocked or not full.phases:
         return ""
     log = full.phases[0].output
@@ -733,7 +932,8 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
            workdir: str = "", project_mode: bool = False,
            test_source: str = "", skip_guard: bool = False,
            path: str = "", timeouts: Timeouts | None = None,
-           test_path: str = "") -> RunResult:
+           test_path: str = "",
+           known_failing: Sequence[str] = ()) -> RunResult:
     """The C4 definition of done: it builds AND the tests run (M4).
 
     This is the function the loop calls, and the one place where "done" is
@@ -746,6 +946,9 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 
     ``test_path`` scopes the test phase to the task's own test file; see
     `run_tests`. Failures elsewhere come back as caveats, not diagnostics.
+    ``known_failing`` names the test modules that were already failing
+    before the build began (the session's baseline); their failures are
+    never charged to the file being verified.
     """
     clocks = timeouts or Timeouts()
     built = build_and_run(code, lang_id, fs=fs, ex=ex, stem=stem,
@@ -757,7 +960,8 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
 
     tested = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
                        test_source=test_source, timeout=clocks.test,
-                       path=path, test_path=test_path)
+                       path=path, test_path=test_path,
+                       known_failing=known_failing)
     if tested.blocked:
         # No test runner is not a pass and not a failure — it is a stated
         # weakness in the evidence. C4 requires saying so out loud.

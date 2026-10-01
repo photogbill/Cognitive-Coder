@@ -107,6 +107,15 @@ def parse(text: str, path: str = "") -> tuple[list[Symbol], list[tuple],
                     base_name = _name_of(base)
                     if base_name:
                         edges.append((name, base_name, "inherits"))
+                # The class's DATA surface, as symbols: annotated class-level
+                # fields (a NamedTuple's or dataclass's constructor arguments)
+                # and the instance attributes its methods assign. These are
+                # what a caller or a test needs and what the signature list
+                # never carried — every build of the racing spec invented
+                # `CarState(speed=…)` and `ProjectedSegment(z=…)` because the
+                # model was shown `class CarState` and nothing of what it held.
+                for sym in _class_members(node, name, path):
+                    symbols.append(sym)
                 visit(node.body, name)
 
     visit(tree.body)
@@ -233,11 +242,155 @@ def _annotation(node) -> str:
         return "?"
 
 
+#: Decorators that change how a class is CONSTRUCTED, so they belong in its
+#: signature: a reader seeing `@dataclass class Segment` knows the fields are
+#: the constructor. Other decorators are noise here.
+_CTOR_DECORATORS = {"dataclass", "define", "frozen", "attrs", "s"}
+
+
 def _class_signature(node: ast.ClassDef) -> str:
     bases = [_name_of(b) for b in node.bases]
     bases = [b for b in bases if b]
-    return f"class {node.name}({', '.join(bases)})" if bases \
-        else f"class {node.name}"
+    decos = []
+    for d in node.decorator_list:
+        name = _name_of(d.func if isinstance(d, ast.Call) else d)
+        if name and name.split(".")[-1] in _CTOR_DECORATORS:
+            decos.append("@" + name.split(".")[-1])
+    head = (" ".join(decos) + " ") if decos else ""
+    return f"{head}class {node.name}({', '.join(bases)})" if bases \
+        else f"{head}class {node.name}"
+
+
+# ---------------------------------------------------------------------------
+# a class's data surface: fields and instance attributes
+# ---------------------------------------------------------------------------
+
+#: Literal node → the type name a reader would write. Anything else is left
+#: blank rather than guessed: a wrong type in an interface is worse than none.
+_LITERAL_TYPES = {bool: "bool", int: "int", float: "float", str: "str",
+                  bytes: "bytes"}
+
+
+def _class_members(node: ast.ClassDef, cls: str, path: str) -> list[Symbol]:
+    """`field` symbols for annotated class-level names, `attribute` symbols
+    for `self.<name> = …` in the class's methods (``__init__`` first).
+
+    Fields are the constructor arguments of a NamedTuple, a dataclass, a
+    TypedDict or a pydantic model, in declaration order. Attributes are the
+    state a plain class exposes after construction. Both carry a type when
+    the source states one or a literal makes it obvious, and a default when
+    it is a simple constant — a test that caps speed at ``max_speed`` needs
+    to know it is 10.0.
+    """
+    out: list[Symbol] = []
+    seen: set[str] = set()
+    # Annotated class-level fields, in order. `x: float = 0.0`, `x: float`.
+    for item in node.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target,
+                                                            ast.Name):
+            fname = item.target.id
+            if fname.startswith("_") or fname in seen:
+                continue
+            sig = f"{fname}: {_annotation(item.annotation)}"
+            default = _literal_text(item.value)
+            if default:
+                sig += f" = {default}"
+            out.append(Symbol(name=f"{cls}.{fname}", kind="field",
+                              line=item.lineno, end_line=item.lineno,
+                              signature=sig, path=path, parent=cls,
+                              approximate=False))
+            seen.add(fname)
+    # Instance attributes: `self.x = …` inside methods, __init__ first so the
+    # constructor's state leads. A parameter's annotation types `self.x = x`.
+    methods = [m for m in node.body
+               if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    methods.sort(key=lambda m: 0 if m.name == "__init__" else 1)
+    for method in methods:
+        params = {a.arg: _annotation(a.annotation)
+                  for a in (method.args.posonlyargs + method.args.args
+                            + method.args.kwonlyargs) if a.annotation}
+        self_name = (method.args.args[0].arg if method.args.args
+                     else "self")
+        for stmt in ast.walk(method):
+            targets: list[tuple[ast.AST, ast.AST | None, ast.AST | None]] = []
+            if isinstance(stmt, ast.Assign):
+                targets = [(t, stmt.value, None) for t in stmt.targets]
+            elif isinstance(stmt, ast.AnnAssign):
+                targets = [(stmt.target, stmt.value, stmt.annotation)]
+            elif isinstance(stmt, ast.AugAssign):
+                targets = [(stmt.target, None, None)]
+            for target, value, ann in targets:
+                if not (isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == self_name):
+                    continue
+                aname = target.attr
+                if aname.startswith("_") or aname in seen:
+                    continue
+                typ = _annotation(ann) if ann is not None else ""
+                if not typ and isinstance(value, ast.Name) \
+                        and value.id in params:
+                    typ = params[value.id]
+                if not typ:
+                    typ = _value_type(value)
+                sig = f"{aname}: {typ}" if typ else aname
+                default = _literal_text(value)
+                if default:
+                    sig += f" = {default}"
+                where = "" if method.name == "__init__" else \
+                    f"  (set in {method.name})"
+                out.append(Symbol(name=f"{cls}.{aname}", kind="attribute",
+                                  line=stmt.lineno, end_line=stmt.lineno,
+                                  signature=sig + where, path=path,
+                                  parent=cls, approximate=False))
+                seen.add(aname)
+    return out
+
+
+def _literal_text(node: ast.AST | None) -> str:
+    """`0.0`, `"x"`, `True`, `None` as written; anything else → ""."""
+    if isinstance(node, ast.Constant) and (
+            node.value is None or type(node.value) in _LITERAL_TYPES):
+        return repr(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) \
+            and isinstance(node.operand, ast.Constant) \
+            and type(node.operand.value) in (int, float):
+        return f"-{node.operand.value!r}"
+    return ""
+
+
+def _value_type(node: ast.AST | None) -> str:
+    """The type a value expression obviously has, or ""."""
+    if node is None:
+        return ""
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return "None"
+        return _LITERAL_TYPES.get(type(node.value), "")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.operand,
+                                                    ast.Constant):
+        return _LITERAL_TYPES.get(type(node.operand.value), "")
+    if isinstance(node, (ast.List, ast.ListComp)):
+        return "list"
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return "dict"
+    if isinstance(node, ast.Tuple):
+        return "tuple"
+    if isinstance(node, (ast.Set, ast.SetComp)):
+        return "set"
+    if isinstance(node, ast.JoinedStr):
+        return "str"
+    if isinstance(node, ast.Call):
+        callee = _name_of(node.func)
+        # `CarState(...)`, `collections.deque(...)` → the class; a lowercase
+        # function's return type is not knowable here, so leave it blank.
+        last = callee.split(".")[-1] if callee else ""
+        if last and last[0].isupper():
+            return last
+        if last in ("list", "dict", "set", "tuple", "str", "int", "float",
+                    "bool", "bytes", "frozenset"):
+            return last
+    return ""
 
 
 def _first_line(doc: str | None) -> str:

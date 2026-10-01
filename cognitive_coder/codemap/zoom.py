@@ -122,19 +122,17 @@ def dependency_interfaces(store: Any, target: str, *,
     used = 0
     approx = False
     dropped: list[str] = []
+    # One renderer for both the codemap's block and `context.interface`, so
+    # the model sees the same surface either way: constructors, a class's
+    # fields and instance attributes on one line each, members indented
+    # under their class, and a `~approx` mark on any pattern-matched row.
+    # (These used to sit under "exact signatures — use these, do not guess"
+    # with no marker, including a C signature that was just `static int`.)
+    from ..context import interface_lines
     for path in deps:
-        block = [f"## {path}"]
-        for s in store.symbols_in(path):
-            if s["name"].split(".")[-1].startswith("_"):
-                continue
-            doc = f"  # {s['docstring']}" if s["docstring"] else ""
-            # A pattern-matched row says so on its own line. These used to
-            # sit under "exact signatures — use these, do not guess" with no
-            # marker, including a C signature that was just `static int`.
-            mark = "  ~approx" if s["approximate"] else ""
-            approx = approx or bool(mark)
-            block.append(f"{s['signature'] or s['name']}{doc}{mark}")
-        text = "\n".join(block)
+        body, is_approx = interface_lines(store.symbols_in(path))
+        approx = approx or is_approx
+        text = "\n".join([f"## {path}", *body])
         cost = count_tokens(text) if count_tokens else len(text) // 4
         if used + cost > budget_tokens and used:
             dropped.append(path)

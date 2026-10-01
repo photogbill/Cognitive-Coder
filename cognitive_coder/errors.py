@@ -113,6 +113,16 @@ class NoModelLoadedError(CognitiveCoderError):
             "the host application and run this again.", detail)
 
 
+class NotACodingModelError(CognitiveCoderError):
+    """The loaded model's name says it was made for conversation or fiction.
+
+    Refused before planning, in one sentence, because a build with it costs
+    twenty minutes and produces nothing — and the person it is refused for
+    may not be able to tell a roleplay merge from a coding model by name.
+    `SessionConfig.allow_any_model` turns the refusal into a warning.
+    """
+
+
 class GuardRefusal(CognitiveCoderError):
     """The static screen refused to run generated code (§6.3).
 

@@ -10,6 +10,87 @@ is a major version.
 
 ## [Unreleased]
 
+### Fixed — the harness tells the truth (Phase 0, 2026-10-01)
+
+Three builds of one specification — a pseudo-3D racing game, seven files —
+failed the same way on Aug 8 and again on Oct 1, on a clean folder. The log
+of the Oct 1 run was read line by line against the code; every item below
+is a defect that run exhibited, with the line that proved it.
+
+- **Interfaces now carry constructors, fields and instance attributes.**
+  `interface()` and the codemap's `# INTERFACES YOU MAY CALL` block
+  filtered every name starting with `_` — which is `__init__`. A caller
+  saw `class CarPhysics` and `def update(…)` and nothing of how the thing
+  was made or what it held, so three builds running invented
+  `CarState(speed=…)` against a constructor that takes nothing, and
+  `ProjectedSegment(z=…, curve=…)` against a NamedTuple whose fields are
+  `x, y, width`. The Python parser now emits `field` symbols (annotated
+  class-level names: NamedTuple, dataclass, TypedDict) and `attribute`
+  symbols (`self.x = …`, typed from the annotation, the parameter it
+  copies, or the literal), and one renderer (`context.interface_lines`)
+  serves both callers: members indented under their class, fields on one
+  line, attributes on one line, a `# construct:` line for any class with
+  no explicit constructor, dunders that define use (`__init__`,
+  `__call__`, `__iter__`, …) kept, single-underscore names still private.
+- **Planned dependencies reach the first attempt.** `Task.depends_on`
+  holds task ids (`t3`); the codemap matched them against file paths, so
+  the planned-dependency injection — the whole reason `planned=` exists —
+  never fired on any build. The session now resolves ids to paths
+  (`Session._planned_paths`) and a test task always gets the module it
+  covers. Measured on the Oct 1 prompts: `main.py`, which depends on four
+  modules, had 56 more tokens of context than `math3d.py`, which depends
+  on none.
+- **Zero collected tests is never "done".** A test file that the runner
+  collects nothing from now FAILS, with a diagnostic the model can act on
+  (`no-tests-collected`: name the methods `test_*` on a `TestCase`;
+  return the test, not the module). It used to pass — once with a file
+  that was not a test at all. `TaskOutcome.verified` is the new, stronger
+  claim: the file's own tests ran, at least one, and passed; `ok` means
+  only that nothing contradicted it. Log lines read `VERIFIED`, `BUILT
+  (not verified)` or `FAILED`, never `DONE`.
+- **A failure that does not name a file is not that file's failure.** A
+  module whose own test does not exist yet was judged by the whole suite,
+  and a stale `tests/test_physics.py` from an earlier session failed
+  `math3d.py`, `physics.py` and `track.py` in turn — each regenerated
+  correctly, each stopped by stagnation. `run_tests` now attributes
+  (`_attribute_failures`): failures that name the module are its; failures
+  that name other test modules are a caveat; an unattributed failure stays
+  a failure. A test task is scoped to its own file. Only for languages
+  whose tests are separate files — a Rust module's tests are inside it.
+- **The session baselines the folder before building.** Tests already on
+  disk run once first; the modules that fail are `LoopConfig.known_failing`
+  and are never charged to the build. The operator is told, by name, in
+  one sentence, and a folder whose `BUILD_LOG.txt` records earlier
+  sessions is said to be one.
+- **The right fence is written when the model sends several.** Aug 8:
+  "Let me check math3d.py…" + an imagined class in a ```python fence, then
+  "Here's the corrected file:" + the real test; the first fence was
+  written as `tests/test_math3d.py`. Same-language fences are now ranked
+  (`patcher._rank_fences`): a test path wants a fence with tests; "let me
+  check the existing file" marks context, "here's the corrected file"
+  marks the answer; longer beats shorter; document order last.
+- **Repair prompts carry the facts the error named** (`enrich.py`, rung 1
+  of the escalation ladder). `cannot import name 'X' from 'm'` → what `m`
+  defines, with the nearest name; an unexpected keyword or a missing
+  positional argument → the exact signature, and for a constructor the
+  class's fields and attributes; `'C' object has no attribute 'a'` → the
+  class and the nearest attribute; `NameError` → where the name lives and
+  the import line; `No module named` → the project's modules. Same model,
+  same temperature, different input — which is what a retry needs before
+  it can produce anything but the same answer.
+- **A model that is not for code is refused before planning.**
+  `models.judge()` reads the loaded model's name: a known coding family
+  builds; a roleplay or fiction merge (`-Tavern`, `-RP`, `Uncensored`, …)
+  is refused in one sentence (`NotACodingModelError`;
+  `SessionConfig.allow_any_model` turns it into a warning); an unknown
+  general model builds under a warning. A context window under 16k is
+  named as a problem. On Aug 8 a roleplay merge built the racing spec for
+  nineteen minutes because it happened to be loaded.
+- Python 3.12+ `unittest` exits 5 and prints `NO TESTS RAN` where 3.11
+  exited 0; the test that pins the discovery fact now states both.
+- Journal: two new events, `model_check` and `baseline`; the golden trace
+  gained the one line.
+
 ### Changed — the prompt cache: two design decisions, measured
 
 A local model re-reads every prompt token its prefix cache cannot reuse,
