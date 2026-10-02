@@ -47,7 +47,7 @@ FINISH_REASONS = ("stop", "length", "tool_calls", "cancelled", "error")
 #: The closed set of `EventPort.event` kinds (§5.4, M19). New kinds are a
 #: minor version; RENAMED kinds are a major one, because hosts render them.
 EVENT_KINDS = ("phase", "token", "status", "diagnostic", "patch", "remote",
-               "warning", "error", "budget")
+               "warning", "error", "budget", "plan")
 
 #: Journal event names (§6.13). Also public API — a host renders history from
 #: these — and under the same semver rule as EVENT_KINDS.

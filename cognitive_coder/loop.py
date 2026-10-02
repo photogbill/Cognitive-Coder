@@ -165,11 +165,17 @@ class Loop:
     _too_big: str = field(default="", repr=False)
     #: Paths of the current task's planned dependencies (set per run_task).
     _planned: tuple = field(default=(), repr=False)
+    #: For a repair routed from another file: the path of the CALLER that
+    #: ran and failed inside the file being repaired (set per run_task).
+    _caller: str = field(default="", repr=False)
+    #: For a test task: the module it covers (set per run_task).
+    _covers: str = field(default="", repr=False)
 
     # ------------------------------------------------------------------
     def run_task(self, task: Task, *, request: str = "", covers: str = "",
                  seed: Sequence[Diagnostic] = (),
-                 planned: Sequence[str] = ()) -> TaskOutcome:
+                 planned: Sequence[str] = (),
+                 caller: str = "") -> TaskOutcome:
         """Generate, verify and repair one file until it works or it stops.
 
         Every phase boundary checks the cancel token (M21). A cancelled task
@@ -183,9 +189,14 @@ class Loop:
         the plan says this one depends on, so their interfaces reach the
         very first attempt. `task.depends_on` holds task IDs (`t3`), and
         handing those to the codemap — which matches paths — meant the
-        planned-dependency injection never fired on any build.
+        planned-dependency injection never fired on any build. ``caller``
+        is, for a repair the session routed here from another file, the
+        path of the file that ran and failed inside this one; its source
+        is shown to the repair as the use that must work.
         """
         self._planned = tuple(p for p in planned if p and p != task.path)
+        self._caller = caller if caller and caller != task.path else ""
+        self._covers = covers if covers and covers != task.path else ""
         lang = task.lang or langs.id_for_path(task.path) or "python"
         persona = PERSONAS.get(task.persona, personas.ENGINEER)
         is_test = task.persona == "tester" or _looks_like_test(task.path)
@@ -393,6 +404,26 @@ class Loop:
                     self.blamed[task.path] = (covers, diags)
                     self._emit("warning", f"{task.path}: {stopped}",
                                {"task": task.path, "covers": covers})
+                    break
+
+                # -- the error is in ANOTHER file of this project ----------
+                # Oct 1, 2026: `main.py` ran and died at `render.py:61`
+                # (`'PhysicsState' object has no attribute 'x'`). The loop
+                # asked for main.py again, twice, got the same file twice
+                # — correctly, there was nothing in main.py to change —
+                # and gave up with "the task is probably too large". The
+                # file to change was render.py. So: when the innermost
+                # project frame of the failure is a different file this
+                # project owns, this task stops HERE and names it, and the
+                # session repairs that file against this failure, then
+                # verifies this one again. Tests keep their own rule above.
+                culprit = "" if is_test else self._culprit_elsewhere(
+                    task, diags)
+                if culprit:
+                    stopped = _elsewhere_sentence(task.path, culprit, diags)
+                    self.blamed[task.path] = (culprit, diags)
+                    self._emit("warning", f"{task.path}: {stopped}",
+                               {"task": task.path, "culprit": culprit})
                     break
 
                 # -- stagnation and cycles (M34) -------------------------
@@ -610,7 +641,9 @@ class Loop:
                 tail_extra.append(f"[THE FILE AS IT STANDS]\n{existing}")
                 tail_pieces.append(("THE FILE AS IT STANDS", existing))
             test_source = self._read(task.test_path) if (
-                against_test and task.test_path) else ""
+                against_test and task.test_path
+                and _looks_like_test(task.test_path)) else ""
+            caller_source = self._read(self._caller) if self._caller else ""
             if test_source:
                 # The test is the specification this repair answers to. The
                 # escape hatch matters: a model that believes the test is
@@ -629,6 +662,56 @@ class Loop:
                      f"Change this file so the test passes. If you are "
                      f"certain the test itself is wrong, return this file "
                      f"unchanged."))
+            if caller_source:
+                # A CALLER that ran and died inside this file. The error
+                # under [ERRORS] is located here; the caller is shown so
+                # the repair can see how this file is used, and is not the
+                # model's to change in this task.
+                rule = (f"`{self._caller}` ran and failed inside this "
+                        f"file, at the line the error names. Fix THIS file "
+                        f"so that run succeeds. The caller is not yours to "
+                        f"change here. Decide from this file's purpose and "
+                        f"the real definitions shown under the error "
+                        f"whether this file misuses another module (fix "
+                        f"the misuse) or lacks something the caller is "
+                        f"right to expect (add it). If you are certain the "
+                        f"caller itself is wrong, return this file "
+                        f"unchanged.")
+                tail_extra.append(
+                    f"[THE CALLER THAT FAILS INSIDE THIS FILE — "
+                    f"{self._caller}]\n{caller_source}\n\n{rule}")
+                tail_pieces.append(
+                    (f"THE CALLER THAT FAILS INSIDE THIS FILE — "
+                     f"{self._caller}", f"{caller_source}\n\n{rule}"))
+
+        # THE MODULE UNDER TEST, for a test written after it. Plans write
+        # modules first, so the tester arrives when the module exists; it
+        # was shown the interface — names and signatures — and for pure
+        # arithmetic the signature does not carry the formula. On Oct 1,
+        # 2026 the tester asserted `x = cx + x/z·(w/2)` to seven places
+        # against a projection that scales by field of view; the spec had
+        # asked only for scale and Y. The source is shown, with the rule
+        # that decides what to assert. (A test written FIRST sees a stub,
+        # which is skipped: the interface block is all there is then.)
+        is_test_task = task.persona == "tester" or _looks_like_test(task.path)
+        if is_test_task and self._covers:
+            module_source = self._read(self._covers)
+            if module_source.strip() and not _is_our_stub(module_source):
+                rule = ("Test the behaviour the request asks for and what "
+                        "this module's docstrings promise; include the edge "
+                        "case the request implies. Where a test needs an "
+                        "exact number, take it from how this module "
+                        "actually computes it — never from a formula or a "
+                        "constant of your own that the request does not "
+                        "state. If the module plainly contradicts the "
+                        "request, assert what the request says and let the "
+                        "test fail; that failure is the finding.")
+                tail_extra.append(
+                    f"[THE MODULE UNDER TEST — {self._covers}]\n"
+                    f"{module_source}\n\n{rule}")
+                tail_pieces.append(
+                    (f"THE MODULE UNDER TEST — {self._covers}",
+                     f"{module_source}\n\n{rule}"))
 
         prompt = self.prompts.build(
             persona, body, architecture=arch,
@@ -881,6 +964,42 @@ class Loop:
         if done and self.journal is not None:
             self.journal.log("autofix", task=task.path, fixes=done)
         return fixed, done
+
+    # ------------------------------------------------------------------
+    # whose fault is it
+    # ------------------------------------------------------------------
+    def _culprit_elsewhere(self, task: Task,
+                           diags: Sequence[Diagnostic]) -> str:
+        """The OTHER project file where this task's failure is raised, or "".
+
+        The first error diagnostic decides. If it is located in the task's
+        own file, the task is at fault and retrying it is right. If it is
+        located in a file the codemap indexes — a file of this project, not
+        a test, not anything under site-packages or a virtualenv — that
+        file is the culprit and retrying this one is waste. Anything else
+        (no file, an unknown file, the interpreter itself) is treated as
+        this task's problem, as before.
+        """
+        if self.codemap is None:
+            return ""
+        first = next((d for d in diags if d.is_error), None)
+        if first is None or not first.file:
+            return ""
+        f = first.file.replace("\\", "/")
+        if _same_file(first.file, task.path):
+            return ""
+        if "site-packages" in f or "/.venv/" in f or "/venv/" in f \
+                or "/node_modules/" in f:
+            return ""
+        try:
+            known = [row["path"] for row in self.codemap.store.files()]
+        except Exception:                                # noqa: BLE001
+            return ""
+        for path in known:
+            if path != task.path and _same_file(first.file, path) \
+                    and not _looks_like_test(path):
+                return path
+        return ""
 
     # ------------------------------------------------------------------
     # stagnation and cycles (M34)
@@ -1469,6 +1588,17 @@ def _test_disagrees_with_code(test_path: str,
     return False
 
 
+def _elsewhere_sentence(path: str, culprit: str,
+                        diags: Sequence[Diagnostic]) -> str:
+    first = next((d for d in diags if d.is_error and d.file
+                  and _same_file(d.file, culprit)), None)
+    where = f"{culprit}:{first.line}" if first and first.line else culprit
+    detail = f" — {first.message}" if first and first.message else ""
+    return (f"the error is in {where}{detail}, not in {path}; rewriting "
+            f"{path} cannot fix it. {culprit} is repaired against this "
+            f"failure next, then {path} is checked again")
+
+
 def _disagreement_sentence(test_path: str, covers: str,
                            diags: Sequence[Diagnostic]) -> str:
     target = f"`{covers}`" if covers else "the code it tests"
@@ -1493,7 +1623,19 @@ def _first_task_text(task: Task, request: str, lang: str) -> str:
         lines.append(f"Its tests live in `{task.test_path}` and must pass.")
     if lang_obj and lang_obj.notes:
         lines.append(f"Note for this language: {lang_obj.notes}")
+    note = _test_note_for(task, lang_obj)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
+
+
+def _test_note_for(task: Task, lang_obj: Any) -> str:
+    """The runner's rules, for a TEST file's author only."""
+    if lang_obj is None or not lang_obj.test_note:
+        return ""
+    if task.persona == "tester" or _looks_like_test(task.path):
+        return f"How the tests are run: {lang_obj.test_note}"
+    return ""
 
 
 def _change_task_text(task: Task, request: str, lang: str) -> str:
@@ -1512,6 +1654,9 @@ def _change_task_text(task: Task, request: str, lang: str) -> str:
         lines.append(f"Its tests live in `{task.test_path}` and must pass.")
     if lang_obj and lang_obj.notes:
         lines.append(f"Note for this language: {lang_obj.notes}")
+    note = _test_note_for(task, lang_obj)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 

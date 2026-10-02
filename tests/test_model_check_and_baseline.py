@@ -203,3 +203,127 @@ def test_planned_dependencies_reach_the_loop_as_paths(tmp_path):
     assert session._planned_paths(session.plan.tasks[1]) == ("src/alpha.py",)
     assert session._planned_paths(session.plan.tasks[2]) == ("src/alpha.py",)
     assert session._planned_paths(session.plan.tasks[0]) == ()
+
+
+def test_a_module_with_no_known_dependencies_is_shown_what_exists(tmp_path):
+    """Oct 1, 2026: `render.py` was written with no interface of `physics`,
+    `track` or `math3d` in front of it — the stubs import nothing, so the
+    plan had no edge to follow — and invented `player_state.x` against a
+    class with no such attribute. A module now sees every module already
+    built in the project, after its real dependencies; never tests, never
+    stubs, never the entry point, and a test task is unaffected."""
+    from cognitive_coder.loop import _is_our_stub  # noqa: F401 (documents)
+    from cognitive_coder.types import Plan, Task
+    host = _host(tmp_path, [PLAN], name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1))
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "math3d.py").write_text("def project():\n    return 1\n")
+    (tmp_path / "src" / "physics.py").write_text(
+        "class PhysicsState:\n    def __init__(self):\n        self.speed = 0\n")
+    (tmp_path / "src" / "track.py").write_text(
+        "# cc-stub: written by the skeleton; replaced when this file is built\n"
+        "def main():\n    raise NotImplementedError\n")
+    (tmp_path / "src" / "render.py").write_text("# cc-stub: x\n")
+    (tmp_path / "src" / "main.py").write_text("print('hi')\n")
+    (tmp_path / "tests" / "test_math3d.py").write_text("import unittest\n")
+    session.plan = Plan(request="r", tasks=(
+        Task(id="t1", path="src/math3d.py", purpose="projection", status="done"),
+        Task(id="t2", path="src/physics.py", purpose="the car", status="done"),
+        Task(id="t3", path="src/track.py", purpose="the track"),     # pending: still a stub
+        Task(id="t4", path="src/render.py", purpose="drawing", depends_on=("t1",)),
+        Task(id="t5", path="src/main.py", purpose="the game loop", status="done"),
+        Task(id="t6", path="tests/test_math3d.py", purpose="tests",
+             persona="tester", status="done"),
+        Task(id="t7", path="tests/test_physics.py", purpose="tests",
+             persona="tester"),
+    ))
+    render = session.plan.tasks[3]
+    # the planned dependency first, then what exists; not the stub, not
+    # the entry point, not the tests, not itself
+    assert session._planned_paths(render) == ("src/math3d.py", "src/physics.py")
+    # a test task gets its module and nothing else
+    assert session._planned_paths(session.plan.tasks[6]) == ("src/physics.py",)
+    # the first module built sees nothing, because nothing exists yet
+    first = Task(id="t0", path="src/zero.py", purpose="z")
+    session.plan = Plan(request="r", tasks=(first,) + session.plan.tasks)
+    session.plan = Plan(request="r", tasks=tuple(
+        t.with_status("pending") if t.id != "t0" else t
+        for t in session.plan.tasks))
+    assert session._planned_paths(first) == ()
+
+
+# --------------------------------------------------------------------------
+# a test written later verifies the module written earlier
+# --------------------------------------------------------------------------
+
+PLAN_WITH_TEST = ("src/alpha.py — the first thing\n"
+                  "tests/test_alpha.py — tests for alpha\n")
+ALPHA_TEST = ('```python\nimport unittest\n\nfrom src.alpha import alpha\n\n\n'
+              'class T(unittest.TestCase):\n    def test_alpha(self):\n'
+              '        self.assertEqual(alpha(), 1)\n\n\n'
+              'if __name__ == "__main__":\n    unittest.main()\n```')
+
+
+def test_a_module_built_before_its_test_is_verified_once_the_test_passes(
+        tmp_path):
+    """Plans write modules first, so every module ends its own task "built,
+    not verified". When its test is written and passes, the session must
+    say verified — not repeat the verdict from an hour earlier."""
+    host = _host(tmp_path, [PLAN_WITH_TEST, ALPHA, ALPHA_TEST],
+                 name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1))
+    outcomes = session.run("one module and its test")
+    by_path = {o.path: o for o in session._final_outcomes()}
+    assert by_path["tests/test_alpha.py"].verified, by_path
+    assert by_path["src/alpha.py"].verified, (
+        "the module's test ran and passed; the module is verified")
+    assert "src/alpha.py" not in session._unverified(session._final_outcomes())
+    assert any("now verified" in m for _k, m, _d in host.events.of("status"))
+    assert all(o.ok for o in outcomes)
+
+
+def test_a_test_written_after_its_module_sees_the_module(tmp_path):
+    """The tester's prompt carries the module's source and the rule that
+    decides what to assert — not only the interface."""
+    host = _host(tmp_path, [PLAN_WITH_TEST, ALPHA, ALPHA_TEST],
+                 name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1))
+    session.run("one module and its test")
+    def last_user(p):
+        return [m for m in p if m.role == "user"][-1].content
+    tester_prompts = [p for p in host.llm.prompts if
+                      "Write the complete contents of `tests/test_alpha.py`"
+                      in last_user(p)]
+    assert tester_prompts, "no tester prompt found"
+    text = "\n".join(m.content for m in tester_prompts[0]
+                     if isinstance(m.content, str))
+    assert "THE MODULE UNDER TEST — src/alpha.py" in text
+    assert 'def alpha():' in text and '"""First."""' in text
+    assert "never from a formula or a constant of your own" in text
+    assert "How the tests are run:" in text          # the runner's rules
+    # the module's own prompt did not get the block
+    module_prompt = next(p for p in host.llm.prompts if
+                         "Write the complete contents of `src/alpha.py`"
+                         in last_user(p))
+    mtext = "\n".join(m.content for m in module_prompt
+                      if isinstance(m.content, str))
+    assert "THE MODULE UNDER TEST" not in mtext
+    assert "How the tests are run:" not in mtext
+
+
+def test_the_plan_reaches_the_host_as_data(tmp_path):
+    """A task board needs the tasks, not the sentence about them."""
+    host = _host(tmp_path, [PLAN_WITH_TEST, ALPHA, ALPHA_TEST],
+                 name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1))
+    session.start("one module and its test")
+    plans = host.events.of("plan")
+    assert plans, host.events.kinds()
+    _kind, message, data = plans[-1]
+    assert message.startswith("plan: 2 file(s)")
+    paths = [t["path"] for t in data["tasks"]]
+    assert paths == ["src/alpha.py", "tests/test_alpha.py"]
+    assert data["tasks"][0]["purpose"] == "the first thing"
+    assert data["tasks"][1]["persona"] == "tester"
+    assert data["revised"] is False

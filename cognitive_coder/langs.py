@@ -115,6 +115,11 @@ class Lang:
     run_timeout: float = 60.0
     test_timeout: float = 900.0
     notes: str = ""                # what an operator should know
+    #: Told to the TEST AUTHOR before it writes: which runner will collect
+    #: its tests and what that runner can see. A test written for a runner
+    #: that is not there collects nothing (Oct 1, 2026: pytest tests under
+    #: unittest — "Ran 0 tests", twelve good tests never run).
+    test_note: str = ""
     install_hint: str = ""
 
     @property
@@ -247,6 +252,17 @@ _add(Lang(
     stub_style="raise",
     notes="The safe default: the interpreter running this engine can always "
           "run Python, so no toolchain detection can fail.",
+    test_note=("Tests are collected and run with `python -m unittest "
+               "discover` from the project root. Write a class that "
+               "subclasses unittest.TestCase with methods named test_*, use "
+               "self.assertEqual / assertAlmostEqual / assertTrue / "
+               "assertRaises rather than bare `assert`, import the code "
+               "under test by its path from the project root (`from "
+               "src.module import name` when it lives in src/), and end the "
+               "file with `if __name__ == '__main__': unittest.main()`. Do "
+               "NOT import pytest or write bare test_* functions: pytest is "
+               "not necessarily installed, and under unittest such a file "
+               "collects zero tests."),
     scaffold='''"""{title}"""
 
 

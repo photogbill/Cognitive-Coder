@@ -600,6 +600,22 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                         testdir=_join(root, folder) if folder else root)
         cmd = (lang.test_one_cmd if scoped and lang.test_one_cmd
                else lang.test_cmd)
+        if lang_id == "python":
+            # pytest-style tests under the unittest runner collect ZERO
+            # tests (Oct 1, 2026: `import pytest`, a bare class, bare
+            # asserts — "Ran 0 tests", then the same file again). When the
+            # tests in play are written for pytest AND pytest is importable
+            # in the project's environment, pytest runs them; it runs
+            # unittest.TestCase tests too, so nothing is lost. Otherwise
+            # unittest, as before — and the zero-tests message below says
+            # which runner looked and what it needs.
+            runner_kind = python_test_runner(fs, ex, root=root,
+                                             run=subs["run"], scoped=scoped)
+            if runner_kind == "pytest":
+                cmd = _PYTEST_ONE if scoped else _PYTEST_ALL
+                caveats.append("test runner: pytest (the tests are written "
+                               "for it and it is installed in the project's "
+                               "environment)")
         argv = langs.render(cmd, **subs)
         run_argv = langs.render(lang.test_run_cmd, **subs)
         if any("{" in str(p) or not str(p) for p in argv + run_argv):
@@ -628,7 +644,7 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
         # and treating it as one fed "NO TESTS RAN" to the model as an
         # error in code that was fine.
         phase = replace(phase, ok=True,
-                        note="exit status 5: unittest found no tests")
+                        note="exit status 5: the test runner found no tests")
     diags: tuple[Diagnostic, ...] = ()
     if not phase.ok:
         diags = tuple(diagnostics.attach_source(
@@ -648,14 +664,8 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
             diagnostics=(Diagnostic(
                 file=path, line=1, severity="error", tool="unittest",
                 code="no-tests-collected",
-                message=(f"{path} ran, but the test runner collected ZERO "
-                         f"tests from it. A test file must define tests the "
-                         f"runner can find: for unittest, methods named "
-                         f"test_* on a class that subclasses "
-                         f"unittest.TestCase, ending with "
-                         f"`if __name__ == '__main__': unittest.main()`. "
-                         f"Return the complete test file — not the module "
-                         f"it tests.")),),
+                message=_zero_tests_message(lang_id, path, fs=fs,
+                                            scoped=scoped)),),
             caveats=tuple(caveats))
     if empty:
         caveats.append(empty)
@@ -695,6 +705,129 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                              caveats=tuple(caveats))
     return RunResult(ok=phase.ok, lang=lang_id, phases=(phase,),
                      diagnostics=diags, caveats=tuple(caveats))
+
+
+#: pytest commands for Python, used when `python_test_runner` says so.
+#: `--tb=native` makes pytest print ordinary Python tracebacks, which the
+#: diagnostics parser already reads; `-p no:cacheprovider` keeps a
+#: `.pytest_cache/` out of the project; `-rfE` lists each failure as a
+#: `FAILED path::test - reason` line, which failure attribution reads.
+_PYTEST_ALL = ["{run}", "-m", "pytest", "-q", "-rfE", "--tb=native",
+               "-p", "no:cacheprovider", "{dir}"]
+_PYTEST_ONE = ["{run}", "-m", "pytest", "-q", "-rfE", "--tb=native",
+               "-p", "no:cacheprovider", "{test}"]
+
+_PYTEST_STYLE = re.compile(
+    r"^\s*(?:import\s+pytest\b|from\s+pytest\b|@pytest\.)", re.M)
+_UNITTEST_STYLE = re.compile(r"\bunittest\.TestCase\b|\bTestCase\)")
+_BARE_TEST_FUNCTION = re.compile(r"^def\s+test_\w+\s*\(", re.M)
+
+
+def is_pytest_style(source: str) -> bool:
+    """Would ONLY pytest collect this file's tests?
+
+    `import pytest`, `pytest.` decorators, or `test_*` functions and
+    classes with no `unittest.TestCase` anywhere. A file that subclasses
+    TestCase is unittest-style even if it also imports pytest: unittest
+    collects it, so no runner change is needed for it.
+    """
+    text = source or ""
+    if _UNITTEST_STYLE.search(text):
+        return False
+    return bool(_PYTEST_STYLE.search(text)
+                or _BARE_TEST_FUNCTION.search(text))
+
+
+def _pytest_importable(ex: Any, run: str, cwd: str) -> bool:
+    """Is pytest importable by the interpreter that will run the tests?
+
+    Probed through the host's ExecPort, so a host that redirects `python`
+    to a per-project environment (ATK does) answers for THAT environment.
+    Cheap — one interpreter start — and repeated per verify on purpose:
+    an install mid-session must be seen by the next run.
+    """
+    if not run:
+        return False
+    try:
+        proc = ex.run([run, "-c", "import pytest"], cwd=cwd, timeout=30)
+    except Exception:                                    # noqa: BLE001
+        return False
+    return getattr(proc, "exit_code", 1) == 0
+
+
+def python_test_runner(fs: Any, ex: Any, *, root: str, run: str,
+                       scoped: str = "") -> str:
+    """``"pytest"`` or ``"unittest"`` for this run.
+
+    pytest only when both hold: the tests in play are pytest-style (the
+    scoped file, or any test file in the project for a whole-suite run)
+    AND pytest is importable in the environment that runs them.
+    """
+    sources: list[str] = []
+    try:
+        if scoped:
+            sources = [fs.read(scoped)]
+        else:
+            for rel in _python_test_files(fs):
+                try:
+                    sources.append(fs.read(rel))
+                except Exception:                        # noqa: BLE001
+                    continue
+    except Exception:                                    # noqa: BLE001
+        return "unittest"
+    if not any(is_pytest_style(src) for src in sources):
+        return "unittest"
+    return "pytest" if _pytest_importable(ex, run, root) else "unittest"
+
+
+def _python_test_files(fs: Any) -> list[str]:
+    """Root-relative `test_*.py` / `*_test.py` files and anything .py under
+    a test folder, skipping dot-folders and virtualenvs."""
+    try:
+        paths = fs.list("*")
+    except Exception:                                    # noqa: BLE001
+        return []
+    out = []
+    for raw in paths:
+        rel = str(raw).replace("\\", "/")
+        parts = rel.split("/")
+        if any(p.startswith(".") or p in ("venv", "node_modules",
+                                          "site-packages", "__pycache__")
+               for p in parts[:-1]):
+            continue
+        if rel.endswith(".py") and is_test_path(rel):
+            out.append(rel)
+    return sorted(out)
+
+
+def _zero_tests_message(lang_id: str, path: str, *, fs: Any,
+                        scoped: str = "") -> str:
+    """Why the runner found nothing, in words the model can act on."""
+    head = (f"{path} ran, but the test runner collected ZERO tests from "
+            f"it. ")
+    if lang_id == "python":
+        try:
+            src = fs.read(scoped or path)
+        except Exception:                                # noqa: BLE001
+            src = ""
+        if is_pytest_style(src):
+            return (head + "It is written for pytest (`import pytest`, bare "
+                    "`test_*` functions or classes without "
+                    "unittest.TestCase), and pytest is not installed in "
+                    "the project's environment, so the unittest runner "
+                    "looked and found nothing. Rewrite it as unittest "
+                    "tests — methods named test_* on a class that "
+                    "subclasses unittest.TestCase, plain `assert`s "
+                    "replaced by self.assertEqual and friends, ending with "
+                    "`if __name__ == '__main__': unittest.main()` — which "
+                    "run under either runner.")
+        return (head + "A test file must define tests the runner can find: "
+                "for unittest, methods named test_* on a class that "
+                "subclasses unittest.TestCase, ending with "
+                "`if __name__ == '__main__': unittest.main()`. Return the "
+                "complete test file — not the module it tests.")
+    return head + ("A test file must define tests the runner can find. "
+                   "Return the complete test file — not the module it tests.")
 
 
 def is_test_path(path: str) -> bool:

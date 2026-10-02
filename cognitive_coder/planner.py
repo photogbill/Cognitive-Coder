@@ -918,21 +918,7 @@ class Planner:
         can be checked against them before anything is generated. That is a
         larger change and belongs in its own pass.
         """
-        entry_names = {"main", "app", "cli", "__main__", "index", "run",
-                       "server", "start", "program", "game"}
-        entry_words = ("entry point", "event loop", "initialization",
-                       "initialisation", "main loop", "bootstrap",
-                       "game loop", "startup", "command line")
-
-        def is_entry(task: Task) -> bool:
-            if _looks_like_test(task.path):
-                return False
-            if _stem(task.path).lower() in entry_names:
-                return True
-            purpose = (task.purpose or "").lower()
-            return any(w in purpose for w in entry_words)
-
-        entries = [t.id for t in plan.tasks if is_entry(t)]
+        entries = [t.id for t in plan.tasks if is_entry_point(t)]
         #: A TEST IS NOT A DEPENDENCY OF THE PROGRAM, and saying otherwise
         #: cost a whole build.
         #:
@@ -1245,6 +1231,27 @@ def _has_body(fs: Any, path: str, lang_id: str) -> bool:
     if STUB_SENTINEL in text:
         return False
     return bool(text.strip()) and "NotImplementedError" not in text
+
+
+#: Module names and purpose phrases that mark an ENTRY POINT — a file
+#: nothing else imports. Used to seed the build order before any code
+#: exists (`derive_order`) and to leave entry points out of the "what
+#: already exists" interfaces shown to a module (`Session._built_siblings`).
+ENTRY_NAMES = frozenset({"main", "app", "cli", "__main__", "index", "run",
+                         "server", "start", "program", "game"})
+ENTRY_WORDS = ("entry point", "event loop", "initialization",
+               "initialisation", "main loop", "bootstrap", "game loop",
+               "startup", "command line")
+
+
+def is_entry_point(task: Task) -> bool:
+    """Is this task's file an entry point — imported by nothing?"""
+    if _looks_like_test(task.path):
+        return False
+    if _stem(task.path).lower() in ENTRY_NAMES:
+        return True
+    purpose = (task.purpose or "").lower()
+    return any(w in purpose for w in ENTRY_WORDS)
 
 
 def _is_our_stub(text: str) -> bool:

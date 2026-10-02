@@ -139,11 +139,17 @@ def dependency_interfaces(store: Any, target: str, *,
             continue
         lines.append(text)
         used += cost
-    lines[0] = ("# INTERFACES YOU MAY CALL (exact signatures — use these, "
-                "do not guess)" if not approx else
-                "# INTERFACES YOU MAY CALL (use these rather than guess; "
-                "lines marked ~approx were pattern-matched, not parsed — "
-                "confirm one with search_codemap before relying on it)")
+    # "If you use one": the list also carries modules the file may not
+    # need (every built sibling, when the plan knows no better). The rule
+    # is about NAMES — call what exists by its real name — not a request
+    # to import everything listed.
+    lines[0] = ("# INTERFACES YOU MAY CALL (exact signatures — if you use one "
+                "of these modules, use these names; do not guess or invent "
+                "others)" if not approx else
+                "# INTERFACES YOU MAY CALL (if you use one of these modules, "
+                "use these names rather than guess; lines marked ~approx "
+                "were pattern-matched, not parsed — confirm one with "
+                "search_codemap before relying on it)")
     if dropped:
         lines.append(f"# NOT SHOWN (no room): {', '.join(dropped)} — call "
                      f"search_codemap if you need them.")

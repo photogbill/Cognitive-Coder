@@ -52,7 +52,7 @@ from .errors import (
 from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
 from .patcher import Patcher
-from .planner import Planner, _looks_like_test
+from .planner import Planner, _looks_like_test, is_entry_point as _is_entry_point
 from .ports import Cancel, Host
 from .providers import RemoteGate
 from .redact import Budget
@@ -297,7 +297,70 @@ class Session:
             # is the one thing skeleton-first exists to provide. A new plan
             # is an epoch boundary (G.7.2); this is that boundary.
             self.codemap.maybe_bump_epoch(replanned=True)
+        self._emit_plan(revised=False)
+        self._preinstall(request)
         return self.plan
+
+    def _preinstall(self, request: str) -> None:
+        """Install the packages the REQUEST names before the first file.
+
+        Oct 1, 2026: "using pygame" was the spec's first line; the engine
+        learned it at minute 13, when `render.py` failed to import it, and
+        the host's install question then waited for a person. Only a host
+        that can install (an ExecPort with `ensure_packages`) does this,
+        only for Python, and only for packages the operator's own text
+        names — `packages.packages_in` — which is also what lets a host
+        approve them without asking. Nothing here fails the build: an
+        install the host declines or cannot do shows up later, at the
+        import, exactly as before.
+        """
+        ensure = getattr(self.host.exec, "ensure_packages", None)
+        if not callable(ensure) or self.config.lang != "python":
+            return
+        from . import packages
+        wanted = packages.packages_in(request)
+        if not wanted:
+            return
+        names = ", ".join(pip for _imp, pip in wanted)
+        self.host.emit("status",
+                       f"the request names {names}; making sure "
+                       f"{'it is' if len(wanted) == 1 else 'they are'} "
+                       f"installed in the project's environment before "
+                       f"the first file", {"phase": "preinstall",
+                                           "packages": [p for _i, p in wanted]})
+        try:
+            outcome = ensure(wanted)
+        except Exception as exc:                         # noqa: BLE001
+            self.host.emit("warning",
+                           f"could not pre-install {names}: {exc} — the "
+                           f"build goes on; a missing one will show at its "
+                           f"import", {"phase": "preinstall"})
+            return
+        if outcome:
+            self.log.event("PREINSTALL", str(outcome))
+
+    def _emit_plan(self, *, revised: bool) -> None:
+        """The plan as DATA, for hosts that draw a task board (event `plan`).
+
+        The console line "plan: 7 file(s) proposed" is for reading; a host
+        that wants to show one row per file, with its purpose in plain words
+        and its state as it changes, needs the tasks themselves. Emitted
+        once after planning and again whenever a re-plan changes the set of
+        files, so a board never shows a file the plan dropped.
+        """
+        if self.plan is None:
+            return
+        tasks = [{"id": t.id, "path": t.path, "purpose": t.purpose,
+                  "test_path": t.test_path, "persona": t.persona,
+                  "depends_on": list(t.depends_on), "status": t.status,
+                  "attempts": t.attempts}
+                 for t in self.plan.tasks]
+        self.host.emit("plan",
+                       f"plan: {len(tasks)} file(s)"
+                       + (" (revised)" if revised else ""),
+                       {"tasks": tasks, "revised": revised,
+                        "request": self.plan.request,
+                        "caveats": list(self.plan.caveats)})
 
     def preview(self, request: str, profile: dict | None = None) -> dict:
         """Plan, and stop. What would be built, before anything is built.
@@ -390,17 +453,35 @@ class Session:
                                      covers=covers.path if covers else "",
                                      planned=self._planned_paths(task))
         self.outcomes.append(outcome)
+        self._credit_module(covers, outcome)
         blamed = self.loop.blamed.pop(task.path, None)
-        if blamed and covers is not None and covers.path not in self._repaired:
-            # The test disagreed with its module and was NOT rewritten.
-            # The module is what changes: one repair pass, against the
-            # test's own failing output, and then the test is run again.
-            self._repaired.add(covers.path)
-            self._repairs.append((covers, task, tuple(blamed[1])))
-            self.host.emit("status",
-                           f"{covers.path} will be repaired against "
-                           f"{task.path}, which it fails",
-                           {"task": covers.path, "test": task.path})
+        if blamed:
+            # Two shapes, one mechanism. A TEST that disagreed with its
+            # module and was not rewritten: the module is repaired against
+            # the test's failing output, then the test runs again. A
+            # MODULE that ran and died inside another file of this project
+            # (`Loop._culprit_elsewhere`): that file is repaired against
+            # the failure, then this module runs again. Each file is
+            # repaired at most once per session, whoever blames it.
+            target = covers if covers is not None else self._task_at(
+                str(blamed[0] or ""))
+            if target is not None and target.path != task.path \
+                    and target.path not in self._repaired:
+                self._repaired.add(target.path)
+                self._repairs.append((target, task, tuple(blamed[1])))
+                self.host.emit(
+                    "status",
+                    f"{target.path} will be repaired against {task.path}, "
+                    f"which {'it fails' if covers is not None else 'fails inside it'}",
+                    {"task": target.path, "test": task.path,
+                     "because": "test" if covers is not None else "caller"})
+            elif target is None and blamed[0]:
+                self.host.emit(
+                    "warning",
+                    f"{task.path} fails inside {blamed[0]}, which is not a "
+                    f"file this plan owns, so it is left alone; fix "
+                    f"{blamed[0]} by hand and build again",
+                    {"task": task.path, "culprit": str(blamed[0])})
         # M31: a model without tool calling gets a summary that may not lag,
         # because it cannot look anything up to correct one that does. Read
         # from capabilities at the task boundary, so a mid-session model swap
@@ -437,19 +518,22 @@ class Session:
         before = {t.path for t in self.plan.tasks}
         self.plan = self.planner.replan(self.plan,
                                         reason=f"after {task.path}")
-        self.codemap.maybe_bump_epoch(
-            replanned={t.path for t in self.plan.tasks} != before)
+        changed = {t.path for t in self.plan.tasks} != before
+        self.codemap.maybe_bump_epoch(replanned=changed)
+        if changed:
+            self._emit_plan(revised=True)
         return outcome
 
     def _repair_step(self) -> TaskOutcome:
-        """Repair a module against the test it failed, then re-run the test.
+        """Repair a file against what it failed, then run that again.
 
-        The fix task has the module's path and purpose and the test as its
-        `test_path`; its first attempt is a REPAIR seeded with the test's
-        failing output, and its prompt carries the test itself as the
-        specification. If it verifies, the test task is verified again —
-        without generating anything — and that verdict is what the session
-        reports for the test.
+        The fix task has the culprit's path and purpose and the blaming
+        task's path as its `test_path`; its first attempt is a REPAIR
+        seeded with the failing output, and its prompt carries the blamer
+        itself — a test as the specification, or a caller as the use that
+        must work. If the fix verifies, the blamer is verified again
+        without generating anything, and that verdict is what the session
+        reports for it.
         """
         module, test, failing = self._repairs.pop(0)
         self._where = f"the repair of {module.path}"
@@ -457,12 +541,21 @@ class Session:
         if not caps.loaded:
             raise NoModelLoadedError(
                 "capabilities() reports no model at a task boundary")
+        blamer_is_test = (test.persona == "tester"
+                          or _looks_like_test(test.path))
+        # A test blamer becomes the fix's `test_path` (the specification it
+        # answers to, and what verifies it). A caller blamer does NOT: a
+        # module is not a test file, and naming it as one made the loop
+        # report "src/main.py exists, but the test run collected none of
+        # its tests". It travels as `caller` instead.
         fix = Task(id=f"{module.id}-fix", path=module.path,
-                   purpose=module.purpose, test_path=test.path,
+                   purpose=module.purpose,
+                   test_path=test.path if blamer_is_test else module.test_path,
                    persona=module.persona, lang=module.lang, atomic=False)
         outcome = self.loop.run_task(fix, request=self.plan.request,
                                      seed=failing,
-                                     planned=self._planned_paths(module))
+                                     planned=self._planned_paths(module),
+                                     caller="" if blamer_is_test else test.path)
         self._record(fix, outcome, label="REPAIRED" if outcome.ok
                      else "NOT REPAIRED")
         if not outcome.ok:
@@ -470,9 +563,24 @@ class Session:
         again = self.loop.reverify(
             test, because=f"{module.path} was repaired against it")
         self._record(test, again, label=again.label)
+        if blamer_is_test:
+            # Only a TEST passing says anything about the module's
+            # correctness; a caller that now runs says the caller runs.
+            self._credit_module(module, again)
         self.plan = self.plan.replace(test.with_status(
             "done" if again.ok else "failed"))
         return again
+
+    def _task_at(self, path: str) -> Task | None:
+        """The plan's task for a path, or None when the plan does not own
+        that file (a pre-existing module the session may not rewrite)."""
+        if self.plan is None or not path:
+            return None
+        want = path.replace("\\", "/")
+        for t in self.plan.tasks:
+            if t.path.replace("\\", "/") == want:
+                return t
+        return None
 
     def _record(self, task: Task, outcome: TaskOutcome, *,
                 label: str) -> None:
@@ -626,6 +734,35 @@ class Session:
                 out.append(rel)
         return sorted(out)
 
+    def _credit_module(self, module: Task | None, test_outcome: TaskOutcome
+                       ) -> None:
+        """A test that VERIFIED clears the "not verified" mark on the module
+        it covers.
+
+        The plan writes modules before their tests, so every module is
+        "built, not verified" at its own task's end — its test did not exist
+        yet. When the test is written and its tests run and pass, the module
+        has been verified after all, and the session's summary must say so
+        rather than repeat a verdict that was true an hour ago.
+        """
+        if module is None or not test_outcome.verified:
+            return
+        self.loop.unverified.discard(module.path)
+        # The module's final outcome carries the verdict too, so a host that
+        # renders outcomes (not only the summary) shows the same thing.
+        last = next((o for o in reversed(self.outcomes)
+                     if o.path == module.path), None)
+        if last is not None and last.ok and not last.verified:
+            self.outcomes.append(dataclasses.replace(
+                last, verified=True,
+                caveats=last.caveats + (
+                    f"verified by {test_outcome.path}, written after it",)))
+        self.host.emit("status",
+                       f"{module.path}: now verified — {test_outcome.path} "
+                       f"ran its tests against it and they passed",
+                       {"task": module.path, "verified": True,
+                        "by": test_outcome.path})
+
     def _planned_paths(self, task: Task) -> tuple[str, ...]:
         """The PATHS of the plan's tasks that `task` depends on.
 
@@ -643,7 +780,56 @@ class Session:
         if covers is not None and covers.path not in paths \
                 and covers.path != task.path:
             paths.append(covers.path)
+        # WHAT ALREADY EXISTS, for a module. The plan's edges come from the
+        # stubs' imports, and a stub imports nothing (only the entry point
+        # does, by the role rule) — so on 2026-10-01 `render.py` was written
+        # with no interface of `physics`, `track` or `math3d` in front of
+        # it and invented `player_state.x` and `segment.width` against a
+        # class with neither. Every module already built in the project is
+        # appended AFTER the real dependencies, so the interface budget
+        # serves those first and the rest as far as it reaches. This is
+        # visibility, not a dependency: no import is written, no order
+        # changes, and `math3d` is not made to depend on `track` by being
+        # shown it (the planner's docstring explains why that would be
+        # wrong). The header the block carries says "use these names if
+        # you call them", which is all it means.
+        if not _looks_like_test(task.path) and task.persona != "tester":
+            for other in self._built_siblings(task):
+                if other not in paths:
+                    paths.append(other)
         return tuple(paths)
+
+    #: How many already-built siblings a module is shown beyond its planned
+    #: dependencies. The interface block's own token budget is the real
+    #: limit; this keeps the "not shown" list short on a large project.
+    SIBLINGS_SHOWN = 10
+
+    def _built_siblings(self, task: Task) -> list[str]:
+        """Paths of the plan's modules with a REAL body, not stubs, not
+        tests, not entry points (nothing imports an entry point)."""
+        if self.plan is None:
+            return []
+        from .loop import _is_our_stub
+        out: list[str] = []
+        for other in self.plan.tasks:
+            if other.id == task.id or other.path == task.path:
+                continue
+            if _looks_like_test(other.path) or other.persona == "tester":
+                continue
+            if other.status not in ("done", "failed"):
+                continue
+            if _is_entry_point(other):
+                continue
+            try:
+                text = self.host.fs.read(other.path)
+            except Exception:                            # noqa: BLE001
+                continue
+            if not text.strip() or _is_our_stub(text):
+                continue
+            out.append(other.path)
+            if len(out) >= self.SIBLINGS_SHOWN:
+                break
+        return out
 
     def _covered_module(self, task: Task) -> Task | None:
         """For a test task, the planned module it tests; else None."""

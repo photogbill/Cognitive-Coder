@@ -174,7 +174,7 @@ def test_event_kinds_are_a_closed_set():
     """M19 — hosts render these; additions are minor, renames are major."""
     from cognitive_coder.types import EVENT_KINDS
     assert EVENT_KINDS == ("phase", "token", "status", "diagnostic", "patch",
-                           "remote", "warning", "error", "budget")
+                           "remote", "warning", "error", "budget", "plan")
 
 
 def test_public_api_exports_the_frozen_surface():

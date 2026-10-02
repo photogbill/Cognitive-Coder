@@ -90,6 +90,74 @@ is a defect that run exhibited, with the line that proved it.
   exited 0; the test that pins the discovery fact now states both.
 - Journal: two new events, `model_check` and `baseline`; the golden trace
   gained the one line.
+- **Host event `plan`** (added to `EVENT_KINDS`; a minor-version addition):
+  the plan as data — one dict per task with `id`, `path`, `purpose`,
+  `test_path`, `persona`, `depends_on`, `status`, `attempts` — emitted
+  after planning and again when a re-plan changes the set of files. The
+  console line `plan: 7 file(s) proposed` was all a host had; a host that
+  draws a task board needs the rows. Hosts that ignore unknown kinds are
+  unaffected.
+
+### Fixed — what the first Phase 0 build showed (2026-10-02)
+
+The racing spec again, on the Phase 0 engine with Qwen3-Coder-30B at 32k:
+28 minutes, three files built-not-verified, four failed. Read line by
+line, as before. Every item is a defect that run exhibited.
+
+- **A module is shown what already exists.** `render.py` was written
+  with no interface of `physics`, `track` or `math3d` in front of it —
+  the stubs import nothing, so the plan had no edge to follow and the
+  Phase 0 interface block had nothing to attach to — and invented
+  `player_state.x` and `segment.width` against a class with neither.
+  `Session._planned_paths` now appends every module already built in
+  the project, after the real dependencies: not tests, not stubs, not
+  the entry point, at most ten (`SIBLINGS_SHOWN`); the interface block's
+  budget serves real dependencies first. Visibility, not a dependency:
+  no import is written and no order changes.
+- **A failure is repaired where it is raised.** `main.py` ran and died
+  at `render.py:61`; the loop asked for main.py again, got the identical
+  file (correctly), and gave up with "the task is probably too large".
+  When the first error's innermost project frame is another file this
+  plan owns (`Loop._culprit_elsewhere`), the task stops at once and
+  names it; the session repairs that file against the failure, with the
+  caller shown as a caller (`[THE CALLER THAT FAILS INSIDE THIS FILE]`)
+  and the real definitions under the error; then the caller runs again.
+  Once per file per session. A culprit outside the plan is named, not
+  touched.
+- **pytest tests are run by pytest when it is there.** The model wrote
+  `tests/test_physics.py` for pytest; the host installed pytest on
+  request; the engine ran `unittest discover`, collected zero tests, and
+  got the same file back. `runner.python_test_runner` picks pytest when
+  the tests in play are pytest-style (`import pytest`, bare `test_*`
+  functions, classes without TestCase) AND pytest is importable in the
+  environment that runs them — probed through the host's ExecPort, so a
+  per-project venv answers for itself; `--tb=native` keeps the
+  diagnostics parser's tracebacks, `-rfE` keeps failure attribution's
+  `FAILED path::test` lines. Without pytest, the zero-tests message says
+  the file is written for pytest and what to write instead. And the
+  test author is told the runner's rules before it writes
+  (`Lang.test_note`, Python set).
+- **A test written after its module sees the module.** The tester
+  asserted `x = cx + x/z·(w/2)` to seven places against an FOV-scaled
+  projection; it had the signature, not the formula. A test task whose
+  covered module has a real body gets `[THE MODULE UNDER TEST]` with
+  the rule: assert the requested behaviour and the docstrings' promises;
+  take exact numbers from how the module computes them, never from a
+  formula of your own; if the module contradicts the request, assert
+  the request and let it fail.
+- **Packages the request names install before the first file.**
+  "using pygame" was the spec's first line; the engine learned it at
+  minute 13, at an import, and the host's install question waited
+  thirteen more for a person. `packages.py` (new): the well-known PyPI
+  names, `packages_in(request)`, `is_known`, `mentioned_in`.
+  `Session.start` hands what the request names to the host's optional
+  `ExecPort.ensure_packages`; a host without one is unaffected, and a
+  host may use `is_known`/`mentioned_in` to install those without
+  asking. (ATK does, by default, into the project's own venv; an
+  unknown name — a model's typo — still asks.)
+- `planner.is_entry_point` is public (it was a closure in
+  `derive_order`); `tests/test_repair_routing.py`,
+  `tests/test_pytest_runner.py`, `tests/test_packages.py` are new.
 
 ### Changed — the prompt cache: two design decisions, measured
 
