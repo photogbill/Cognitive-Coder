@@ -535,8 +535,31 @@ class Loop:
         stopped = ""
         if not result.ok:
             first = next((d for d in result.diagnostics if d.is_error), None)
-            stopped = (f"it still fails after {because or 'the repair'}"
-                       + (f": {first.one_line()}" if first else ""))
+            # THE FAILURE MAY HAVE MOVED. Oct 2, 2026: main.py died in
+            # math3d.py; math3d.py was repaired; main.py then died in
+            # render.py — a different file, a different bug — and this
+            # reported "it still fails" and stopped, so render.py was never
+            # touched. When the error is now raised in another project
+            # file, name it, exactly as a first failure would. The session
+            # decides whether it may still be repaired (each file at most
+            # once), so this cannot loop.
+            culprit = self._culprit_elsewhere(task, result.diagnostics)
+            if culprit:
+                self.blamed[task.path] = (culprit, result.diagnostics)
+                where = next((d for d in result.diagnostics if d.is_error
+                              and d.file and _same_file(d.file, culprit)),
+                             None)
+                at = (f"{culprit}:{where.line}" if where and where.line
+                      else culprit)
+                detail = f" — {where.message}" if where and where.message \
+                    else ""
+                stopped = (f"it still fails after {because or 'the repair'}"
+                           f", and the error is now in {at}{detail}")
+                self._emit("warning", f"{task.path}: {stopped}",
+                           {"task": task.path, "culprit": culprit})
+            else:
+                stopped = (f"it still fails after {because or 'the repair'}"
+                           + (f": {first.one_line()}" if first else ""))
         outcome = TaskOutcome(task_id=task.id, path=task.path, ok=result.ok,
                               result=result, stopped_because=stopped,
                               caveats=caveats,
@@ -996,8 +1019,17 @@ class Loop:
         except Exception:                                # noqa: BLE001
             return ""
         for path in known:
-            if path != task.path and _same_file(first.file, path) \
-                    and not _looks_like_test(path):
+            if path == task.path or not _same_file(first.file, path):
+                continue
+            if not _looks_like_test(path):
+                return path
+            # A TEST file is normally the authority, never the culprit —
+            # except when it does not parse. Oct 2, 2026: src/physics.py
+            # failed its run because tests/test_physics.py ended in a stray
+            # "```"; the loop rewrote physics.py twice, got the same file
+            # twice, and stopped. Nothing in physics.py could fix that.
+            if first.code == "syntax" or \
+                    _TEST_PARSE_FAULT.search(first.message or ""):
                 return path
         return ""
 
@@ -1547,6 +1579,13 @@ _TEST_OWN_FAULT = re.compile(
     r"cannot import name|NameError|is not defined", re.I)
 
 
+#: A test file that cannot even be PARSED. Narrower than _TEST_OWN_FAULT on
+#: purpose: "cannot import name X from src.physics", raised in a test, can be
+#: fixed by giving src/physics.py an X — but no change to any module can fix
+#: a syntax error in the test file.
+_TEST_PARSE_FAULT = re.compile(r"SyntaxError|IndentationError|TabError")
+
+
 def _same_file(diag_file: str, path: str) -> bool:
     f = (diag_file or "").replace("\\", "/")
     p = path.replace("\\", "/")
@@ -1575,8 +1614,12 @@ def _test_disagrees_with_code(test_path: str,
     """
     errors = [d for d in diags if d.is_error]
     for d in errors:
-        if d.file and _same_file(d.file, test_path) and \
-                _TEST_OWN_FAULT.search(d.message or ""):
+        # `code == "syntax"`: the in-process parse check's message is the
+        # bare reason ("invalid syntax", "expected ':'"), with no
+        # "SyntaxError" in it for the pattern to find.
+        if d.file and _same_file(d.file, test_path) and (
+                d.code == "syntax"
+                or _TEST_OWN_FAULT.search(d.message or "")):
             return False
     for d in errors:
         message = (d.message or "").lower()

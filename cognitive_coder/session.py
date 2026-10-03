@@ -456,32 +456,7 @@ class Session:
         self._credit_module(covers, outcome)
         blamed = self.loop.blamed.pop(task.path, None)
         if blamed:
-            # Two shapes, one mechanism. A TEST that disagreed with its
-            # module and was not rewritten: the module is repaired against
-            # the test's failing output, then the test runs again. A
-            # MODULE that ran and died inside another file of this project
-            # (`Loop._culprit_elsewhere`): that file is repaired against
-            # the failure, then this module runs again. Each file is
-            # repaired at most once per session, whoever blames it.
-            target = covers if covers is not None else self._task_at(
-                str(blamed[0] or ""))
-            if target is not None and target.path != task.path \
-                    and target.path not in self._repaired:
-                self._repaired.add(target.path)
-                self._repairs.append((target, task, tuple(blamed[1])))
-                self.host.emit(
-                    "status",
-                    f"{target.path} will be repaired against {task.path}, "
-                    f"which {'it fails' if covers is not None else 'fails inside it'}",
-                    {"task": target.path, "test": task.path,
-                     "because": "test" if covers is not None else "caller"})
-            elif target is None and blamed[0]:
-                self.host.emit(
-                    "warning",
-                    f"{task.path} fails inside {blamed[0]}, which is not a "
-                    f"file this plan owns, so it is left alone; fix "
-                    f"{blamed[0]} by hand and build again",
-                    {"task": task.path, "culprit": str(blamed[0])})
+            self._queue_repair(task, blamed, covers)
         # M31: a model without tool calling gets a summary that may not lag,
         # because it cannot look anything up to correct one that does. Read
         # from capabilities at the task boundary, so a mid-session model swap
@@ -524,6 +499,51 @@ class Session:
             self._emit_plan(revised=True)
         return outcome
 
+    def _queue_repair(self, task: Task, blamed: tuple,
+                      covers: Task | None) -> None:
+        """Queue the repair of the file ``task`` blames, if it may be.
+
+        Two shapes, one mechanism. A TEST that disagreed with its module
+        and was not rewritten: the module is repaired against the test's
+        failing output, then the test runs again. A MODULE that ran and
+        died inside another file of this project (`Loop._culprit_elsewhere`)
+        — or inside a test file that does not parse — that file is
+        repaired against the failure, then this module runs again.
+
+        Each file is repaired at most once per session, whoever blames it.
+        That is also what bounds a chain of them: Oct 2, 2026, main.py
+        died in math3d.py, then (math3d.py repaired) in render.py. A second
+        hop is queued like the first; a file blamed again after its one
+        repair is reported, not repaired again.
+        """
+        target = covers if covers is not None else self._task_at(
+            str(blamed[0] or ""))
+        if target is not None and target.path != task.path \
+                and target.path not in self._repaired:
+            self._repaired.add(target.path)
+            self._repairs.append((target, task, tuple(blamed[1])))
+            self.host.emit(
+                "status",
+                f"{target.path} will be repaired against {task.path}, "
+                f"which {'it fails' if covers is not None else 'fails inside it'}",
+                {"task": target.path, "test": task.path,
+                 "because": "test" if covers is not None else "caller"})
+        elif target is not None and target.path in self._repaired \
+                and target.path != task.path:
+            self.host.emit(
+                "warning",
+                f"{task.path} still fails inside {target.path}, which has "
+                f"already had its one repair this session; fix "
+                f"{target.path} by hand and build again",
+                {"task": task.path, "culprit": target.path})
+        elif target is None and blamed[0]:
+            self.host.emit(
+                "warning",
+                f"{task.path} fails inside {blamed[0]}, which is not a "
+                f"file this plan owns, so it is left alone; fix "
+                f"{blamed[0]} by hand and build again",
+                {"task": task.path, "culprit": str(blamed[0])})
+
     def _repair_step(self) -> TaskOutcome:
         """Repair a file against what it failed, then run that again.
 
@@ -563,6 +583,12 @@ class Session:
         again = self.loop.reverify(
             test, because=f"{module.path} was repaired against it")
         self._record(test, again, label=again.label)
+        # The failure may now be raised in a THIRD file (`Loop.reverify`
+        # names it). Queue that repair the same way; `_queue_repair`
+        # refuses any file that has had its one repair already.
+        moved = self.loop.blamed.pop(test.path, None)
+        if moved and not again.ok:
+            self._queue_repair(test, moved, None)
         if blamer_is_test:
             # Only a TEST passing says anything about the module's
             # correctness; a caller that now runs says the caller runs.

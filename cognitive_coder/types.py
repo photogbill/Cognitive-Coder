@@ -320,6 +320,11 @@ class PhaseResult:
     proc: ProcResult | None = None
     ok: bool = False
     note: str = ""
+    #: Diagnostics the phase produced as OBJECTS, when it has them — the
+    #: in-process `ast.parse` check does. The runner uses these instead of
+    #: re-parsing the phase's printed output, which lost the file: see
+    #: `runner.syntax_check`.
+    diagnostics: tuple[Diagnostic, ...] = ()
 
     @property
     def output(self) -> str:

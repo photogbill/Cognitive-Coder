@@ -283,18 +283,29 @@ def syntax_check(code: str, lang_id: str, *, ex: Any = None,
     such.
     """
     if lang_id == "python":
+        # THE FILE NAME IS PART OF THE VERDICT. Oct 2, 2026: this read
+        # `file=exc.filename or src_path`, and `ast.parse` without a
+        # filename reports "<unknown>" — which is truthy, so src_path was
+        # never used. The printed line "<unknown>:47:1: error: ..." was then
+        # re-parsed as a gcc message, the diagnostic arrived with no real
+        # file, and failure attribution could not see that it was
+        # tests/test_math3d.py that did not parse. It blamed src/math3d.py
+        # instead, and src/physics.py was rewritten twice for a stray fence
+        # in tests/test_physics.py. Now the parse is told the path, the
+        # diagnostic carries it, and the object itself travels with the
+        # phase so nothing has to re-read it from text.
         try:
-            ast.parse(code)
+            ast.parse(code, filename=src_path or "<unknown>")
             return PhaseResult(name="syntax", ok=True)
         except SyntaxError as exc:
             diag = Diagnostic(
-                file=exc.filename or src_path, line=exc.lineno or 0,
+                file=src_path or exc.filename or "", line=exc.lineno or 0,
                 col=exc.offset, severity="error",
                 message=f"{exc.msg}", code="syntax", tool="python-ast")
             return PhaseResult(
                 name="syntax", ok=False,
                 proc=ProcResult(exit_code=1, stderr=diag.one_line()),
-                note="the file does not parse")
+                note="the file does not parse", diagnostics=(diag,))
 
     lang = langs.get(lang_id)
     if not lang or not lang.syntax_cmd or ex is None:
@@ -378,11 +389,18 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
                 or "\n".join(p.output for p in phases))
         diags: tuple[Diagnostic, ...] = ()
         if not ok:
+            # A phase that already holds its diagnostics as objects (the
+            # in-process syntax check) is taken at its word: printing one
+            # and parsing it back is how the file got lost on Oct 2.
+            known = tuple(d for p in phases if not p.ok
+                          for d in p.diagnostics)
             # `root`, so a traceback raised inside a library is located in
             # the project's own deepest frame — one the model can fix.
+            found = list(known) or diagnostics.parse(text, lang_id,
+                                                     root=root)
             diags = tuple(diagnostics.attach_source(
-                diagnostics.parse(text, lang_id, root=root), fs,
-                sources={src_rel: code}))
+                found, fs, sources={src_rel: code,
+                                    src.replace("\\", "/"): code}))
         return RunResult(ok=ok, lang=lang_id, phases=tuple(phases),
                          diagnostics=diags,
                          warnings=guard.advisory(findings),

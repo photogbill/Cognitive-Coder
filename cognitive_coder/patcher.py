@@ -218,6 +218,57 @@ def _rank_fences(text: str, fences: list, *, path: str = "") -> list:
     return [m for _i, m in sorted(enumerate(fences), key=score)]
 
 
+#: A line that is nothing but a fence: "```", "```python", "  ```py  ".
+_FENCE_LINE = re.compile(r"^[ \t]*```[\w+#.-]*[ \t]*$")
+
+
+def _unpaired_fence_candidates(body: str) -> list[str]:
+    """The reply with an UNMATCHED fence line taken out, when it has one.
+
+    Oct 2, 2026, Devstral-Small-2-24B, both test files of the racing spec.
+    The model wrote the file with no opening fence and then closed one:
+
+        import unittest
+        ...
+        if __name__ == '__main__':
+            unittest.main()
+        ```
+
+    `_FENCE` needs a pair, so it found nothing; the whole reply failed to
+    parse; and the fallback returned the whole reply — closing fence
+    included — which was written to disk as a test that could not import.
+    The same model did it the other way round on main.py (the file
+    unfenced, then again inside a full fence), which the pair rule handles.
+
+    An odd number of fence lines means one of them has no partner. With
+    exactly one, the code is on one side of it: before a bare "```" (a
+    closer whose opener never came), after a tagged "```python" (an opener
+    whose closer never came). Both sides are offered, likeliest first, and
+    the caller's validator decides. With more, a lone fence line at the very
+    start or end is dropped. An EVEN count is left alone on purpose: a
+    Markdown file that ends in a code block is balanced, and stripping its
+    last fence would break it.
+    """
+    lines = (body or "").split("\n")
+    at = [i for i, line in enumerate(lines) if _FENCE_LINE.match(line)]
+    if len(at) % 2 == 0:
+        return []
+    if len(at) == 1:
+        i = at[0]
+        before = "\n".join(lines[:i])
+        after = "\n".join(lines[i + 1:])
+        opener = bool(lines[i].strip().strip("`").strip())
+        return [after, before] if opener else [before, after]
+    trimmed = list(lines)
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    if trimmed and _FENCE_LINE.match(trimmed[-1]):
+        trimmed.pop()
+    elif trimmed and _FENCE_LINE.match(trimmed[0]):
+        trimmed.pop(0)
+    return ["\n".join(trimmed)] if trimmed != lines else []
+
+
 def extract_code(text: str, lang_id: str = "", validator=None, *,
                  path: str = "") -> str:
     """The code from a model reply, when the whole reply should be one file.
@@ -229,9 +280,10 @@ def extract_code(text: str, lang_id: str = "", validator=None, *,
     tests; "let me check the existing file" marks context, "here's the
     corrected file" marks the answer; longer beats shorter; document order
     last); then untagged fences, longest first; then fences tagged for
-    something else, longest first; then the whole reply — and **validate by
-    parsing** where a validator is supplied, trying the next candidate
-    before giving up. Never assume the first fence.
+    something else, longest first; then the reply with an unmatched fence
+    line taken out (`_unpaired_fence_candidates`); then the whole reply —
+    and **validate by parsing** where a validator is supplied, trying the
+    next candidate before giving up. Never assume the first fence.
 
     Untagged is never "tagged for the target". Observed: "Build with:
     ```cargo run```" followed by a ```rust fence wrote `main.rs` as
@@ -254,6 +306,7 @@ def extract_code(text: str, lang_id: str = "", validator=None, *,
                        for m in _rank_fences(body, tagged, path=path)]
     candidates += [m.group("body") for m in by_length if not tag(m)]
     candidates += [m.group("body") for m in by_length if tag(m)]
+    candidates += _unpaired_fence_candidates(body)
     candidates.append(body)
 
     for cand in candidates:

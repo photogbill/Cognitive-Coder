@@ -10,6 +10,48 @@ is a major version.
 
 ## [Unreleased]
 
+### Fixed — extraction and repair routing (2026-10-02)
+
+The racing spec again, on Devstral-Small-2-24B (Q4_K_M, 32k): 23 minutes,
+three files built-not-verified, four failed — the same score as Qwen3 on
+Oct 1. Two of the four failures were the engine's, not the model's.
+
+- **A reply with an unmatched fence line no longer reaches the disk with
+  it.** Devstral wrote both test files with no opening fence and then a
+  closing one. `_FENCE` needs a pair, the whole reply failed to parse, and
+  `extract_code` fell back to the whole reply: each test was written with
+  a trailing "```" and could not be imported. `_unpaired_fence_candidates`
+  now offers the reply with the odd fence line removed (before a bare
+  closer, after a tagged opener), validated like every other candidate. An
+  even number of fence lines is left alone, so a Markdown file that ends in
+  a code block keeps its closing fence.
+- **A test file that does not parse is blamed on the test.**
+  `runner.syntax_check` recorded `file=exc.filename or src_path`, and
+  `ast.parse` without a filename reports `"<unknown>"` — truthy, so the
+  path was never used. The printed line was re-parsed as a gcc message
+  (`tool='gcc'`, `file='<unknown>'`), and `_test_disagrees_with_code` could
+  not see that the error was in the test: it reported "It is src/math3d.py
+  that has to change". The parse is now given the path, the diagnostic
+  object travels with the phase (`PhaseResult.diagnostics`), and the runner
+  uses it instead of re-reading text. A syntax-phase diagnostic in the test
+  file counts as the test's own fault.
+- **A module is not rewritten for its test file's syntax error.**
+  `src/physics.py` was regenerated twice — identical both times — because
+  `tests/test_physics.py` did not parse. `_culprit_elsewhere` skipped test
+  files entirely; it now names a test file as the culprit when the error
+  is a parse error located in it (SyntaxError, IndentationError, TabError).
+  "cannot import name X", raised in a test, still belongs to the module.
+- **A failure that moves to a third file is followed.** main.py died in
+  math3d.py; math3d.py was repaired; main.py then died in render.py, and
+  `reverify` reported "it still fails" and stopped. It now names the new
+  culprit, and the session queues that repair like the first
+  (`Session._queue_repair`). Each file still gets one repair per session,
+  which bounds the chain; a file blamed again after its repair is
+  reported, with a warning that says so.
+
+Tests: `test_extract_unpaired_fence` (built on the Oct 2 reply, verbatim),
+`test_repair_routing_oct2` (new). 1151 pass, 20 skipped.
+
 ### Fixed — the harness tells the truth (Phase 0, 2026-10-01)
 
 Three builds of one specification — a pseudo-3D racing game, seven files —
