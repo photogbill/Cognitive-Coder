@@ -52,6 +52,22 @@ REPLIES = [
     "src/stats.py — mean/min/max per column\n"
     "src/cli.py — argument parsing and output\n",
 
+    # [skeleton] the interface skeleton (§4.2 step 2): every module's stub,
+    # in one reply. Its imports are what derive the order readings → stats
+    # → cli, as Appendix E's `[skeleton]` line says.
+    '```python\n# file: src/readings.py\n\n\n'
+    'def load_readings(path: str) -> list:\n'
+    '    """Load the CSV, returning a list of row dicts."""\n'
+    '    raise NotImplementedError\n```\n\n'
+    '```python\n# file: src/stats.py\nfrom src.readings import load_readings'
+    '\n\n\ndef summarise(path: str) -> dict:\n'
+    '    """Mean, min and max per column."""\n'
+    '    raise NotImplementedError\n```\n\n'
+    '```python\n# file: src/cli.py\nfrom src.stats import summarise\n\n\n'
+    'def main(argv=None) -> int:\n'
+    '    """Parse arguments and print the summary."""\n'
+    '    raise NotImplementedError\n```',
+
     # [build 1/3] src/readings.py, attempt 1 — treats the header as data,
     # via a constant it never defined. Parses cleanly; fails when run, with
     # a LOCATED error, which is the shape of feedback §6.2 exists to

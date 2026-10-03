@@ -33,6 +33,12 @@ from cognitive_coder.errors import NotACodingModelError
 PLAN = "src/alpha.py — the first thing\nsrc/beta.py — the second thing\n"
 ALPHA = '```python\ndef alpha():\n    """First."""\n    return 1\n```'
 BETA = '```python\ndef beta():\n    """Second."""\n    return 2\n```'
+#: The interface skeleton's reply (§4.2 step 2): a plan of two Python
+#: modules has a contract to pin before either is written.
+SKELETON = ('```python\n# file: src/alpha.py\ndef alpha() -> int:\n'
+            '    """First."""\n    raise NotImplementedError\n```\n'
+            '```python\n# file: src/beta.py\ndef beta() -> int:\n'
+            '    """Second."""\n    raise NotImplementedError\n```')
 
 
 def _host(tmp_path, replies, *, name="scripted", context_tokens=16384):
@@ -99,7 +105,7 @@ def test_the_short_name_is_the_part_a_person_recognises():
 # --------------------------------------------------------------------------
 
 def test_a_session_refuses_a_roleplay_model_before_planning(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA],
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA],
                  name="Slimaki-Tavern-24B-v1.3.Q4_K_M.gguf")
     session = Session(host, config=SessionConfig(attempts=1))
     with pytest.raises(NotACodingModelError) as err:
@@ -111,7 +117,7 @@ def test_a_session_refuses_a_roleplay_model_before_planning(tmp_path):
 
 
 def test_allow_any_model_turns_the_refusal_into_a_warning(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA],
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA],
                  name="Slimaki-Tavern-24B-v1.3.Q4_K_M.gguf")
     session = Session(host, config=SessionConfig(attempts=1,
                                                  allow_any_model=True))
@@ -122,7 +128,7 @@ def test_allow_any_model_turns_the_refusal_into_a_warning(tmp_path):
 
 
 def test_an_unrecognised_model_builds_under_a_warning(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="my-finetune-v7")
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="my-finetune-v7")
     session = Session(host, config=SessionConfig(attempts=1))
     outcomes = session.run("two small modules")
     assert [o.ok for o in outcomes] == [True, True]
@@ -131,7 +137,7 @@ def test_an_unrecognised_model_builds_under_a_warning(tmp_path):
 
 
 def test_a_coding_model_with_a_small_context_is_warned_about(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="Devstral-Small-2-24B",
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="Devstral-Small-2-24B",
                  context_tokens=4096)
     session = Session(host, config=SessionConfig(attempts=1))
     session.start("two small modules")
@@ -154,7 +160,7 @@ def test_tests_already_failing_in_the_folder_are_baselined_and_named(
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "__init__.py").write_text("")
     (tmp_path / "tests" / "test_gamma.py").write_text(STALE_TEST)
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="Devstral-Small-2-24B")
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="Devstral-Small-2-24B")
     session = Session(host, config=SessionConfig(attempts=1))
     outcomes = session.run("two small modules")
     assert [o.ok for o in outcomes] == [True, True], [
@@ -170,7 +176,7 @@ def test_a_folder_with_an_earlier_build_is_said_so(tmp_path):
     (tmp_path / "BUILD_LOG.txt").write_text(
         "COGNITIVE CODER — BUILD LOG\n\n====\nSESSION cc-1\n====\n"
         "started 2026-08-08\n\n====\nSESSION cc-2\n====\n")
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="Devstral-Small-2-24B")
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="Devstral-Small-2-24B")
     session = Session(host, config=SessionConfig(attempts=1))
     session.start("two small modules")
     warnings = [m for _k, m, _d in host.events.of("warning")]
@@ -178,7 +184,7 @@ def test_a_folder_with_an_earlier_build_is_said_so(tmp_path):
 
 
 def test_an_empty_folder_raises_no_such_warnings(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="Devstral-Small-2-24B")
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="Devstral-Small-2-24B")
     session = Session(host, config=SessionConfig(attempts=1))
     session.start("two small modules")
     warnings = [m for _k, m, _d in host.events.of("warning")]
@@ -191,7 +197,7 @@ def test_planned_dependencies_reach_the_loop_as_paths(tmp_path):
     """`depends_on` holds task ids; the codemap wants paths. The session
     translates — and a test task always gets the module it covers."""
     from cognitive_coder.types import Plan, Task
-    host = _host(tmp_path, [PLAN, ALPHA, BETA], name="Devstral-Small-2-24B")
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA], name="Devstral-Small-2-24B")
     session = Session(host, config=SessionConfig(attempts=1))
     session.plan = Plan(request="r", tasks=(
         Task(id="t1", path="src/alpha.py", purpose="a",

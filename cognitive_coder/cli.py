@@ -592,6 +592,8 @@ def build(args: argparse.Namespace) -> int:
         wall_clock_s=args.budget * 60 if args.budget else 0.0,
         max_files=args.max_files,
         skeleton_first=not args.no_skeleton,
+        pin_interfaces=not getattr(args, "no_interfaces", False),
+        test_first=getattr(args, "test_first", None),
         use_skills=not args.no_skills)
     # With --remote the session exists FIRST: its gate is what the provider
     # is bound to. Without it, nothing is built until a model is known to be
@@ -895,6 +897,20 @@ def _add_build_parser(sub, common) -> Handler:
                         "raise it for a large written specification")
     b.add_argument("--no-skeleton", action="store_true",
                    help="skip the compiling-skeleton step (not advised)")
+    b.add_argument("--no-interfaces", action="store_true",
+                   help="write plain stubs instead of asking the model to "
+                        "pin every module's interface first (saves one "
+                        "generation; files are then written blind to each "
+                        "other — not advised)")
+    tf = b.add_mutually_exclusive_group()
+    tf.add_argument("--tests-first", dest="test_first", action="store_const",
+                    const=True, default=None,
+                    help="write each test before its module (the default "
+                         "when the request asks for it)")
+    tf.add_argument("--tests-after", dest="test_first", action="store_const",
+                    const=False,
+                    help="write each test right after its module, even if "
+                         "the request asks for tests first")
     b.add_argument("--dry-run", action="store_true",
                    help="refuse every write, to see what it would do")
     b.add_argument("--no-skills", action="store_true",

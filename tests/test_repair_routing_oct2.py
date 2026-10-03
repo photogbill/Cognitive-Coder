@@ -245,9 +245,41 @@ if __name__ == "__main__":
 ```'''
 
 
+#: The interface skeleton's reply for HOP_PLAN (§4.2 step 2).
+HOP_SKELETON = '''```python
+# file: src/alpha.py
+class State:
+    """The car."""
+
+    def __init__(self) -> None:
+        self.speed: float = 0.0
+
+
+def make() -> State:
+    """A new car."""
+    raise NotImplementedError
+```
+```python
+# file: src/beta.py
+def describe(state) -> str:
+    """One line about the car."""
+    raise NotImplementedError
+```
+```python
+# file: src/main.py
+from src.alpha import make
+from src.beta import describe
+
+
+def main() -> int:
+    """Build a state and print it."""
+    raise NotImplementedError
+```'''
+
+
 def test_a_failure_that_moves_to_a_third_file_is_followed(tmp_path):
-    host = _host(tmp_path, [HOP_PLAN, ALPHA_WRONG, BETA_WRONG, MAIN,
-                            ALPHA_FIXED, BETA_FIXED])
+    host = _host(tmp_path, [HOP_PLAN, HOP_SKELETON, ALPHA_WRONG, BETA_WRONG,
+                            MAIN, ALPHA_FIXED, BETA_FIXED])
     session = Session(host, config=SessionConfig(attempts=3))
     session.run("a car state, a describer, and a main that prints it")
 
@@ -267,11 +299,32 @@ def test_a_failure_that_moves_to_a_third_file_is_followed(tmp_path):
                for m in statuses), statuses
 
 
+#: alpha's repair fixes `make` and adds `wheels`, which is itself wrong.
+ALPHA_FIXED_WITH_WHEELS = ALPHA_FIXED.replace(
+    "    return State()\n```",
+    "    return State()\n\n\ndef wheels(state: State) -> int:\n"
+    '    """How many wheels."""\n    return state.wheels\n```')
+
+#: beta's repair fixes its own attribute and calls the broken `wheels`, so
+#: the failure moves BACK into alpha, which has had its one repair.
+BETA_CALLS_WHEELS = '''```python
+from src.alpha import wheels
+
+
+def describe(state) -> str:
+    """One line about the car."""
+    return f"speed {state.speed}, {wheels(state)} wheels"
+```'''
+
+
 def test_a_file_blamed_again_after_its_repair_is_not_repaired_twice(tmp_path):
-    """The chain is bounded: each file gets one repair per session."""
-    beta_ok = BETA_FIXED
-    host = _host(tmp_path, [HOP_PLAN, ALPHA_WRONG, beta_ok, MAIN,
-                            ALPHA_WRONG])        # the "repair" changes nothing
+    """The chain is bounded: each file gets one repair per session.
+
+    main.py dies in alpha; alpha's repair moves the failure to beta (so it
+    is accepted: main.py no longer fails inside alpha); beta's repair moves
+    it back into alpha — which is not repaired a second time."""
+    host = _host(tmp_path, [HOP_PLAN, HOP_SKELETON, ALPHA_WRONG, BETA_WRONG,
+                            MAIN, ALPHA_FIXED_WITH_WHEELS, BETA_CALLS_WHEELS])
     session = Session(host, config=SessionConfig(attempts=3))
     session.run("a car state, a describer, and a main that prints it")
 
@@ -280,5 +333,24 @@ def test_a_file_blamed_again_after_its_repair_is_not_repaired_twice(tmp_path):
     assert any("src/main.py still fails inside src/alpha.py, which has "
                "already had its one repair" in m for m in _warnings(host)), \
         _warnings(host)
-    # plan, alpha, beta, main, alpha's one repair — and nothing more
-    assert len(_writes(host)) == 5
+    # plan, skeleton, alpha, beta, main, alpha's one repair, beta's one
+    # repair — and nothing more
+    assert len(_writes(host)) == 7
+
+
+def test_a_repair_that_changes_nothing_is_not_followed_by_a_recheck(
+        tmp_path):
+    """The repair returns alpha.py unchanged: NOT REPAIRED at once, and
+    main.py is not "checked again" against a file nobody changed."""
+    host = _host(tmp_path, [HOP_PLAN, HOP_SKELETON, ALPHA_WRONG, BETA_FIXED,
+                            MAIN, ALPHA_WRONG])
+    session = Session(host, config=SessionConfig(attempts=3))
+    session.run("a car state, a describer, and a main that prints it")
+    final = {o.path: o for o in session._final_outcomes()}
+    assert not final["src/main.py"].ok
+    fix = [o for o in session.outcomes if o.path == "src/alpha.py"][-1]
+    assert not fix.ok and "the model returned the same code" in \
+        fix.stopped_because
+    assert len([o for o in session.outcomes if o.path == "src/main.py"]) \
+        == 1
+    assert len(_writes(host)) == 6

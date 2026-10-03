@@ -52,9 +52,16 @@ import posixpath
 import re
 from typing import Any
 
-from . import langs
+from . import interfaces, langs
 from .codemap import parse_python, parse_regex
-from .personas import CONTRACT_LIST, PERSONAS, PromptBuilder, strip_think
+from .errors import Cancelled
+from .personas import (
+    CONTRACT_FILES,
+    CONTRACT_LIST,
+    PERSONAS,
+    PromptBuilder,
+    strip_think,
+)
 from .types import Edit, Plan, Task
 
 # A file list longer than this is a request that should have been split.
@@ -113,6 +120,32 @@ class Planner:
     #: several host test suites script their replies for the unpaired plan.
     #: With it off, a plan no longer PROMISES a test file nothing will write.
     pair_tests: bool = False
+    #: ASK THE MODEL FOR THE INTERFACE SKELETON (§4.2 step 2) — one call
+    #: that writes a stub with real signatures and shared data types for
+    #: every planned Python module, so each file is written against the
+    #: others' contract instead of blind. See `interfaces.py` for what that
+    #: cost when it was missing. Asked only when there is a contract to
+    #: pin: two or more Python modules, or a module whose test is written
+    #: first. Off, or for other languages, the rule stub is written as
+    #: before.
+    pin_interfaces: bool = True
+    #: Reply budget for the interface call (the session passes its own).
+    max_tokens: int = 2048
+    #: TESTS BEFORE THE MODULE BODY (F2). None: when the request asks for
+    #: it ("implement tests before writing the module bodies", "test-first",
+    #: "TDD"). True/False: always/never. Either way only for a module whose
+    #: interface the skeleton pinned — a test written first against a stub
+    #: that names nothing can only invent the module's API.
+    test_first: bool | None = None
+    #: Paths whose stub this session's skeleton pinned (also readable from
+    #: the files: `interfaces.is_pinned`).
+    pinned: set = field(default_factory=set)
+    #: Why each planned module kept the rule stub, when pinning was tried.
+    pin_fallback: dict = field(default_factory=dict)
+    #: The interface call's Completion, for the session's readable log.
+    interface_reply: Any = None
+    #: {path: pinned stub text} from the current skeleton (`stub_for`).
+    _pinned_text: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -477,12 +510,12 @@ class Planner:
             that rather than reporting a skeleton that does not exist.
         """
         stubs: list[Edit] = []
-        kept: list[str] = []
+        kept: list[str] = [t.path for t in plan.tasks
+                           if not _looks_like_test(t.path)
+                           and self._has_real_work(t.path)]
+        self._pinned_text = self._pin_interfaces(plan, kept)
         for task in plan.tasks:
-            if _looks_like_test(task.path):
-                continue
-            if self._has_real_work(task.path):
-                kept.append(task.path)
+            if _looks_like_test(task.path) or task.path in kept:
                 continue
             stubs.append(Edit(path=task.path, kind="whole",
                               new=self.stub_for(task, plan),
@@ -517,19 +550,165 @@ class Planner:
 
         stub_paths = [e.path for e in stubs]
         written = [p for p in written if p in stub_paths]
+        self.pinned = {p for p in written if p in self._pinned_text}
         if self.codemap is not None:
             for path in written:
                 self.codemap.reindex_after_write(path)
 
         ok, note = self.verify_skeleton(written)
+        pinned = sorted(self.pinned)
         if self.journal is not None:
             self.journal.log("skeleton", files=written, ok=ok, note=note,
-                             kept=kept)
+                             kept=kept, pinned=pinned)
         self.host.emit("phase" if ok else "warning",
                        f"skeleton: {note}",
-                       {"phase": "skeleton", "files": written, "ok": ok})
+                       {"phase": "skeleton", "files": written, "ok": ok,
+                        "pinned": pinned})
         return {"ok": ok, "files": written, "note": note, "approved": True,
-                "kept": kept}
+                "kept": kept, "pinned": pinned,
+                "fallback": dict(self.pin_fallback)}
+
+    def _pin_interfaces(self, plan: Plan, kept: Sequence[str]
+                        ) -> dict[str, str]:
+        """{path: pinned stub} from ONE model call, or {} (§4.2 step 2).
+
+        Asked only when there is a contract between files to pin, and only
+        for Python, whose stubs can be reduced to signatures by rule
+        (`interfaces.sanitise`). Every planned module that does not come
+        back usable keeps the rule stub, with the reason in
+        `pin_fallback` — this never makes a skeleton worse than it was.
+        """
+        self.pin_fallback = {}
+        self.interface_reply = None
+        if not self.pin_interfaces or (self.lang or "python") != "python":
+            return {}
+        modules = [t for t in plan.tasks
+                   if not _looks_like_test(t.path) and t.path not in kept
+                   and (t.lang or self.lang) == "python"
+                   and t.path.endswith(".py")]
+        if not modules:
+            return {}
+        python_modules = [t for t in plan.tasks
+                          if not _looks_like_test(t.path)
+                          and t.path.endswith(".py")]
+        tests = [t.path for t in plan.tasks if _looks_like_test(t.path)]
+        if len(python_modules) < 2 and not (
+                tests and self.wants_test_first(plan.request)):
+            return {}
+        from .context import interface as _interface
+        existing = []
+        for path in kept:
+            try:
+                existing.append((path, _interface(self.host.fs.read(path),
+                                                  "python", path)))
+            except Exception:                            # noqa: BLE001
+                continue
+        persona = PERSONAS["architect"]
+        prompt = self.prompts.build(
+            persona,
+            interfaces.task_text(plan.request,
+                                 [(t.path, t.purpose) for t in modules],
+                                 tests=tests, existing=existing),
+            architecture=self._architecture(), contract=CONTRACT_FILES)
+        messages = prompt.messages()
+        self.host.emit("status",
+                       f"skeleton: asking the model to pin the interfaces "
+                       f"of {len(modules)} file(s) before any is written",
+                       {"phase": "skeleton", "files": [t.path
+                                                       for t in modules]})
+        # A stub is a few hundred tokens; a reply cut off leaves the last
+        # files with plain stubs, so the budget grows with the plan.
+        budget = max(1024, int(self.max_tokens or 0),
+                     min(400 * len(modules), 8192))
+        try:
+            completion = self.host.llm.complete(
+                messages, temperature=persona.temperature,
+                max_tokens=budget)
+        except (AssertionError, Cancelled):
+            raise           # a cancel, or a scripted model out of replies
+        except Exception as exc:                         # noqa: BLE001
+            reason = f"the interface call failed ({exc})"
+            self.pin_fallback = {t.path: reason for t in modules}
+            self._log_interfaces(messages, None, {}, reason)
+            return {}
+        if completion.finish_reason == "cancelled":
+            raise Cancelled("pinning the interfaces")
+        if completion.finish_reason == "error":
+            reason = (f"the interface call failed ("
+                      f"{completion.error or 'the model returned an error'})")
+            self.pin_fallback = {t.path: reason for t in modules}
+            self._log_interfaces(messages, completion, {}, reason)
+            return {}
+        self.interface_reply = completion
+        blocks = interfaces.split_reply(strip_think(completion.text or ""),
+                                        [t.path for t in modules])
+        out: dict[str, str] = {}
+        notes: list[str] = []
+        truncated = completion.finish_reason == "length"
+        for task in modules:
+            code = blocks.get(task.path)
+            if code is None:
+                self.pin_fallback[task.path] = (
+                    "the reply was cut off before its stub"
+                    if truncated else "the reply had no stub for it")
+                continue
+            stub, dropped = interfaces.sanitise(
+                code, task.purpose, entry_point=is_entry_point(task))
+            if not stub:
+                self.pin_fallback[task.path] = "; ".join(dropped)
+                continue
+            out[task.path] = stub
+            if dropped:
+                notes.append(f"{task.path}: dropped "
+                             + ", ".join(dropped[:4])
+                             + (" …" if len(dropped) > 4 else "")
+                             + " (a stub runs nothing at import)")
+        self._log_interfaces(messages, completion, out, "", notes)
+        if self.pin_fallback:
+            self.host.emit(
+                "warning",
+                "skeleton: " + "; ".join(
+                    f"{p} keeps a plain stub — {why}"
+                    for p, why in self.pin_fallback.items()),
+                {"phase": "skeleton", "fallback": dict(self.pin_fallback)})
+        return out
+
+    def _log_interfaces(self, messages: Sequence[Any], completion: Any,
+                        out: dict, error: str,
+                        notes: Sequence[str] = ()) -> None:
+        """The interface call's provenance (C8): what was asked, of which
+        model, what came back pinned, what fell back and why."""
+        if self.journal is None:
+            return
+        from .journal import prompt_hash
+        fields: dict[str, Any] = {
+            "pinned": sorted(out), "fallback": dict(self.pin_fallback),
+            "notes": list(notes), "prompt_sha256": prompt_hash(list(messages))}
+        if completion is not None:
+            fields.update(model=completion.model,
+                          tokens_in=completion.tokens_in,
+                          tokens_out=completion.tokens_out,
+                          prompt_ms=completion.prompt_ms,
+                          decode_ms=getattr(completion, "decode_ms", 0),
+                          finish_reason=completion.finish_reason,
+                          temperature=PERSONAS["architect"].temperature)
+        if error:
+            fields["error"] = error
+        try:
+            self.journal.log("interfaces", **fields)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    @staticmethod
+    def wants_test_first_text(request: str) -> bool:
+        """Does the REQUEST ask for tests before the module bodies?"""
+        return bool(_TEST_FIRST.search(request or ""))
+
+    def wants_test_first(self, request: str) -> bool:
+        """Test-first for this plan: the setting, else the request's word."""
+        if self.test_first is not None:
+            return bool(self.test_first)
+        return self.wants_test_first_text(request)
 
     def _has_real_work(self, path: str) -> bool:
         """Does this path already hold something a stub must not replace?
@@ -665,11 +844,16 @@ class Planner:
     def stub_for(self, task: Task, plan: Plan) -> str:
         """A stub that compiles. Written deterministically where possible.
 
-        For Python the stub is generated by rule rather than by the model:
-        it is a mechanical transformation of the file's purpose, and asking
-        a model to produce something a rule can produce is C5 backwards.
+        The PINNED interface when the skeleton has one for this file
+        (`_pin_interfaces`): the model chose the signatures, a rule reduced
+        them to a stub. Otherwise the rule stub — a mechanical transformation
+        of the file's purpose — because a rule cannot invent signatures, and
+        asking a model for what a rule can produce is C5 backwards.
         """
         lang_id = task.lang or self.lang
+        pinned = self._pinned_text.get(task.path)
+        if pinned:
+            return pinned
         if lang_id == "python":
             imports = [f"from {_module(t.path)} import *"
                        for t in plan.tasks
@@ -717,6 +901,25 @@ class Planner:
             return False, (f"the skeleton imports things nothing provides: "
                            f"{', '.join(unresolved[:4])} — the file split is "
                            f"probably wrong")
+        # NAME by name, not only module by module: a pinned stub that
+        # imports `Segment` from a stub that never defines it is the
+        # render/track disagreement again, caught before a body exists.
+        texts = {}
+        for path in paths:
+            try:
+                texts[path] = self.host.fs.read(path)
+            except Exception:                            # noqa: BLE001
+                continue
+        missing = interfaces.missing_imports(
+            {p: t for p, t in texts.items() if p.endswith(".py")}, _module)
+        if missing:
+            return False, ("the skeleton's files disagree: "
+                           + "; ".join(missing[:3]))
+        pinned = [p for p in paths if p in self.pinned]
+        if pinned:
+            return True, (f"interfaces pinned for {len(pinned)} of "
+                          f"{len(paths)} file(s), imports resolved, all "
+                          f"compile")
         return True, (f"stubs written, imports resolved, {len(paths)} file(s) "
                       f"compile")
 
@@ -856,19 +1059,21 @@ class Planner:
         if not learned:
             depends = self._role_order(plan)
 
-        #: A test depends on the module it covers, always. This holds no
-        #: matter which branch produced `depends`, and without it a test can
-        #: be scheduled before the thing it tests exists.
-        for task in plan.tasks:
-            if not _looks_like_test(task.path):
-                continue
-            stem = _stem(task.path)
-            covered = stem[5:] if stem.startswith("test_") else stem
-            for other in plan.tasks:
-                if other.id != task.id and _stem(other.path) == covered:
-                    depends[task.id].add(other.id)
+        #: A test depends on the module it covers — unless it is written
+        #: FIRST (F2), against the module's pinned interface. Then it waits
+        #: for nothing, and the module does not wait for it either: the
+        #: ORDER puts the test first, and a test that fails to be written
+        #: must not leave its module unbuilt.
+        covered = self._covered_modules(plan)
+        first = self._tests_written_first(plan, covered)
+        for test_id, module_id in covered.items():
+            if test_id in first:
+                depends[test_id].discard(module_id)
+            else:
+                depends[test_id].add(module_id)
 
-        ordered = _topological(plan.tasks, depends)
+        ordered = _place_tests(_topological(plan.tasks, depends), depends,
+                               covered, first)
         tasks = tuple(
             Task(id=t.id, path=t.path, purpose=t.purpose,
                  test_path=t.test_path, persona=t.persona,
@@ -878,6 +1083,53 @@ class Planner:
             for t in ordered)
         return Plan(request=plan.request, tasks=tasks,
                     layout_note=plan.layout_note, caveats=plan.caveats)
+
+    def _covered_modules(self, plan: Plan) -> dict[str, str]:
+        """{test task id: id of the module it covers} — by the module's
+        `test_path`, else by name (`test_physics` covers `physics`)."""
+        out: dict[str, str] = {}
+        for task in plan.tasks:
+            if not _looks_like_test(task.path):
+                continue
+            key = task.path.replace("\\", "/").lower()
+            stem = _stem(task.path)
+            name = stem[5:] if stem.startswith("test_") else (
+                stem[:-5] if stem.endswith("_test") else stem)
+            hit = next((o for o in plan.tasks if o.id != task.id
+                        and not _looks_like_test(o.path) and o.test_path
+                        and o.test_path.replace("\\", "/").lower() == key),
+                       None) or next(
+                (o for o in plan.tasks if o.id != task.id
+                 and not _looks_like_test(o.path)
+                 and _stem(o.path) == name), None)
+            if hit is not None:
+                out[task.id] = hit.id
+        return out
+
+    def _tests_written_first(self, plan: Plan,
+                             covered: dict[str, str]) -> set[str]:
+        """Test task ids to write BEFORE their module (F2).
+
+        Only when test-first is on (`wants_test_first`), only for a test
+        still to be written, and only when its module's stub on disk is a
+        PINNED interface — the test needs real names to call. A module that
+        kept the rule stub has its test written after it, as before.
+        """
+        if not covered or not self.wants_test_first(plan.request):
+            return set()
+        by_id = {t.id: t for t in plan.tasks}
+        out: set[str] = set()
+        for test_id, module_id in covered.items():
+            test, module = by_id[test_id], by_id[module_id]
+            if test.status != "pending":
+                continue
+            try:
+                text = self.host.fs.read(module.path)
+            except Exception:                            # noqa: BLE001
+                continue
+            if interfaces.is_pinned(text):
+                out.add(test_id)
+        return out
 
     def _role_order(self, plan: Plan) -> dict[str, set]:
         """Ordering from role, for use before any code exists to read.
@@ -915,8 +1167,10 @@ class Planner:
 
         The real repair for that case is a richer skeleton — stubs that
         declare the symbols their module is supposed to export, so an importer
-        can be checked against them before anything is generated. That is a
-        larger change and belongs in its own pass.
+        can be checked against them before anything is generated. That pass
+        is `interfaces.py` (Oct 2, 2026): pinned stubs import each other by
+        name, and the order is then learned from those imports, not from
+        this rule.
         """
         entries = [t.id for t in plan.tasks if is_entry_point(t)]
         #: A TEST IS NOT A DEPENDENCY OF THE PROGRAM, and saying otherwise
@@ -1292,10 +1546,68 @@ def strip_stub_sentinel(code: str) -> str:
     as unwritten and a later skeleton as replaceable. Only a line carrying
     the full sentinel text is removed.
     """
-    if _SENTINEL_TEXT not in code:
+    if _SENTINEL_TEXT not in code and interfaces.PINNED_TEXT not in code:
         return code
     return "\n".join(ln for ln in code.split("\n")
-                     if _SENTINEL_TEXT not in ln)
+                     if _SENTINEL_TEXT not in ln
+                     and interfaces.PINNED_TEXT not in ln)
+
+
+#: A request asking for tests before the code: "The engine must implement
+#: tests before writing the module bodies" (the racing spec), "test-first",
+#: "TDD", "write the tests first".
+_TEST_FIRST = re.compile(
+    r"\btest[- ]first\b|\btest[- ]driven\b|\bTDD\b"
+    r"|\b(?:write|implement|create|generate)s?\s+(?:the\s+|all\s+)?"
+    r"(?:unit\s+)?tests?\s+(?:first\b|before\b)"
+    r"|\btests?\s+(?:must|should|shall|are\s+to)\s+be\s+"
+    r"(?:written|implemented|created)\s+(?:first\b|before\b)"
+    r"|\btests?\s+before\s+(?:writing|implementing|the)\s+"
+    r"(?:the\s+)?(?:module|implementation|code|bod(?:y|ies)|source)",
+    re.I)
+
+
+def _place_tests(ordered: Sequence[Task], depends: dict[str, set],
+                 covered: dict[str, str], first: set[str]) -> list[Task]:
+    """Each test BESIDE its module: right after it, or right before it.
+
+    Topological order alone put every test after every module — they were
+    planned last and depend on nothing but their module — so on Oct 2,
+    2026 four of five modules were built, called "verified" against zero
+    tests, and only then were the two test files written. A test right
+    after its module is what lets the module's own failure be found (and
+    repaired against the test) before the next module is built on top of
+    it. A test written first goes right before its module.
+
+    A test that depends on more than its module (its file already exists
+    and imports others) is placed after the last of those, never earlier.
+    """
+    tests = {tid for tid in covered}
+    rest = [t for t in ordered if t.id not in tests]
+    by_module: dict[str, list[Task]] = {}
+    for t in ordered:
+        if t.id in tests:
+            by_module.setdefault(covered[t.id], []).append(t)
+    out: list[Task] = []
+    for t in rest:
+        out.extend(x for x in by_module.get(t.id, []) if x.id in first)
+        out.append(t)
+        out.extend(x for x in by_module.get(t.id, []) if x.id not in first)
+    # A test whose other dependencies come later moves after them.
+    fixed: list[Task] = []
+    for t in out:
+        if t.id in tests and t.id not in first:
+            need = set(depends.get(t.id, ())) - {x.id for x in fixed}
+            if need:
+                continue                       # re-inserted below
+        fixed.append(t)
+    for t in out:
+        if t in fixed:
+            continue
+        last = max((i for i, x in enumerate(fixed)
+                    if x.id in depends.get(t.id, ())), default=len(fixed) - 1)
+        fixed.insert(last + 1, t)
+    return fixed
 
 
 def _topological(tasks: Sequence[Task],

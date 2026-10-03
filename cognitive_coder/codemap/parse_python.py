@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
+import re
 
 from ..types import Symbol
 
@@ -120,6 +121,18 @@ def parse(text: str, path: str = "") -> tuple[list[Symbol], list[tuple],
 
     visit(tree.body)
 
+    # The module's DATA surface: type aliases and constants. `TrackSegment
+    # = Tuple[float, float, int]` used to be invisible — the index held
+    # functions and classes only — so on Oct 2, 2026 `render.py` was shown
+    # `build_track() -> List[TrackSegment]` and nothing of what a
+    # TrackSegment is, guessed an object with `.x/.y/.z`, and died on its
+    # first frame: `'tuple' object has no attribute 'x'`.
+    taken = {s.name for s in symbols}
+    for sym in _module_values(tree, text, path):
+        if sym.name not in taken:
+            symbols.append(sym)
+            taken.add(sym.name)
+
     # Module-level calls belong to the module itself — a script's top-level
     # code is real code, and pretending it has no callers is how a CLI entry
     # point looks dead.
@@ -207,20 +220,34 @@ def _name_of(node: ast.AST) -> str:
 
 
 def _signature(node) -> str:
+    """`def name(params) -> ret` as written — DEFAULTS INCLUDED.
+
+    Defaults used to be dropped, so `TrackBuilder(segment_count: int = 300)`
+    reached every caller as `__init__(self, segment_count: int)`: a
+    parameter that may be left out was shown as one that must be passed,
+    and a caller told the truth about everything else still had to guess
+    which arguments were optional. An interface is the one place where the
+    exact text matters more than brevity.
+    """
     args = []
     a = node.args
-    for arg in a.posonlyargs:
-        args.append(_arg(arg))
+    positional = list(a.posonlyargs) + list(a.args)
+    # `defaults` belong to the LAST len(defaults) positional parameters.
+    first_default = len(positional) - len(a.defaults)
+    defaults = {i: d for i, d in zip(range(first_default, len(positional)),
+                                     a.defaults)}
+    for i, arg in enumerate(a.posonlyargs):
+        args.append(_arg(arg, defaults.get(i)))
     if a.posonlyargs:
         args.append("/")
-    for arg in a.args:
-        args.append(_arg(arg))
+    for j, arg in enumerate(a.args):
+        args.append(_arg(arg, defaults.get(len(a.posonlyargs) + j)))
     if a.vararg:
         args.append("*" + _arg(a.vararg))
     elif a.kwonlyargs:
         args.append("*")
-    for arg in a.kwonlyargs:
-        args.append(_arg(arg))
+    for arg, default in zip(a.kwonlyargs, a.kw_defaults):
+        args.append(_arg(arg, default))
     if a.kwarg:
         args.append("**" + _arg(a.kwarg))
     prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
@@ -228,9 +255,28 @@ def _signature(node) -> str:
     return f"{prefix} {node.name}({', '.join(args)}){ret}"
 
 
-def _arg(arg: ast.arg) -> str:
-    return (f"{arg.arg}: {_annotation(arg.annotation)}" if arg.annotation
+def _arg(arg: ast.arg, default: ast.AST | None = None) -> str:
+    text = (f"{arg.arg}: {_annotation(arg.annotation)}" if arg.annotation
             else arg.arg)
+    if default is not None:
+        # PEP 8 spacing: `x: int = 3` but `x=3` — as a person writes it.
+        sep = " = " if arg.annotation else "="
+        text += sep + _default_text(default)
+    return text
+
+
+#: How long a default may be before it is elided. A default is part of the
+#: contract when it is a value (`300`, `"red"`, `None`, `(0, 0)`); a long
+#: expression is an implementation detail, and the `…` says one was cut.
+_MAX_DEFAULT = 60
+
+
+def _default_text(node: ast.AST | None) -> str:
+    """A default value's source, as written, or `…` when it is long."""
+    if node is None:
+        return ""
+    text = _annotation(node)
+    return text if len(text) <= _MAX_DEFAULT else "…"
 
 
 def _annotation(node) -> str:
@@ -255,7 +301,11 @@ def _class_signature(node: ast.ClassDef) -> str:
     for d in node.decorator_list:
         name = _name_of(d.func if isinstance(d, ast.Call) else d)
         if name and name.split(".")[-1] in _CTOR_DECORATORS:
-            decos.append("@" + name.split(".")[-1])
+            # With its arguments: `@dataclass(frozen=True)` is a different
+            # contract from `@dataclass` — its fields cannot be assigned.
+            args = _annotation(d)[len(name):] if isinstance(d, ast.Call) \
+                else ""
+            decos.append("@" + name.split(".")[-1] + args)
     head = (" ".join(decos) + " ") if decos else ""
     return f"{head}class {node.name}({', '.join(bases)})" if bases \
         else f"{head}class {node.name}"
@@ -284,6 +334,8 @@ def _class_members(node: ast.ClassDef, cls: str, path: str) -> list[Symbol]:
     """
     out: list[Symbol] = []
     seen: set[str] = set()
+    is_enum = any(_name_of(b).split(".")[-1] in _ENUM_BASES
+                  for b in node.bases)
     # Annotated class-level fields, in order. `x: float = 0.0`, `x: float`.
     for item in node.body:
         if isinstance(item, ast.AnnAssign) and isinstance(item.target,
@@ -292,7 +344,11 @@ def _class_members(node: ast.ClassDef, cls: str, path: str) -> list[Symbol]:
             if fname.startswith("_") or fname in seen:
                 continue
             sig = f"{fname}: {_annotation(item.annotation)}"
-            default = _literal_text(item.value)
+            # The default AS WRITTEN — `field(default_factory=list)` too.
+            # Only literals used to be kept, so a field with a factory
+            # default read as a required constructor argument.
+            default = _default_text(item.value) if item.value is not None \
+                else ""
             if default:
                 sig += f" = {default}"
             out.append(Symbol(name=f"{cls}.{fname}", kind="field",
@@ -300,6 +356,23 @@ def _class_members(node: ast.ClassDef, cls: str, path: str) -> list[Symbol]:
                               signature=sig, path=path, parent=cls,
                               approximate=False))
             seen.add(fname)
+        elif isinstance(item, ast.Assign) and len(item.targets) == 1 \
+                and isinstance(item.targets[0], ast.Name):
+            # An Enum's members, or a class constant (`MAX_SPEED = 200.0`):
+            # values a caller names as `Cls.NAME`, so they are interface.
+            cname = item.targets[0].id
+            if cname.startswith("_") or cname in seen:
+                continue
+            if not (is_enum or _CONST_NAME.match(cname)):
+                continue
+            value = _default_text(item.value)
+            out.append(Symbol(name=f"{cls}.{cname}",
+                              kind="member" if is_enum else "constant",
+                              line=item.lineno,
+                              end_line=item.end_lineno or item.lineno,
+                              signature=f"{cname} = {value}", path=path,
+                              parent=cls, approximate=False))
+            seen.add(cname)
     # Instance attributes: `self.x = …` inside methods, __init__ first so the
     # constructor's state leads. A parameter's annotation types `self.x = x`.
     methods = [m for m in node.body
@@ -345,6 +418,189 @@ def _class_members(node: ast.ClassDef, cls: str, path: str) -> list[Symbol]:
                                   parent=cls, approximate=False))
                 seen.add(aname)
     return out
+
+
+# ---------------------------------------------------------------------------
+# a module's data surface: type aliases and constants
+# ---------------------------------------------------------------------------
+
+#: `ALL_CAPS` — a constant by every Python convention there is.
+_CONST_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+#: Bases that make a class an Enum: its class-level assignments are members.
+_ENUM_BASES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
+
+#: Calls that BUILD A TYPE: `Point = namedtuple("Point", "x y")`.
+_TYPE_FACTORIES = frozenset({
+    "NamedTuple", "namedtuple", "TypedDict", "NewType", "TypeVar",
+    "ParamSpec", "TypeVarTuple", "Enum", "IntEnum", "StrEnum", "Flag",
+    "IntFlag", "make_dataclass"})
+
+#: Subscripted names that make an expression a type, whatever the target is
+#: called: `RGB = Tuple[int, int, int]` is an alias, not a constant.
+_GENERICS = frozenset({
+    "Tuple", "tuple", "List", "list", "Dict", "dict", "Set", "set",
+    "FrozenSet", "frozenset", "Optional", "Union", "Callable", "Sequence",
+    "Mapping", "MutableMapping", "Iterable", "Iterator", "Literal",
+    "Annotated", "Type", "type", "Deque", "deque", "DefaultDict",
+    "OrderedDict", "Counter", "ChainMap", "Generator", "Awaitable",
+    "Coroutine", "AsyncIterator", "AsyncIterable", "ClassVar", "Final"})
+
+_BUILTIN_TYPES = frozenset({
+    "int", "float", "str", "bytes", "bool", "complex", "dict", "list",
+    "tuple", "set", "frozenset", "object", "bytearray", "type"})
+
+#: Past this, a constant's value is a table, not a contract, and is shown
+#: by its type alone. An alias is never cut: it IS the contract.
+_MAX_CONSTANT = 160
+
+
+def _module_values(tree: ast.Module, text: str, path: str) -> list[Symbol]:
+    """`alias` and `constant` symbols for a module's top-level assignments.
+
+    alias:    `Name = <a type>` — `Tuple[float, float, int]`, `dict`,
+              `int | None`, `namedtuple(...)`, `TypeVar(...)` — or anything
+              annotated `TypeAlias`, or a `type Name = ...` statement.
+    constant: `ALL_CAPS = <anything>`.
+
+    Ordinary lowercase module variables (`screen = pygame.display...`) are
+    not interface and are left out; underscored names are private.
+
+    The SIGNATURE IS THE SOURCE STATEMENT, as written, so the model is
+    handed the definition rather than a description of it. Its comment —
+    on the same line, as a string right after it, or on the line above —
+    is the docstring: `# (curve_value, color_pattern, z_position)` is the
+    only place a tuple's fields are named at all.
+    """
+    lines = text.splitlines()
+    out: list[Symbol] = []
+    for idx, node in enumerate(tree.body):
+        name, value, ann, kind = "", None, None, ""
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target,
+                                                            ast.Name):
+            name, value, ann = node.target.id, node.value, node.annotation
+        elif type(node).__name__ == "TypeAlias":         # 3.12: `type X = …`
+            name = getattr(getattr(node, "name", None), "id", "")
+            value, kind = getattr(node, "value", None), "alias"
+        else:
+            continue
+        if not name or name.startswith("_"):
+            continue
+        kind = kind or _value_kind(name, value, ann)
+        if not kind:
+            continue
+        sig = _statement_text(node, text, lines)
+        if kind == "constant" and len(sig) > _MAX_CONSTANT:
+            typ = (_annotation(ann) if ann is not None
+                   else _value_type(value)) or "value"
+            sig = f"{name}: {typ} = …"
+        doc = (_trailing_comment(node, lines)
+               or _attribute_docstring(tree.body, idx)
+               or _comment_above(node, lines))
+        out.append(Symbol(name=name, kind=kind, line=node.lineno,
+                          end_line=node.end_lineno or node.lineno,
+                          signature=sig, path=path, docstring=doc[:200],
+                          approximate=False))
+    return out
+
+
+def _value_kind(name: str, value: ast.AST | None,
+                ann: ast.AST | None) -> str:
+    """"alias", "constant" or "" for one top-level assignment."""
+    if ann is not None and _name_of(ann).split(".")[-1] == "TypeAlias":
+        return "alias"
+    if isinstance(value, ast.Call) and \
+            _name_of(value.func).split(".")[-1] in _TYPE_FACTORIES:
+        return "alias"
+    if isinstance(value, ast.Subscript) and _subscript_head(value) \
+            in _GENERICS:
+        return "alias"
+    if _CONST_NAME.match(name):
+        return "constant"
+    if name[:1].isupper() and value is not None and _is_type_expr(value):
+        return "alias"
+    return ""
+
+
+def _subscript_head(node: ast.Subscript) -> str:
+    return _name_of(node.value).split(".")[-1]
+
+
+def _is_type_expr(node: ast.AST) -> bool:
+    """Does this expression denote a type? Conservative: when unsure, no."""
+    if isinstance(node, ast.Name):
+        return node.id in _BUILTIN_TYPES or node.id[:1].isupper()
+    if isinstance(node, ast.Attribute):
+        return node.attr[:1].isupper()
+    if isinstance(node, ast.Subscript):
+        head = _subscript_head(node)
+        return head in _GENERICS or head[:1].isupper()
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return all(_is_type_expr(side) or (isinstance(side, ast.Constant)
+                                           and side.value is None)
+                   for side in (node.left, node.right))
+    if isinstance(node, ast.Call):
+        return _name_of(node.func).split(".")[-1] in _TYPE_FACTORIES
+    return False
+
+
+def _statement_text(node: ast.AST, text: str, lines: list[str]) -> str:
+    """The statement exactly as written, its lines joined into one."""
+    try:
+        seg = ast.get_source_segment(text, node)
+    except Exception:                                    # noqa: BLE001
+        seg = None
+    if not seg:
+        try:
+            seg = ast.unparse(node)
+        except Exception:                                # noqa: BLE001
+            return ""
+    joined = ""
+    for part in (ln.strip() for ln in seg.splitlines()):
+        if not part:
+            continue
+        # A line break after `(`/`[` or before `)`/`]` becomes nothing, any
+        # other one a single space: `(800,\n 600)` reads `(800, 600)`.
+        glue = "" if not joined or joined.endswith(("(", "[", "{")) \
+            or part.startswith((")", "]", "}")) else " "
+        joined += glue + part
+    return joined
+
+
+def _trailing_comment(node: ast.AST, lines: list[str]) -> str:
+    """`# …` after the statement on its last line, or ""."""
+    end = (getattr(node, "end_lineno", None) or node.lineno) - 1
+    col = getattr(node, "end_col_offset", None)
+    if not (0 <= end < len(lines)) or col is None:
+        return ""
+    rest = lines[end][col:].strip()
+    return rest[1:].strip() if rest.startswith("#") else ""
+
+
+def _comment_above(node: ast.AST, lines: list[str]) -> str:
+    """A comment line immediately above the statement, or ""."""
+    above = node.lineno - 2
+    if not (0 <= above < len(lines)):
+        return ""
+    line = lines[above].strip()
+    if not line.startswith("#") or "cc-stub:" in line:
+        return ""
+    return line.lstrip("#").strip()
+
+
+def _attribute_docstring(body: list, idx: int) -> str:
+    """A string literal right after the assignment (PEP 257's attribute
+    docstring), or ""."""
+    if idx + 1 >= len(body):
+        return ""
+    nxt = body[idx + 1]
+    if isinstance(nxt, ast.Expr) and isinstance(nxt.value, ast.Constant) \
+            and isinstance(nxt.value.value, str):
+        return _first_line(nxt.value.value)
+    return ""
 
 
 def _literal_text(node: ast.AST | None) -> str:

@@ -73,6 +73,32 @@ def describe(state: State) -> str:
 
 MAIN_AGAIN = MAIN     # what a retry of main.py would have produced: the same
 
+#: The interface skeleton's reply (§4.2 step 2). It pins `State` WITHOUT an
+#: `x`, which is the point: the stub is the contract, and the body that
+#: reads `state.x` broke it.
+SKELETON = '''```python
+# file: src/alpha.py
+class State:
+    """The car."""
+
+    def __init__(self) -> None:
+        self.speed: float = 0.0
+
+
+def describe(state: State) -> str:
+    """One line about the car."""
+    raise NotImplementedError
+```
+```python
+# file: src/main.py
+from src.alpha import State, describe
+
+
+def main() -> int:
+    """Build a state and print it."""
+    raise NotImplementedError
+```'''
+
 
 def _host(tmp_path, replies):
     return Host(llm=ScriptedLLM(replies, supports_tools=False,
@@ -84,7 +110,7 @@ def _host(tmp_path, replies):
 
 
 def test_a_run_that_dies_in_another_file_repairs_that_file(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA_WRONG, MAIN, ALPHA_FIXED])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA_WRONG, MAIN, ALPHA_FIXED])
     session = Session(host, config=SessionConfig(attempts=3))
     session.run("a state and a main that prints it")
 
@@ -109,14 +135,14 @@ def test_a_run_that_dies_in_another_file_repairs_that_file(tmp_path):
     assert not any("collected none of its tests" in m for m in warnings), (
         "a caller is not a test file", warnings)
 
-    # the model was asked to WRITE exactly four times: plan, alpha, main,
-    # the repair of alpha — never main again (the review stage's questions
-    # come after and are not generations)
+    # the model was asked to WRITE exactly five times: plan, the interface
+    # skeleton, alpha, main, the repair of alpha — never main again (the
+    # review stage's questions come after and are not generations)
     def last_user(p):
         return [m for m in p if m.role == "user"][-1].content
     writes = [p for p in host.llm.prompts
               if not last_user(p).startswith("[TASK]\nReview ")]
-    assert len(writes) == 4, [last_user(p)[:60] for p in host.llm.prompts]
+    assert len(writes) == 5, [last_user(p)[:60] for p in host.llm.prompts]
 
     # and the repair prompt showed the caller, as a caller, not as a test
     sent = writes[-1]

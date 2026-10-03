@@ -217,6 +217,10 @@ def test_an_existing_test_file_that_ran_nothing_does_not_verify(tmp_path):
 def test_the_summary_counts_files_with_no_tests(tmp_path):
     host = _host(tmp_path, ["src/alpha.py — the first thing\n"
                             "src/beta.py — the second thing\n",
+                            # the interface skeleton: two pinned stubs
+                            "```python\n# file: src/alpha.py\nA: int = 1\n"
+                            "```\n```python\n# file: src/beta.py\nB: int = 2"
+                            "\n```",
                             "```python\nA = 1\n```", "```python\nB = 2\n```"])
     session = _session(host, attempts=1)
     session.run("two modules")

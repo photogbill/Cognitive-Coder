@@ -10,6 +10,111 @@ is a major version.
 
 ## [Unreleased]
 
+### Fixed — the skeleton pins the interfaces; tests sit beside their modules; a repair answers for its result (2026-10-03)
+
+The racing spec on Qwen3-Coder-30B-A3B (Q4_K_M, 32k), Oct 2, 23:23: 998 s,
+three files failed, two built with no test. Its generations were replayed
+through a scripted session to see the prompts each file was given; three
+of the defects it showed were the harness's, not the model's.
+
+- **The skeleton carries the interfaces (§4.2 step 2).** Every stub was a
+  docstring and `def main(): raise NotImplementedError`, so each file was
+  written blind to the others: `track.py` made `TrackSegment =
+  Tuple[float, float, int]` and `render.py` read `seg.x` from it —
+  `'tuple' object has no attribute 'x'`, main.py dead on its first frame.
+  Root cause, in two parts. (1) The Phase 0 "interfaces" fix is the
+  codemap's `# INTERFACES YOU MAY CALL` block, and it did fire for
+  render.py (with math3d, physics and track as built siblings) — but the
+  codemap indexed functions and classes only, so `TrackSegment` did not
+  exist for it: render.py was shown `build_track() -> List[TrackSegment]`
+  and nothing of what a TrackSegment is. (2) The skeleton itself never
+  carried signatures: `Planner.stub_for` writes the rule stub, and the
+  richer skeleton was deferred "to its own pass" (`_role_order`'s
+  docstring). For the first three files there was nothing to show at all.
+  Now:
+  * `interfaces.py` (new) + `Planner._pin_interfaces`: ONE model call
+    (persona `architect`, contract `CONTRACT_FILES`) writes a stub for
+    every planned Python module — shared data types defined once and
+    imported by name, every public signature. The reply is reduced BY RULE
+    (`interfaces.sanitise`): bodies become `raise NotImplementedError`
+    (an `__init__` keeps its `self.x = …` lines), anything that would run
+    at import is dropped, an entry point keeps `if __name__ ==
+    "__main__": raise SystemExit(main())`, and the result must parse. A
+    pinned stub carries `interfaces.PINNED_TEXT` (still the `cc-stub:`
+    sentinel). Asked only for two or more Python modules, or a module
+    whose test is written first; a file whose block is missing or broken
+    keeps the rule stub, and the session says which and why. The skeleton
+    check now also catches `from src.track import Lane` when the track
+    stub has no `Lane`. Order is then learned from the stubs' imports.
+  * The loop shows each file `[THE INTERFACE PINNED FOR THIS FILE]` —
+    keep every name, signature, field, alias and constant — and holds the
+    body to it (D12): a body that no longer defines a pinned name fails
+    with a located `pinned-interface` diagnostic ("src/track.py does not
+    define `Segment`…") and is sent back with the interface in view,
+    instead of passing its own check and breaking the files built on it.
+  * The codemap indexes module-level **type aliases** and **constants**
+    (`alias`/`constant` symbols whose signature is the source statement,
+    its comment as the docstring), a class's constants and an Enum's
+    **members**; signatures keep their **defaults** (`segment_count: int =
+    300` used to read as required); a field's default is shown as written
+    (`field(default_factory=list)`); a ctor decorator keeps its arguments
+    (`@dataclass(frozen=True)`). The interface block puts an alias before
+    what uses it, and says of a `Tuple`/`dict`/`list` alias that it is a
+    plain container with no named attributes. `enrich` answers `'tuple'
+    object has no attribute 'x'` with the project's tuple aliases, exactly,
+    and a `NameError` with an alias or constant's definition.
+- **Tests are built beside their modules (F2).** PLAN order was math3d,
+  physics, track, render, main, test_math3d, test_physics: a test depends
+  only on its module, so the topological sort left every test last and
+  four modules were "verified" against zero tests. `planner._place_tests`
+  puts each test right AFTER its module — the module is checked by its own
+  test, and repaired against it, before the next module is built on it.
+  When the request asks for tests first ("The engine must implement tests
+  before writing the module bodies", "test-first", "TDD") or
+  `SessionConfig.test_first=True`, each test whose module's interface was
+  pinned is written right BEFORE its module, against the pinned stub
+  (`[THE MODULE UNDER TEST — …, interface only]`); failing against the
+  stub is accepted as what such a test must do (its own faults — a syntax
+  error, a name the stub lacks — are still repaired); a test that PASSES
+  against the stub is said to test nothing; the module's first attempt is
+  shown the test (`[THE TEST THIS FILE MUST PASS]`), and when the module
+  verifies, so does the test. Test-first without a pinned interface falls
+  back to test-after, as a plan caveat. The build spec's F2 makes
+  test-first the design, but Phase 0 deliberately shows a tester the
+  module it tests, so test-after stays the default for requests that do
+  not ask; `test_first=True` makes test-first the default.
+- **A cross-file repair is accepted only when its cause is gone.** At
+  358.9 s the log said `REPAIRED src/render.py`; snapshot 0007-t4-fix is
+  empty — the model had returned render.py byte for byte, and it passed
+  its own check (an import, zero tests). `Loop.run_task` takes `baseline`
+  (the file when the repair began) and `accept` (the task whose failure
+  caused it). A reply identical after normalising (the AST, so a comment
+  is no change) stops the repair at once: NOT REPAIRED, "the model
+  returned the same code", nothing run. Once the repaired file's own check
+  passes, the caller's runs too; while it still fails inside the repaired
+  file, the attempt is not accepted and the caller's error drives the
+  next one. That acceptance run is the re-check `reverify` reports, so a
+  game is not run twice. A module repaired against its test gets the
+  unchanged-file rule too (its test was always its acceptance).
+- New: `SessionConfig.pin_interfaces` (default on), `SessionConfig.
+  test_first` (default None: follow the request); `ccoder build
+  --no-interfaces`, `--tests-first`, `--tests-after`; journal event
+  `interfaces` (the call's prompt hash, model, tokens, what was pinned and
+  what fell back) — a minor-version addition to `JOURNAL_EVENTS`; the
+  BUILD_LOG shows the interface reply and the build order. **The interface
+  call is one more model call**: a host suite that scripts replies for a
+  plan of two or more Python modules needs one more reply after the plan
+  (this repo's suites were updated), or `pin_interfaces=False`.
+- Unchanged, deliberately: a test is still never rewritten to agree with
+  the code.
+
+Tests: `test_interfaces_pinned`, `test_test_order`,
+`test_repair_acceptance` (new; each fails on the previous code), one more
+in `test_repair_routing_oct2`; the scripted suites gained the skeleton
+reply; the golden trace gained one event (`interfaces`). 1214 pass, 20
+skipped, 3 fail on the Linux VM's Python 3.10 exactly as before this
+change (doctor's Python 3.11 floor ×2, one SQLite-threading test).
+
 ### Fixed — extraction and repair routing (2026-10-02)
 
 The racing spec again, on Devstral-Small-2-24B (Q4_K_M, 32k): 23 minutes,

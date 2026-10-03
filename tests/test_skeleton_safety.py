@@ -35,6 +35,10 @@ REAL = ('"""Hand-written, 200 lines of real work."""\n\n\n'
         'def util(x):\n    return x * 2\n')
 PLAN = "src/util.py — extend the utilities\nsrc/new.py — a new thing\n"
 REQUEST = "extend src/util.py and add src/new.py"
+#: The interface skeleton's reply: two Python modules is a contract to pin,
+#: and the kept file is shown to it rather than stubbed (`interfaces.py`).
+SKELETON = ('```python\n# file: src/new.py\ndef new() -> int:\n'
+            '    """A new thing."""\n    raise NotImplementedError\n```')
 
 
 def _host(tmp_path, replies, approval=None):
@@ -58,7 +62,7 @@ def _seed(tmp_path):
 
 def test_an_existing_file_with_a_body_is_kept_byte_for_byte(tmp_path):
     _seed(tmp_path)
-    host = _host(tmp_path, [PLAN])
+    host = _host(tmp_path, [PLAN, SKELETON])
     session = Session(host, config=SessionConfig(attempts=1))
     session.start(REQUEST)
     assert (tmp_path / "src" / "util.py").read_bytes() == \
@@ -71,7 +75,7 @@ def test_an_existing_file_with_a_body_is_kept_byte_for_byte(tmp_path):
 
 def test_the_skeleton_is_one_snapshotted_transaction(tmp_path):
     _seed(tmp_path)
-    host = _host(tmp_path, [PLAN])
+    host = _host(tmp_path, [PLAN, SKELETON])
     session = Session(host, config=SessionConfig(attempts=1))
     session.start(REQUEST)
     skeleton = [r for r in session.history() if r.task_id == "skeleton"]
@@ -87,7 +91,7 @@ def test_the_skeleton_is_one_snapshotted_transaction(tmp_path):
 def test_the_skeleton_asks_for_approval_once(tmp_path):
     _seed(tmp_path)
     approval = AutoApprove()
-    host = _host(tmp_path, [PLAN], approval=approval)
+    host = _host(tmp_path, [PLAN, SKELETON], approval=approval)
     Session(host, config=SessionConfig(attempts=1)).start(REQUEST)
     asked = [summary for summary, _diff in approval.diffs]
     assert len(asked) == 1, asked
@@ -98,7 +102,7 @@ def test_the_skeleton_asks_for_approval_once(tmp_path):
 
 
 def test_the_skeleton_can_be_undone(tmp_path):
-    host = _host(tmp_path, [PLAN])
+    host = _host(tmp_path, [PLAN, SKELETON])
     session = Session(host, config=SessionConfig(attempts=1))
     session.start(REQUEST)
     assert (tmp_path / "src" / "new.py").exists()
@@ -110,7 +114,7 @@ def test_the_skeleton_can_be_undone(tmp_path):
 
 def test_under_deny_all_the_skeleton_writes_nothing_and_says_so(tmp_path):
     _seed(tmp_path)
-    host = _host(tmp_path, [PLAN], approval=DenyAll())
+    host = _host(tmp_path, [PLAN, SKELETON], approval=DenyAll())
     before = _project_files(host)
     session = Session(host, config=SessionConfig(attempts=1))
     session.start(REQUEST)
@@ -208,7 +212,7 @@ def test_a_kept_file_is_still_built_not_marked_done(tmp_path):
                 '    return x * 3\n```')
     # util.py SECOND, so it is still pending when the first replan runs.
     plan = "src/new.py — a new thing\nsrc/util.py — extend the utilities\n"
-    host = _host(tmp_path, [plan, new, extended])
+    host = _host(tmp_path, [plan, SKELETON, new, extended])
     session = Session(host, config=SessionConfig(
         attempts=1, review_after_build=False))
     session.run(REQUEST)

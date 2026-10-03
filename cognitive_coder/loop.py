@@ -67,6 +67,8 @@ from . import diagnostics as dx
 from . import enrich, guard, langs, personas, runner, textio
 from .context import CHARS_PER_TOKEN, Piece, build_context
 from .errors import Cancelled
+from .interfaces import broken_contract as _broken_contract
+from .interfaces import is_pinned as _is_pinned
 from .personas import (
     CONTRACT_FILE,
     PERSONAS,
@@ -168,14 +170,23 @@ class Loop:
     #: For a repair routed from another file: the path of the CALLER that
     #: ran and failed inside the file being repaired (set per run_task).
     _caller: str = field(default="", repr=False)
+    #: For a task whose file is still its PINNED stub: that interface, shown
+    #: on every attempt and enforced on every body (set per run_task).
+    _contract: str = field(default="", repr=False)
     #: For a test task: the module it covers (set per run_task).
     _covers: str = field(default="", repr=False)
+    #: {path: its last verification} for a repair's ACCEPTANCE run — the
+    #: caller whose failure caused the repair, run after the repaired file
+    #: passed. The session's `reverify` uses it instead of running the
+    #: caller a second time (a game's run is a full timeout).
+    accepted: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     def run_task(self, task: Task, *, request: str = "", covers: str = "",
                  seed: Sequence[Diagnostic] = (),
                  planned: Sequence[str] = (),
-                 caller: str = "") -> TaskOutcome:
+                 caller: str = "", accept: Task | None = None,
+                 baseline: str | None = None) -> TaskOutcome:
         """Generate, verify and repair one file until it works or it stops.
 
         Every phase boundary checks the cancel token (M21). A cancelled task
@@ -193,6 +204,17 @@ class Loop:
         is, for a repair the session routed here from another file, the
         path of the file that ran and failed inside this one; its source
         is shown to the repair as the use that must work.
+
+        ``accept`` and ``baseline`` make a REPAIR answer for its result
+        (Oct 2, 2026: `render.py` was "REPAIRED" against main.py's crash
+        with a byte-identical file, because render.py's own check — an
+        import and zero tests — passed). ``baseline`` is the file as it
+        stood when the repair began: an attempt that returns it unchanged
+        (after normalising) ends the task at once, NOT repaired, without
+        running anything. ``accept`` is the task whose failure caused the
+        repair: once this file's own check passes, ``accept``'s check runs
+        too, and the repair is accepted only if that failure is gone from
+        this file. If it is not, its diagnostics drive the next attempt.
         """
         self._planned = tuple(p for p in planned if p and p != task.path)
         self._caller = caller if caller and caller != task.path else ""
@@ -200,6 +222,22 @@ class Loop:
         lang = task.lang or langs.id_for_path(task.path) or "python"
         persona = PERSONAS.get(task.persona, personas.ENGINEER)
         is_test = task.persona == "tester" or _looks_like_test(task.path)
+        #: A test written FIRST (F2): the module it covers is still the
+        #: skeleton's stub. Failing against that stub is what such a test
+        #: must do; only its own faults are its to fix.
+        before_module = bool(is_test and self._covers and _is_our_stub(
+            self._read(self._covers)))
+        written_first = ""
+        if accept is not None:
+            self.accepted.pop(accept.path, None)
+        #: The interface the skeleton pinned for THIS file, when it is still
+        #: the pinned stub: the names the body must keep (D12).
+        on_disk = self._read(task.path)
+        contract = strip_stub_sentinel(on_disk) \
+            if lang == "python" and _is_pinned(on_disk) else ""
+        self._contract = contract.strip()
+        baseline_id = (_code_identity(baseline, lang)[0]
+                       if baseline is not None and baseline.strip() else "")
         attempts: list[AttemptRecord] = []
         seen: set[tuple[str, str]] = set()
         history: list[_Signature] = []
@@ -305,6 +343,25 @@ class Loop:
                 if self.config.autofix:
                     code, fixes = self._prefix_fixes(code, lang, task)
 
+                # -- a repair that changed nothing is not a repair -------
+                if baseline_id and \
+                        _code_identity(code, lang)[0] == baseline_id:
+                    attempts.append(AttemptRecord(
+                        n=n, code_sha=baseline_id,
+                        finish_reason=completion.finish_reason,
+                        continued=continued,
+                        note="returned the file unchanged"))
+                    self._journal_attempt(task, n, completion, sent,
+                                          {"ok": False, "unchanged": True})
+                    stopped = _unchanged_sentence(
+                        task.path,
+                        self._caller or (accept.path if accept else "")
+                        or task.test_path,
+                        by_caller=bool(self._caller or accept))
+                    self._emit("warning", f"{task.path}: {stopped}",
+                               {"task": task.path, "unchanged": True})
+                    break
+
                 findings = guard.scan(code, lang, self.config.project_mode)
                 blocked = guard.blocked(findings)
                 if blocked:
@@ -357,6 +414,14 @@ class Loop:
                             "attempt": n})
                 result = self._verify(task, lang)
                 self._log_verify(task, n, result)
+                if contract:
+                    result = self._keep_contract(task, contract, code,
+                                                 result)
+                if result.ok and accept is not None:
+                    # THE REPAIR IS JUDGED BY WHAT CAUSED IT. This file's
+                    # own check passing says it imports; it does not say
+                    # the caller's failure inside it is gone.
+                    result = self._acceptance(task, accept, result, n)
                 diags = tuple(result.diagnostics)
 
                 sig = _signature(code, lang, diags)
@@ -395,6 +460,20 @@ class Loop:
                                              code.splitlines()))
                     # Remember what worked, for next time (F10).
                     self._remember(attempts, diags)
+                    break
+
+                # -- a test written first fails against the stub --------
+                if before_module and _test_disagrees_with_code(task.path,
+                                                               diags):
+                    written_first = (
+                        f"written before {self._covers}, against its pinned "
+                        f"interface; it fails against the stub, as a test "
+                        f"written first must, and {self._covers} is built "
+                        f"next to pass it")
+                    if self.journal is not None:
+                        self.journal.log("patch", task=task.path, attempt=n,
+                                         lines=len(code.splitlines()),
+                                         written_first=True)
                     break
 
                 # -- a test that disagrees with the code is not bent (C4) --
@@ -442,20 +521,32 @@ class Loop:
                                f"({self.config.wall_clock_s:.0f}s) ran out")
                     break
 
-            ok = bool(result and result.ok)
-            unverified = self._ran_no_tests(task, is_test, result) if ok \
-                else ""
+            ok = bool(result and result.ok) or bool(written_first)
+            unverified = self._ran_no_tests(task, is_test, result) \
+                if result is not None and result.ok else ""
             if unverified:
                 self.unverified.add(task.path)
                 self._emit("warning", f"{task.path}: {unverified}",
                            {"task": task.path, "verified": False})
-            verified = ok and not unverified and self._tests_ran(
-                task, is_test, result)
+            verified = bool(result and result.ok) and not unverified \
+                and self._tests_ran(task, is_test, result)
+            passes_stub = ""
+            if before_module and result is not None and result.ok:
+                # F2 step 3: a test that passes against `raise
+                # NotImplementedError` exercises nothing of the module.
+                verified = False
+                passes_stub = (f"its tests PASS against the unwritten stub "
+                               f"of {self._covers}, so they do not exercise "
+                               f"its behaviour yet")
+                self._emit("warning", f"{task.path}: {passes_stub}",
+                           {"task": task.path, "verified": False})
             if tx is not None:
                 if ok:
                     # committed AND verified: SEALED — unless the tests that
-                    # were meant to verify it never ran.
-                    tx.commit(verified=not unverified)
+                    # were meant to verify it never ran, or it is a test
+                    # written first, which has verified nothing yet.
+                    tx.commit(verified=not unverified and not written_first
+                              and not passes_stub)
                 elif tx.state == "open":
                     # A and B are one change and B failed → both revert. When
                     # the task is not atomic the planner said so, and the
@@ -474,15 +565,19 @@ class Loop:
                 tx.rollback("an unexpected failure ended the task")
             raise
 
-        if not stopped and not (result and result.ok):
+        if not stopped and not (result and result.ok) and not written_first:
             stopped = self._give_up_sentence(attempts)
 
         caveats = tuple(result.caveats) if result else ()
         if unverified:
             caveats += (unverified,)
+        if written_first:
+            caveats += (written_first,)
+        if passes_stub:
+            caveats += (passes_stub,)
         outcome = TaskOutcome(
             task_id=task.id, path=task.path,
-            ok=bool(result and result.ok), attempts=tuple(attempts),
+            ok=ok, attempts=tuple(attempts),
             result=result, stopped_because=stopped, caveats=caveats,
             verified=verified)
         self._emit("status", outcome.summary(),
@@ -509,20 +604,24 @@ class Loop:
                         if p.name == "test" and p.ok)
         return not runner.zero_tests(log)
 
-    def reverify(self, task: Task, *, because: str = "") -> TaskOutcome:
+    def reverify(self, task: Task, *, because: str = "",
+                 result: RunResult | None = None) -> TaskOutcome:
         """Verify a file again WITHOUT generating anything.
 
         Used after the module a test covers has been repaired against that
         test: the test's own verdict is the evidence, and asking a model to
         regenerate a test that may now pass would be paying to risk it.
+        ``result`` is a verification already run against the files as they
+        stand — a repair's acceptance run — and is used as it is.
         """
         lang = task.lang or langs.id_for_path(task.path) or "python"
         is_test = task.persona == "tester" or _looks_like_test(task.path)
         self._check_cancel(f"verifying {task.path} again")
         self._emit("phase", f"{task.path}: verifying again",
                    {"phase": "verify", "task": task.path, "attempt": 0})
-        result = self._verify(task, lang)
-        self._log_verify(task, 0, result)
+        if result is None:
+            result = self._verify(task, lang)
+            self._log_verify(task, 0, result)
         caveats = tuple(result.caveats)
         if because:
             caveats += (f"verified again after {because}; no new code was "
@@ -570,6 +669,75 @@ class Loop:
                    {"task": task.path, "ok": outcome.ok,
                     "verified": outcome.verified})
         return outcome
+
+    def _keep_contract(self, task: Task, contract: str, code: str,
+                       result: RunResult) -> RunResult:
+        """`result`, failed with a located diagnostic when the body drops a
+        name its pinned interface declares (D12)."""
+        missing = _broken_contract(contract, code)
+        if not missing:
+            return result
+        names = ", ".join(f"`{n}`" for n in missing[:6])
+        diag = Diagnostic(
+            file=task.path, line=1, severity="error", code="pinned-interface",
+            tool="skeleton",
+            message=(f"{task.path} does not define {names}, which the "
+                     f"interface pinned for it declares. Other files are "
+                     f"written against those names: define each with its "
+                     f"pinned signature, as shown under THE INTERFACE "
+                     f"PINNED FOR THIS FILE."))
+        self._emit("warning", f"{task.path}: the body dropped {names} from "
+                              f"its pinned interface",
+                   {"task": task.path, "missing": missing})
+        return RunResult(ok=False, lang=result.lang,
+                         phases=tuple(result.phases),
+                         diagnostics=(diag,) + tuple(result.diagnostics),
+                         caveats=tuple(result.caveats))
+
+    def _acceptance(self, task: Task, accept: Task, own: RunResult,
+                    n: int) -> RunResult:
+        """`own` if `accept`'s failure is gone from `task.path`, else a
+        failed result carrying `accept`'s diagnostics for the next attempt.
+
+        Gone means: `accept` now passes, or its first error is raised
+        somewhere else — the failure has moved on, which `Session` follows
+        with `reverify`. Still raised in this file means this repair did
+        not do its job, whatever this file's own check says.
+        """
+        lang = accept.lang or langs.id_for_path(accept.path) or "python"
+        self._emit("phase", f"{accept.path}: run again to judge the repair "
+                            f"of {task.path}",
+                   {"phase": "verify", "task": accept.path, "attempt": 0,
+                    "accepts": task.path})
+        log = getattr(self, "log", None)
+        if log is not None:
+            try:
+                log.line(f"  acceptance: {accept.path} is run again to judge "
+                         f"attempt {n} of the repair of {task.path}")
+            except Exception:                            # noqa: BLE001
+                pass
+        again = self._verify(accept, lang)
+        self._log_verify(accept, 0, again)
+        self.accepted[accept.path] = again
+        if again.ok:
+            return own
+        first = next((d for d in again.diagnostics if d.is_error), None)
+        if first is None or not first.file or \
+                not _same_file(first.file, task.path):
+            return own
+        why = f"{accept.path} still fails inside {task.path}"
+        if first.line:
+            why += f" at line {first.line}"
+        if first.message:
+            why += f": {first.message}"
+        self._emit("warning",
+                   f"{task.path}: its own check passes, but {why} — the "
+                   f"repair is not accepted", {"task": task.path,
+                                               "accept": accept.path})
+        return RunResult(ok=False, phases=tuple(again.phases),
+                         diagnostics=tuple(again.diagnostics),
+                         caveats=tuple(own.caveats) + (
+                             f"its own check passed; {why}",))
 
     def _ran_no_tests(self, task: Task, is_test: bool,
                       result: RunResult | None) -> str:
@@ -635,6 +803,7 @@ class Loop:
                     staleness = b
 
         current = "" if repair else self._read(task.path)
+        pinned = self._contract
         if current and _is_our_stub(current):
             current = ""
         if not repair and current.strip():
@@ -650,6 +819,32 @@ class Loop:
             tail_pieces.append(("THE FILE AS IT STANDS", current))
         elif not repair:
             body = _first_task_text(task, request, lang)
+            if pinned:
+                # THE CONTRACT THIS FILE WAS PINNED TO. Other files are
+                # being written against these exact names and types; a body
+                # that renames `Segment` or turns it into a tuple breaks
+                # them all, invisibly, until one of them runs.
+                label, text = _pinned_piece(task.path, pinned)
+                tail_extra.append(f"[{label}]\n{text}")
+                tail_pieces.append((label, text))
+            test_source = self._read(task.test_path) if (
+                task.test_path and _looks_like_test(task.test_path)
+                and not (task.persona == "tester"
+                         or _looks_like_test(task.path))) else ""
+            if test_source.strip():
+                # THE TEST EXISTS BEFORE THE MODULE — written first (F2),
+                # or already in the folder. "Its tests live in X and must
+                # pass" without X in view asked the model to pass a test
+                # it could not read.
+                rule = ("These tests already exist and are the "
+                        "specification: write this file so they pass. They "
+                        "are not yours to change.")
+                tail_extra.append(
+                    f"[THE TEST THIS FILE MUST PASS — {task.test_path}]\n"
+                    f"{test_source}\n\n{rule}")
+                tail_pieces.append(
+                    (f"THE TEST THIS FILE MUST PASS — {task.test_path}",
+                     f"{test_source}\n\n{rule}"))
         else:
             # Diagnostics go in the TAIL, not here — tail_for puts them
             # immediately before the output contract, where recency helps
@@ -663,6 +858,12 @@ class Loop:
             if existing:
                 tail_extra.append(f"[THE FILE AS IT STANDS]\n{existing}")
                 tail_pieces.append(("THE FILE AS IT STANDS", existing))
+            if pinned:
+                # Still the contract: a repair that fixes one error by
+                # renaming a pinned type has moved the error, not fixed it.
+                label, text = _pinned_piece(task.path, pinned)
+                tail_extra.append(f"[{label}]\n{text}")
+                tail_pieces.append((label, text))
             test_source = self._read(task.test_path) if (
                 against_test and task.test_path
                 and _looks_like_test(task.test_path)) else ""
@@ -707,19 +908,38 @@ class Loop:
                     (f"THE CALLER THAT FAILS INSIDE THIS FILE — "
                      f"{self._caller}", f"{caller_source}\n\n{rule}"))
 
-        # THE MODULE UNDER TEST, for a test written after it. Plans write
-        # modules first, so the tester arrives when the module exists; it
+        # THE MODULE UNDER TEST, for a test written after it — the default
+        # order puts each test right after its module, so the tester
+        # arrives when the module exists; it
         # was shown the interface — names and signatures — and for pure
         # arithmetic the signature does not carry the formula. On Oct 1,
         # 2026 the tester asserted `x = cx + x/z·(w/2)` to seven places
         # against a projection that scales by field of view; the spec had
         # asked only for scale and Y. The source is shown, with the rule
-        # that decides what to assert. (A test written FIRST sees a stub,
-        # which is skipped: the interface block is all there is then.)
+        # that decides what to assert. A test written FIRST (F2) sees the
+        # module's PINNED interface instead, with the rule for that case.
         is_test_task = task.persona == "tester" or _looks_like_test(task.path)
         if is_test_task and self._covers:
             module_source = self._read(self._covers)
-            if module_source.strip() and not _is_our_stub(module_source):
+            if _is_pinned(module_source):
+                # A TEST WRITTEN FIRST (F2): the module is its pinned
+                # interface and nothing else. The test is the
+                # specification the module will be written to.
+                rule = ("The module is not written yet: this is its pinned "
+                        "interface, and it will be written next, to pass "
+                        "your tests. Call it only through these names and "
+                        "signatures. Test the behaviour the request asks "
+                        "for; where you assert an exact number, choose "
+                        "inputs whose result follows plainly from the "
+                        "request, and say in a comment how you got it.")
+                stub = strip_stub_sentinel(module_source).strip()
+                tail_extra.append(
+                    f"[THE MODULE UNDER TEST — {self._covers}, interface "
+                    f"only]\n{stub}\n\n{rule}")
+                tail_pieces.append(
+                    (f"THE MODULE UNDER TEST — {self._covers}, interface "
+                     f"only", f"{stub}\n\n{rule}"))
+            elif module_source.strip() and not _is_our_stub(module_source):
                 rule = ("Test the behaviour the request asks for and what "
                         "this module's docstrings promise; include the edge "
                         "case the request implies. Where a test needs an "
@@ -916,7 +1136,8 @@ class Loop:
         if pieces and room > 256:
             tail = build_context(
                 [Piece(label, text, priority=i,
-                       essential=label.startswith(("THE FILE", "THE TEST")))
+                       essential=label.startswith(("THE FILE", "THE TEST",
+                                                   "THE INTERFACE")))
                  for i, (label, text) in enumerate(pieces)],
                 room * CHARS_PER_TOKEN, count_tokens=count)
             fitted = rebuild([tail])
@@ -1640,6 +1861,33 @@ def _elsewhere_sentence(path: str, culprit: str,
     return (f"the error is in {where}{detail}, not in {path}; rewriting "
             f"{path} cannot fix it. {culprit} is repaired against this "
             f"failure next, then {path} is checked again")
+
+
+def _pinned_piece(path: str, pinned: str) -> tuple[str, str]:
+    """(label, text) of the pinned-interface block of a prompt."""
+    rule = ("This is the interface the skeleton pinned for this file before "
+            "any file was written. Other files use it exactly as it stands. "
+            "Keep every name, signature, field, type alias and constant "
+            "shown here, and replace each `raise NotImplementedError` with "
+            "the real body. You may add private helpers.")
+    if "__main__" in pinned:
+        rule += (" Keep the `if __name__ == \"__main__\":` block: it is how "
+                 "the program starts.")
+    return (f"THE INTERFACE PINNED FOR THIS FILE — {path}",
+            f"{pinned}\n\n{rule}")
+
+
+def _unchanged_sentence(path: str, blamer: str, *, by_caller: bool) -> str:
+    """Why a repair that returned the file unchanged is NOT a repair."""
+    whose = (f"{blamer}'s failure" if blamer else "the failure it was "
+             f"repaired against")
+    who = "caller" if by_caller else "test"
+    return (f"the model returned the same code — {path} is unchanged "
+            f"(identical after normalising), so {whose} cannot have gone "
+            f"away. It was told to return the file unchanged only if it is "
+            f"certain the {who} itself is wrong: either it is, or the fix "
+            f"is one the model cannot see. Read the error and fix "
+            f"whichever is wrong by hand")
 
 
 def _disagreement_sentence(test_path: str, covers: str,

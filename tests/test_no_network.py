@@ -81,6 +81,13 @@ def test_a_full_session_runs_with_networking_disabled(no_network, tmp_path):
     replies = [
         "src/parser.py — parse a line into fields\n"
         "src/report.py — format the parsed fields\n",
+        # the interface skeleton (§4.2 step 2): both stubs, one reply
+        '```python\n# file: src/parser.py\ndef parse(line: str) -> list:\n'
+        '    """Split a line into fields."""\n    raise NotImplementedError\n'
+        '```\n```python\n# file: src/report.py\n'
+        'from src.parser import parse\n\n\ndef report(line: str) -> str:\n'
+        '    """Format the parsed fields."""\n    raise NotImplementedError\n'
+        '```',
         '```python\ndef parse(line):\n    """Split a line into fields."""\n'
         '    return [p.strip() for p in line.split(",")]\n```',
         '```python\nfrom src.parser import parse\n\n'

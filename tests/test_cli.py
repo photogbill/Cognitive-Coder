@@ -35,6 +35,12 @@ PLAN = "src/alpha.py — the first thing\nsrc/beta.py — the second thing\n"
 PLAN3 = PLAN + "src/gamma.py — the third thing\n"
 ALPHA = '```python\ndef alpha():\n    """First."""\n    return 1\n```'
 BETA = '```python\ndef beta():\n    """Second."""\n    return 2\n```'
+#: The interface skeleton's reply (§4.2 step 2): a plan of two Python
+#: modules has a contract to pin before either is written.
+SKELETON = ('```python\n# file: src/alpha.py\ndef alpha() -> int:\n'
+            '    """First."""\n    raise NotImplementedError\n```\n'
+            '```python\n# file: src/beta.py\ndef beta() -> int:\n'
+            '    """Second."""\n    raise NotImplementedError\n```')
 
 
 class Scripted:
@@ -82,7 +88,7 @@ def _sessions(project: Path) -> list[str]:
 
 def test_build_with_yes_writes_every_file_and_exits_zero(
         tmp_path, scripted, no_input, capsys):
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     rc = cli.main(["build", "two small modules", "--yes", "-p",
                    str(tmp_path), "--attempts", "1"])
     out = capsys.readouterr().out
@@ -107,7 +113,7 @@ def test_build_without_yes_asks_and_a_no_writes_nothing(
     asked: list[str] = []
     monkeypatch.setattr(builtins, "input",
                         lambda prompt="": asked.append(prompt) or "n")
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     rc = cli.main(["build", "two", "-p", str(tmp_path), "--attempts", "1"])
     out = capsys.readouterr().out
     assert rc == 1, "a build whose every change was declined did not work"
@@ -125,14 +131,14 @@ def test_build_with_eof_at_the_prompt_is_a_no(tmp_path, scripted,
     def eof(prompt=""):
         raise EOFError
     monkeypatch.setattr(builtins, "input", eof)
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     assert cli.main(["build", "two", "-p", str(tmp_path),
                      "--attempts", "1"]) == 1
 
 
 def test_dry_run_refuses_every_write_without_asking(tmp_path, scripted,
                                                     no_input):
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     rc = cli.main(["build", "two", "-p", str(tmp_path), "--attempts", "1",
                    "--dry-run", "--yes"])
     assert rc == 1
@@ -145,7 +151,7 @@ def test_build_reads_the_request_from_a_spec_file(tmp_path, scripted,
     spec = tmp_path / "plan.md"
     spec.write_text("# Two modules\n\nBuild src/alpha.py and src/beta.py.\n",
                     encoding="utf-8")
-    llm = scripted([PLAN, ALPHA, BETA])
+    llm = scripted([PLAN, SKELETON, ALPHA, BETA])
     rc = cli.main(["build", "--spec", str(spec), "--yes", "-p",
                    str(tmp_path), "--attempts", "1"])
     assert rc == 0
@@ -373,7 +379,7 @@ def test_resume_with_no_sessions_says_so(tmp_path, scripted, capsys):
 
 def test_resume_lists_sessions_then_resumes_one(tmp_path, scripted,
                                                 no_input, capsys):
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     assert cli.main(["build", "two", "--yes", "-p", str(tmp_path),
                      "--attempts", "1"]) == 0
     capsys.readouterr()
@@ -400,7 +406,7 @@ AUTO_APPLY = "auto-apply is ON: every diff will be written without asking"
 def test_yes_says_that_auto_apply_is_on(tmp_path, scripted, no_input,
                                         capsys):
     """§6.5: a host that auto-applies must SAY so. `--yes` said nothing."""
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     cli.main(["build", "two", "--yes", "-p", str(tmp_path),
               "--attempts", "1"])
     assert AUTO_APPLY in capsys.readouterr().out
@@ -410,7 +416,7 @@ def test_without_yes_or_when_nothing_is_written_it_is_not_claimed(
         tmp_path, scripted, capsys):
     scripted([PLAN])
     cli.main(["build", "two", "--preview", "--yes", "-p", str(tmp_path)])
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     cli.main(["build", "two", "--dry-run", "--yes", "-p", str(tmp_path),
               "--attempts", "1"])
     assert AUTO_APPLY not in capsys.readouterr().out
@@ -419,7 +425,7 @@ def test_without_yes_or_when_nothing_is_written_it_is_not_claimed(
 def test_a_build_that_built_nothing_is_not_a_success(tmp_path, scripted,
                                                      no_input, capsys):
     """`--budget -1` once printed "Stopped… nothing" and exited 0."""
-    scripted([PLAN])
+    scripted([PLAN, SKELETON])
     rc = cli.main(["build", "two", "--yes", "-p", str(tmp_path),
                    "--budget", "0.00001"])
     assert rc == 1
@@ -563,7 +569,7 @@ def fake_remote(monkeypatch):
     """
     class Fake:
         built: list[dict] = []
-        replies: list[str] = [PLAN, ALPHA, BETA]
+        replies: list[str] = [PLAN, SKELETON, ALPHA, BETA]
 
     def ctor(**kwargs):
         if not kwargs["gate"].allowed("fakeremote"):
@@ -787,7 +793,7 @@ def test_history_in_a_second_process_shows_what_a_build_did(
     import os
     import subprocess
 
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     assert cli.main(["build", "two", "--yes", "-p", str(tmp_path),
                      "--attempts", "1"]) == 0
     repo = str(Path(__file__).resolve().parent.parent)
@@ -807,7 +813,7 @@ def test_a_second_build_continues_the_sequence(tmp_path, scripted,
                                                no_input, capsys):
     """Per-process storage restarted the counter at 1 on every run, so the
     log's numbering no longer proved it was linear (M25)."""
-    scripted([PLAN, ALPHA, BETA])
+    scripted([PLAN, SKELETON, ALPHA, BETA])
     cli.main(["build", "two", "--yes", "-p", str(tmp_path),
               "--attempts", "1"])
     scripted(["src/gamma.py — the third thing\n",

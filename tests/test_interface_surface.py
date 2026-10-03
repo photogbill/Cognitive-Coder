@@ -114,7 +114,8 @@ def test_namedtuple_fields_become_a_constructor_line():
 
 def test_dataclass_fields_keep_their_defaults_and_the_decorator_shows():
     surface = ctx.interface(RENDER, "python", "src/render.py")
-    assert "@dataclass class Segment" in surface
+    # with its arguments: a frozen dataclass's fields cannot be assigned
+    assert "@dataclass(frozen=True) class Segment" in surface
     assert "index: int, curve: float = 0.0, light: bool = True" in surface
     assert "# construct: Segment(index, curve, light)" in surface
 

@@ -37,6 +37,12 @@ from cognitive_coder.types import ModelCapabilities  # noqa: E402
 PLAN = ("src/alpha.py — the first thing\nsrc/beta.py — the second thing\n")
 ALPHA = '```python\ndef alpha():\n    """First."""\n    return 1\n```'
 BETA = '```python\ndef beta():\n    """Second."""\n    return 2\n```'
+#: The interface skeleton's reply (§4.2 step 2): a plan of two Python
+#: modules has a contract to pin before either is written.
+SKELETON = ('```python\n# file: src/alpha.py\ndef alpha() -> int:\n'
+            '    """First."""\n    raise NotImplementedError\n```\n'
+            '```python\n# file: src/beta.py\ndef beta() -> int:\n'
+            '    """Second."""\n    raise NotImplementedError\n```')
 
 
 def _host(tmp_path, replies, llm=None):
@@ -47,7 +53,7 @@ def _host(tmp_path, replies, llm=None):
 
 
 def test_a_session_plans_then_builds_each_file(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     outcomes = session.run("two small modules")
     assert [o.ok for o in outcomes] == [True, True]
@@ -55,7 +61,7 @@ def test_a_session_plans_then_builds_each_file(tmp_path):
 
 
 def test_the_report_reads_like_appendix_E(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     session.run("two small modules")
     report = session.report()
@@ -65,7 +71,7 @@ def test_the_report_reads_like_appendix_E(tmp_path):
 
 def test_caveats_are_surfaced_in_the_report_not_buried(tmp_path):
     """C4 — a suite of zero tests LOOKS like success and is not."""
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     session.run("two small modules")
     assert "CAVEAT" in session.report()
@@ -78,7 +84,7 @@ def test_caveats_are_surfaced_in_the_report_not_buried(tmp_path):
 def test_resume_is_derived_from_the_journal_on_disk(tmp_path):
     """It must survive a CRASH, not merely a pause — so the object that
     would have held the state is thrown away before resuming."""
-    host = _host(tmp_path, [PLAN, ALPHA])       # runs out after alpha
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA])       # runs out after alpha
     session = Session(host, config=SessionConfig(attempts=1))
     session_id = session.id
     with pytest.raises(AssertionError):         # ScriptedLLM runs dry
@@ -159,7 +165,7 @@ def test_a_preview_is_not_a_session_to_resume(tmp_path):
 
 
 def test_previous_sessions_are_listable(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     session.run("two small modules")
     assert session.id in Session.previous_sessions(host)
@@ -197,7 +203,7 @@ def test_a_model_change_is_treated_as_an_epoch_boundary(tmp_path):
 
         def __init__(self):
             self.name = "devstral-small-2-24b"
-            self.replies = [PLAN, ALPHA, BETA]
+            self.replies = [PLAN, SKELETON, ALPHA, BETA]
 
         def capabilities(self):
             return ModelCapabilities(name=self.name, family="mistral",
@@ -251,7 +257,7 @@ def test_the_core_contains_no_model_swap_logic():
 
 def test_the_wall_clock_budget_stops_cleanly_and_says_what_was_achieved(
         tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1,
                                                  wall_clock_s=0.0001))
     session.start("two small modules")
@@ -264,7 +270,7 @@ def test_the_wall_clock_budget_stops_cleanly_and_says_what_was_achieved(
 
 
 def test_cancelling_ends_the_session_with_resumable_state(tmp_path):
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     session.start("two small modules")
     session.cancel()
@@ -278,7 +284,7 @@ def test_a_git_repository_earns_one_warning_and_no_git_command(tmp_path):
     """§6.5b — say so once; do not refuse, do not commit for them."""
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "config").write_text("[core]\n")
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     session.start("two small modules")
     warnings = [m for k, m, _d in host.events.events if k == "warning"]
@@ -300,7 +306,7 @@ def test_a_port_failure_reaches_the_host_as_a_sentence(tmp_path):
     `Session.run` as a raw traceback, and `CognitiveCoderError.wrap` — the
     mechanism built for exactly this — was never called."""
     from cognitive_coder.errors import CognitiveCoderError
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     host.exec = _UndecodableExec()
     session = Session(host, config=SessionConfig(attempts=1))
     with pytest.raises(CognitiveCoderError) as exc:
@@ -402,7 +408,7 @@ def test_a_session_built_on_one_thread_runs_on_another(tmp_path):
     ProgrammingError — observed as tool calls answering "That tool call
     failed" and an index that silently stopped."""
     import threading
-    host = _host(tmp_path, [PLAN, ALPHA, BETA])
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA])
     session = Session(host, config=SessionConfig(attempts=1))
     errors: list[BaseException] = []
 

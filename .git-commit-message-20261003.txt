@@ -1,0 +1,43 @@
+Pin interfaces in the skeleton; build tests beside modules; honest repairs
+
+Read from the Oct 2 build of the racing spec (Qwen3-Coder-30B-A3B Q4_K_M,
+32k): 998 s, three files failed, two built with no test. Three of the
+defects were the harness's.
+
+- The skeleton carries the interfaces (spec 4.2 step 2). Every stub was
+  a docstring and `def main(): raise NotImplementedError`, so track.py
+  made `TrackSegment = Tuple[float, float, int]` and render.py, written
+  blind to it, read `seg.x` -> "'tuple' object has no attribute 'x'".
+  The Phase 0 interface block did reach render.py, but the codemap
+  indexed functions and classes only, so the alias did not exist for it.
+  * interfaces.py (new), Planner._pin_interfaces: one model call writes
+    every Python module's stub (shared types defined once, all public
+    signatures); a rule reduces it to signatures that import cleanly;
+    files whose stub is missing or broken keep the rule stub, by name.
+    The loop shows each file its pinned interface and fails a body that
+    drops a pinned name (D12, `pinned-interface` diagnostic).
+  * codemap: type aliases and constants are symbols (their source
+    statement, their comment), Enum members and class constants too;
+    signatures keep defaults; field defaults and decorator arguments are
+    shown as written; a tuple/dict/list alias is called a plain container.
+    enrich answers "'tuple' object has no attribute" with the aliases.
+- Tests are built beside their modules (F2). Order was every module, then
+  every test; now each test runs right after its module. When the request
+  asks for tests first (or test_first=True), a test whose module was
+  pinned is written right before it, against the stub; its failure there
+  is accepted, the module is shown the test, and both verify together.
+- A cross-file repair answers for its result. render.py was "REPAIRED"
+  with a byte-identical file because its own check passed. An unchanged
+  reply (AST-identical) is now NOT REPAIRED at once, with the reason, and
+  a caller-triggered repair is accepted only once the caller no longer
+  fails inside the repaired file; that run is the caller's re-check.
+
+New: SessionConfig.pin_interfaces / test_first, ccoder build
+--no-interfaces / --tests-first / --tests-after, journal event
+"interfaces". One more model call per multi-module build: host suites
+that script replies need one more after the plan.
+
+Tests: test_interfaces_pinned, test_test_order, test_repair_acceptance
+(new); scripted suites gained the skeleton reply; golden trace +1 event.
+1214 pass, 20 skipped; the 3 failures on the Linux VM (Python 3.10) are
+the same 3 as before the change.

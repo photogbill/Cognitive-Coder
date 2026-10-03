@@ -147,6 +147,8 @@ def _arity(g: dict, *, store: Any, fs: Any) -> str:
 
 
 def _object_attr(g: dict, *, store: Any, fs: Any) -> str:
+    if g["cls"] in _PLAIN_CONTAINERS:
+        return _plain_container_fact(g, store=store)
     rows = _class_rows(g["cls"], store=store)
     if not rows:
         return ""
@@ -158,6 +160,52 @@ def _object_attr(g: dict, *, store: Any, fs: Any) -> str:
     hint = f" Did you mean `{near}`?" if near else ""
     return (f"`{g['cls']}` has no attribute `{g['attr']}`.{hint} "
             f"Its interface is:\n{body}")
+
+
+#: Builtin types a project ALIASES — `TrackSegment = Tuple[float, float,
+#: int]` — and the alias spellings that mean each one.
+_PLAIN_CONTAINERS = {"tuple": ("Tuple", "tuple"), "dict": ("Dict", "dict"),
+                     "list": ("List", "list")}
+
+
+def _plain_container_fact(g: dict, *, store: Any) -> str:
+    """`'tuple' object has no attribute 'x'`: the value is a plain tuple.
+
+    Oct 2, 2026: `render.py` read `seg.x` from a `TrackSegment`, which
+    `track.py` had defined as `Tuple[float, float, int]`. The class lookup
+    finds no class called `tuple` and said nothing; the repair then
+    returned the same file. What is true is the alias — so this names it,
+    exactly, with how such a value is used.
+    """
+    cls = g["cls"]
+    spellings = _PLAIN_CONTAINERS[cls]
+    aliases: list[str] = []
+    if store is not None:
+        try:
+            for row in store.files():
+                for r in store.symbols_in(row["path"]):
+                    sig = r.get("signature") or ""
+                    if r.get("kind") != "alias" or "=" not in sig:
+                        continue
+                    value = sig.split("=", 1)[1].strip()
+                    if value.split("[", 1)[0].strip().split(".")[-1] \
+                            in spellings:
+                        doc = r.get("docstring") or ""
+                        aliases.append(f"    {sig}"
+                                       + (f"  # {doc}" if doc else "")
+                                       + f"   ({row['path']})")
+        except Exception:                                # noqa: BLE001
+            aliases = []
+    how = {"tuple": "unpack it (`a, b, c = value`) or index it "
+                    "(`value[0]`)",
+           "dict": "read it by key (`value[\"key\"]`)",
+           "list": "index or iterate it"}[cls]
+    lead = (f"The value is a plain {cls}: it has no attribute "
+            f"`{g['attr']}`, or any named attribute — {how}.")
+    if not aliases:
+        return lead
+    return (f"{lead} This project defines these {cls} types:\n"
+            + "\n".join(aliases[:6]))
 
 
 def _type_attr(g: dict, *, store: Any, fs: Any) -> str:
@@ -185,7 +233,9 @@ def _name_error(g: dict, *, store: Any, fs: Any) -> str:
     except Exception:                                    # noqa: BLE001
         return ""
     hits = [r for r in rows if r["name"].split(".")[-1] == name
-            and r.get("kind") in ("class", "function")]
+            and (r.get("kind") in ("class", "function")
+                 or (r.get("kind") in ("alias", "constant")
+                     and "." not in r["name"]))]
     if not hits:
         return (f"Nothing in this project defines `{name}`. Either it is "
                 f"from the standard library and needs an import, or it "

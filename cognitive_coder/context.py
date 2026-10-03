@@ -353,9 +353,13 @@ def interface_lines(rows: Sequence[Any], *, indent: str = "    "
 
     def emit(r: Any, prefix: str) -> None:
         kind, name = get(r, "kind"), get(r, "name")
-        if kind in ("field", "attribute") or not is_public_symbol(name):
+        if kind in _DATA_KINDS and parent_of(r) or \
+                kind in ("field", "attribute") or not is_public_symbol(name):
             return
-        lines.append(one(r, prefix))
+        line = one(r, prefix)
+        if kind == "alias":
+            line += _alias_note(get(r, "signature") or "")
+        lines.append(line)
         if kind not in _CLASS_KINDS:
             return
         kids = children.get(name, [])
@@ -363,12 +367,23 @@ def interface_lines(rows: Sequence[Any], *, indent: str = "    "
                   and is_public_symbol(get(k, "name"))]
         attrs = [k for k in kids if get(k, "kind") == "attribute"
                  and is_public_symbol(get(k, "name"))]
+        enum_members = [k for k in kids if get(k, "kind") == "member"
+                        and is_public_symbol(get(k, "name"))]
+        constants = [k for k in kids if get(k, "kind") == "constant"
+                     and is_public_symbol(get(k, "name"))]
         members = [k for k in kids
-                   if get(k, "kind") not in ("field", "attribute")]
+                   if get(k, "kind") not in ("field", "attribute")
+                   and get(k, "kind") not in _DATA_KINDS]
         has_ctor = any(get(k, "name").split(".")[-1] in ("__init__", "__new__")
                        for k in members)
         inner = prefix + indent
         cls = name.split(".")[-1]
+        if enum_members:
+            lines.append(f"{inner}# members: "
+                         + ", ".join(short(m) for m in enum_members))
+        if constants:
+            lines.append(f"{inner}# class constants: "
+                         + ", ".join(short(c) for c in constants))
         if fields:
             lines.append(f"{inner}# fields (constructor arguments, in this "
                          f"order): " + ", ".join(short(f) for f in fields))
@@ -389,10 +404,42 @@ def interface_lines(rows: Sequence[Any], *, indent: str = "    "
         for k in members:
             emit(k, inner)
 
-    for r in rows:
-        if not parent_of(r):
-            emit(r, "")
+    # Top level in SOURCE order, so a type alias is read before the
+    # functions that take it. The codemap's rows are sorted by line already;
+    # a parser's list puts module-level values after the definitions.
+    top = [r for r in rows if not parent_of(r)]
+    if all(isinstance(get(r, "line", None), int) for r in top):
+        top.sort(key=lambda r: get(r, "line", 0))
+    for r in top:
+        emit(r, "")
     return lines, approx
+
+
+#: Symbol kinds that are VALUES rather than code: a module's type aliases
+#: and constants, a class's constants and an Enum's members. Rendered as
+#: the statement that defines them.
+_DATA_KINDS = ("alias", "constant", "member")
+
+_PLAIN_CONTAINER = re.compile(
+    r"=\s*(?:typing\.)?(?P<kind>Tuple|tuple|Dict|dict|List|list)\b(?!\w)")
+
+
+def _alias_note(signature: str) -> str:
+    """What a model must not assume about a plain-container alias.
+
+    `TrackSegment = Tuple[float, float, int]` names a TUPLE. A model that
+    sees `List[TrackSegment]` and not this line writes `seg.x`; a model that
+    sees this line can still write it, because a capitalised name reads
+    like a class. One deterministic clause closes that gap.
+    """
+    m = _PLAIN_CONTAINER.search(signature)
+    if not m:
+        return ""
+    kind = m.group("kind").lower()
+    how = {"tuple": "unpack it or index it (`a, b, c = value`)",
+           "dict": "read it by key (`value[\"key\"]`)",
+           "list": "index or iterate it"}[kind]
+    return f"  — a plain {kind}, not a class: no named attributes; {how}"
 
 
 def slice_around(text: str, line: int, before: int = 40,

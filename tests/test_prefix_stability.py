@@ -216,8 +216,14 @@ def test_the_first_file_sees_the_skeleton_in_the_cached_prefix(tmp_path):
         SessionConfig,
         SubprocessExec,
     )
+    skeleton = ('```python\n# file: src/alpha.py\ndef parse(text: str) '
+                '-> list:\n    """Parse the input."""\n'
+                '    raise NotImplementedError\n```\n'
+                '```python\n# file: src/beta.py\nfrom src.alpha import parse'
+                '\n\n\ndef report(text: str) -> str:\n    """Report on it."""'
+                '\n    raise NotImplementedError\n```')
     host = Host(llm=ScriptedLLM(["src/alpha.py — parse the input\n"
-                                 "src/beta.py — report on it\n"]),
+                                 "src/beta.py — report on it\n", skeleton]),
                 fs=LocalFileSystem(str(tmp_path)), exec=SubprocessExec(),
                 storage=MemoryStorage(str(tmp_path / ".s")),
                 events=RecordingEvents(), approval=AutoApprove())
@@ -226,6 +232,9 @@ def test_the_first_file_sees_the_skeleton_in_the_cached_prefix(tmp_path):
     assert (tmp_path / "src" / "beta.py").exists(), "no skeleton written"
     prefix = session.codemap.prefix_block()
     assert "src/beta.py" in prefix, prefix
+    # and with the interfaces pinned, the architecture names what each
+    # file will provide — before any of them is written
+    assert "src/beta.py: report" in prefix, prefix
 
 
 # --------------------------------------------------------------------------

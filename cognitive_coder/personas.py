@@ -339,7 +339,25 @@ REPAIRER = Persona(
                "not force you to touch."),
     temperature=0.15)
 
-PERSONAS = {p.id: p for p in (ENGINEER, TESTER, PLANNER, REVIEWER, REPAIRER)}
+#: Writes the interface skeleton (§4.2 step 2): the stubs every file is
+#: later built against. Code, so the engineer's temperature, not the
+#: planner's: a contract wants the likeliest answer, not a varied one.
+ARCHITECT = Persona(
+    id="architect", label="Architect",
+    self_model=("You design the contract between the files of a project "
+                "before any of them is written: the shared data types, "
+                "defined once in the module that owns them, and every "
+                "public function's exact signature. The people who write "
+                "each file later see only these stubs, so a type two files "
+                "share must be the same type in both."),
+    directive=("Write a stub for every file you are given: imports, data "
+               "types with typed fields, constants, and every public "
+               "function and method with type hints, a one-line docstring "
+               "and the body `raise NotImplementedError`. No real code."),
+    temperature=0.15)
+
+PERSONAS = {p.id: p for p in (ENGINEER, TESTER, PLANNER, REVIEWER, REPAIRER,
+                              ARCHITECT)}
 
 
 # --------------------------------------------------------------------------
@@ -372,6 +390,12 @@ CONTRACT_LIST = (
     "OUTPUT CONTRACT\n"
     "Return one item per line, in the form `path — purpose`. No numbering, "
     "no headings, no preamble, no closing remarks.")
+
+CONTRACT_FILES = (
+    "OUTPUT CONTRACT\n"
+    "Return one fenced code block per file, in the order the files are "
+    "listed. The first line inside each block is `# file: <its path>`. "
+    "Nothing outside the blocks.")
 
 CONTRACT_JSON = (
     "OUTPUT CONTRACT\n"

@@ -96,6 +96,15 @@ class SessionConfig:
     #: `Planner.pair_tests`. Without it, a file with no test file is "built
     #: and ran", and the session summary counts how many are in that state.
     pair_tests: bool = False
+    #: Ask the model for the INTERFACE SKELETON before any body is written
+    #: (§4.2 step 2): real signatures and shared data types for every
+    #: planned Python module, one call. Costs one generation; without it
+    #: each file is written blind to the others (see `interfaces.py`).
+    pin_interfaces: bool = True
+    #: Tests before module bodies (F2). None: when the request asks for it.
+    #: True/False: always/never. Only for modules whose interface was
+    #: pinned; otherwise each test is written right AFTER its module.
+    test_first: bool | None = None
     conventions: str = ""
     #: Deployed skills (F3). Discovered once, at Session construction, from
     #: `skills_dir` — never re-read mid-session, because the prefix must not
@@ -166,7 +175,10 @@ class Session:
                                lang=self.config.lang,
                                max_files=self.config.max_files,
                                patcher=self.patcher,
-                               pair_tests=self.config.pair_tests)
+                               pair_tests=self.config.pair_tests,
+                               pin_interfaces=self.config.pin_interfaces,
+                               max_tokens=self.config.max_tokens,
+                               test_first=self.config.test_first)
         self.loop = Loop(
             host, codemap=self.codemap, patcher=self.patcher,
             journal=self.journal, prompts=self.prompts,
@@ -195,6 +207,8 @@ class Session:
         #: What the session was doing, for the sentence a failure earns.
         self._where = ""
         self.profile: dict = {}
+        #: What `Planner.skeleton` returned: files, pinned, fallback, note.
+        self.skeleton_result: dict = {}
         self.last_review: Any = None
         self._model: str = ""
         self._context: int = 0
@@ -290,6 +304,8 @@ class Session:
                                f"watch the first file.",
                                {"phase": "skeleton"})
             self.plan = self.planner.derive_order(self.plan)
+            self.skeleton_result = dict(result)
+            self._log_skeleton(result)
             # The epoch snapshot was taken at start, BEFORE the skeleton
             # existed. The planner indexes each stub as it writes it, but
             # the cached prefix serves the snapshot — so the first file was
@@ -300,6 +316,64 @@ class Session:
         self._emit_plan(revised=False)
         self._preinstall(request)
         return self.plan
+
+    def _log_skeleton(self, result: dict) -> None:
+        """What the skeleton pinned, and the order the build will take.
+
+        The order matters now in a way it did not: a test is written beside
+        its module — first, when the request asks for that — and the PLAN
+        list above is the planner's proposal, not the order of the build.
+        """
+        pinned = result.get("pinned") or []
+        fallback = result.get("fallback") or {}
+        reply = self.planner.interface_reply
+        if reply is not None:
+            # The reply itself, as every generation's is: the snapshot holds
+            # the stubs as written, this holds what the model said.
+            self.log.generation(
+                "the interface skeleton", 1,
+                temperature=personas.ARCHITECT.temperature,
+                seed=self.config.seed, tokens_in=reply.tokens_in,
+                tokens_out=reply.tokens_out, prompt_ms=reply.prompt_ms,
+                decode_ms=getattr(reply, "decode_ms", 0), text=reply.text)
+        if pinned:
+            self.log.event("INTERFACES",
+                           f"pinned for {len(pinned)} file(s) before any "
+                           f"body was written: {', '.join(pinned)}")
+        for path, why in fallback.items():
+            self.log.line(f"  NOTE: {path} keeps a plain stub — {why}")
+        first = self._tests_first()
+        covered = self.planner._covered_modules(self.plan)
+        late = [t.path for t in self.plan.tasks
+                if t.id in covered and t.path not in first]
+        if late and self.planner.wants_test_first(self.plan.request):
+            which = ("no module's interface could be pinned, so each test "
+                     "is written right after its module instead" if not first
+                     else f"{', '.join(late)} "
+                          f"{'is' if len(late) == 1 else 'are'} written "
+                          f"after {'its module' if len(late) == 1 else 'their modules'}"
+                          f", whose interface could not be pinned")
+            note = f"the request asks for tests before the module bodies, " \
+                   f"but {which}"
+            self.plan = dataclasses.replace(
+                self.plan, caveats=self.plan.caveats + (note,))
+            self.host.emit("warning", note, {"phase": "plan"})
+            self.log.line(f"  CAVEAT: {note}")
+        order = []
+        for i, t in enumerate(self.plan.tasks, 1):
+            mark = "  (written first)" if t.path in first else ""
+            order.append(f"  {i}. {t.path}{mark}")
+        self.log.line("  build order:")
+        for line in order:
+            self.log.line("  " + line)
+
+    def _tests_first(self) -> set[str]:
+        """Paths of the plan's tests that are written before their module."""
+        if self.plan is None:
+            return set()
+        covered = self.planner._covered_modules(self.plan)
+        ids = self.planner._tests_written_first(self.plan, covered)
+        return {t.path for t in self.plan.tasks if t.id in ids}
 
     def _preinstall(self, request: str) -> None:
         """Install the packages the REQUEST names before the first file.
@@ -454,6 +528,7 @@ class Session:
                                      planned=self._planned_paths(task))
         self.outcomes.append(outcome)
         self._credit_module(covers, outcome)
+        self._credit_test_written_first(task, outcome)
         blamed = self.loop.blamed.pop(task.path, None)
         if blamed:
             self._queue_repair(task, blamed, covers)
@@ -572,16 +647,32 @@ class Session:
                    purpose=module.purpose,
                    test_path=test.path if blamer_is_test else module.test_path,
                    persona=module.persona, lang=module.lang, atomic=False)
+        # THE REPAIR ANSWERS FOR ITS RESULT. Oct 2, 2026: render.py was
+        # reported REPAIRED against main.py's crash with a byte-identical
+        # file — render.py's own check (an import, zero tests) passed, and
+        # main.py then failed with the same error. Now an unchanged file
+        # stops the repair at once, NOT repaired, and a caller's failure is
+        # re-run as the acceptance test. (A test blamer needs no separate
+        # acceptance: it is the fix's own test.)
+        try:
+            before = self.host.fs.read(module.path)
+        except Exception:                                # noqa: BLE001
+            before = None
+        caller = None if blamer_is_test else test
         outcome = self.loop.run_task(fix, request=self.plan.request,
                                      seed=failing,
                                      planned=self._planned_paths(module),
-                                     caller="" if blamer_is_test else test.path)
+                                     caller=caller.path if caller else "",
+                                     accept=caller, baseline=before)
         self._record(fix, outcome, label="REPAIRED" if outcome.ok
                      else "NOT REPAIRED")
         if not outcome.ok:
             return outcome
+        # The acceptance run IS the re-check, against the same files: a
+        # caller's second run would cost a second full run timeout.
         again = self.loop.reverify(
-            test, because=f"{module.path} was repaired against it")
+            test, because=f"{module.path} was repaired against it",
+            result=self.loop.accepted.pop(test.path, None))
         self._record(test, again, label=again.label)
         # The failure may now be raised in a THIRD file (`Loop.reverify`
         # names it). Queue that repair the same way; `_queue_repair`
@@ -765,9 +856,9 @@ class Session:
         """A test that VERIFIED clears the "not verified" mark on the module
         it covers.
 
-        The plan writes modules before their tests, so every module is
-        "built, not verified" at its own task's end — its test did not exist
-        yet. When the test is written and its tests run and pass, the module
+        Unless tests are written first, a module's test is written right
+        after it, so the module is "built, not verified" at its own task's
+        end — its test did not exist yet. When the test is written and its tests run and pass, the module
         has been verified after all, and the session's summary must say so
         rather than repeat a verdict that was true an hour ago.
         """
@@ -788,6 +879,33 @@ class Session:
                        f"ran its tests against it and they passed",
                        {"task": module.path, "verified": True,
                         "by": test_outcome.path})
+
+    def _credit_test_written_first(self, module: Task,
+                                   outcome: TaskOutcome) -> None:
+        """A module that VERIFIED against a test written before it verifies
+        that test too: it was "written, not verified" at its own task's
+        end, because nothing it tests existed yet."""
+        if not outcome.verified or not module.test_path:
+            return
+        last = next((o for o in reversed(self.outcomes)
+                     if o.path == module.test_path), None)
+        if last is None or not last.ok or last.verified:
+            return
+        if any("PASS against the unwritten stub" in c for c in last.caveats):
+            return      # it passed before the module existed: it tests nothing
+        if not any("written before" in c for c in last.caveats):
+            return      # not a test written first; `_credit_module` has it
+        self.loop.unverified.discard(module.test_path)
+        self.outcomes.append(dataclasses.replace(
+            last, verified=True,
+            caveats=last.caveats + (
+                f"verified when {module.path} was built against it and "
+                f"its tests passed",)))
+        self.host.emit("status",
+                       f"{module.test_path}: now verified — {module.path} "
+                       f"was built to pass it, and it does",
+                       {"task": module.test_path, "verified": True,
+                        "by": module.path})
 
     def _planned_paths(self, task: Task) -> tuple[str, ...]:
         """The PATHS of the plan's tasks that `task` depends on.
@@ -1312,6 +1430,11 @@ class Session:
             lines.append(f"[plan]      {len(self.plan.tasks)} files")
             for t in self.plan.tasks:
                 lines.append(f"              {t.path}   — {t.purpose}")
+        if self.skeleton_result.get("files"):
+            pinned = self.skeleton_result.get("pinned") or []
+            lines.append(
+                f"[skeleton]  {self.skeleton_result.get('note', '')}"
+                + (f" — pinned: {', '.join(pinned)}" if pinned else ""))
         for i, o in enumerate(self.outcomes, 1):
             mark = "→ committed" if o.ok else "→ NOT finished"
             lines.append(f"[build {i}/{len(self.outcomes)}] {o.path}")

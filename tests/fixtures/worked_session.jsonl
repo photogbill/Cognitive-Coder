@@ -3,6 +3,7 @@
 {"event": "model_check"}
 {"event": "codemap"}
 {"event": "plan"}
+{"event": "interfaces"}
 {"event": "skeleton"}
 {"event": "autofix", "task": "src/readings.py"}
 {"attempt": 1, "event": "generate", "task": "src/readings.py"}
