@@ -63,6 +63,7 @@ import re
 import time
 from typing import Any
 
+from . import canvas as cv
 from . import diagnostics as dx
 from . import enrich, guard, langs, personas, runner, textio
 from .context import CHARS_PER_TOKEN, Piece, build_context
@@ -82,6 +83,7 @@ from .planner import _is_our_stub, _looks_like_test, strip_stub_sentinel
 from .ports import NeverCancelled
 from .types import (
     AttemptRecord,
+    CanvasRequest,
     Completion,
     Diagnostic,
     Edit,
@@ -124,6 +126,20 @@ class LoopConfig:
     #: construction. Without this, a stale `tests/test_physics.py` from an
     #: earlier session failed every module of the next build in turn.
     known_failing: tuple[str, ...] = ()
+    #: DIFFUSION MODE (canvas.py, docs/DIFFUSION_MODE.md). "auto": when the
+    #: loaded model fills a canvas (`ModelCapabilities.supports_canvas`), a
+    #: repair rewrites the HOLE the error is in and a pinned file is written
+    #: body by body; "off": never — the whole-file path, exactly as before.
+    canvas: str = "auto"
+    #: Canvases tried per repair attempt; the one that parses and that the
+    #: model was surest of goes to the tests. Each is one short request
+    #: against a prompt the server already holds, not a whole file.
+    canvas_candidates: int = 2
+    #: Before a pinned file's bodies are written, one ordinary call plans
+    #: them in plain notes. A canvas starts with code, so a body cannot think
+    #: first; the notes are the thinking, written down where every body in
+    #: the file can read it.
+    canvas_notes: bool = True
 
 
 @dataclass
@@ -180,6 +196,21 @@ class Loop:
     #: passed. The session's `reverify` uses it instead of running the
     #: caller a second time (a game's run is a full timeout).
     accepted: dict = field(default_factory=dict)
+    #: DIFFUSION MODE's memory of how sure the model was of each body it
+    #: wrote: {path: {function: least certain line, 0..1}}. A failure that
+    #: names no line of the file (an assertion in its test) is repaired in
+    #: the body the model was least sure of, then the next.
+    doubt: dict = field(default_factory=dict)
+    _doubt_tried: dict = field(default_factory=dict, repr=False)
+    #: {path: {(kind, function or error line, the error)}} — holes tried in
+    #: this task. The same hole failing with the same error twice says the
+    #: fault is not in the hole (a caller passing the wrong thing, a
+    #: definition elsewhere in the file): that attempt is a whole file.
+    _holes_tried: dict = field(default_factory=dict, repr=False)
+    #: {path: the attempt whose code came from canvases} — so the build
+    #: log's `generate` line says "via diffusion canvases" instead of a
+    #: temperature that attempt never sampled at.
+    _via_canvas: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     def run_task(self, task: Task, *, request: str = "", covers: str = "",
@@ -217,6 +248,9 @@ class Loop:
         this file. If it is not, its diagnostics drive the next attempt.
         """
         self._planned = tuple(p for p in planned if p and p != task.path)
+        self._doubt_tried.pop(task.path, None)
+        self._holes_tried.pop(task.path, None)
+        self._via_canvas.pop(task.path, None)
         self._caller = caller if caller and caller != task.path else ""
         self._covers = covers if covers and covers != task.path else ""
         lang = task.lang or langs.id_for_path(task.path) or "python"
@@ -305,7 +339,8 @@ class Loop:
                 code, completion, continued, sent = self._generate(
                     task, persona, lang, request=request,
                     diagnostics=diag_text, autofixes=autofixed, attempt=n,
-                    repair=repair, against_test=bool(seed))
+                    repair=repair, against_test=bool(seed),
+                    located=carried)
 
                 if completion.finish_reason == "cancelled":
                     raise Cancelled(f"generating {task.path}")
@@ -765,7 +800,8 @@ class Loop:
     def _generate(self, task: Task, persona: Persona, lang: str, *,
                   request: str, diagnostics: str, autofixes: Sequence[str],
                   attempt: int, repair: bool | None = None,
-                  against_test: bool = False
+                  against_test: bool = False,
+                  located: Sequence[Diagnostic] = ()
                   ) -> tuple[str, Completion, bool, list[Message]]:
         """(code, completion, continued, the messages actually sent).
 
@@ -956,6 +992,24 @@ class Loop:
                     (f"THE MODULE UNDER TEST — {self._covers}",
                      f"{module_source}\n\n{rule}"))
 
+        # -- DIFFUSION MODE: a hole, not the whole file (canvas.py) --------
+        # Everything above — the interfaces, the pinned contract, the test,
+        # the caller, the enriched errors — is the context of the hole too;
+        # only the task, the file view and the output contract differ. Any
+        # reason the canvas cannot serve (no located line, a hole that does
+        # not fit, no candidate that parses) falls through to the whole-file
+        # path below, unchanged.
+        if self._canvas_ready(caps):
+            via = self._canvas_generate(
+                task, persona, lang, repair=repair, located=located,
+                pinned=pinned, arch=arch, interfaces=interfaces,
+                examples=examples, staleness=staleness,
+                diagnostics=diagnostics, tail_extra=tail_extra,
+                caps=caps, attempt=attempt, request=request,
+                autofixes=autofixes)
+            if via is not None:
+                return via
+
         prompt = self.prompts.build(
             persona, body, architecture=arch,
             epoch=(self.codemap.store.epoch if self.codemap else 0),
@@ -1074,6 +1128,467 @@ class Loop:
         # the text-lookup fallback, before any continuation (a continuation
         # is derived from this prompt, not a different one).
         return code, completion, continued, list(messages)
+
+    # ------------------------------------------------------------------
+    # DIFFUSION MODE (canvas.py)
+    # ------------------------------------------------------------------
+    def _canvas_ready(self, caps: ModelCapabilities) -> bool:
+        """The loaded model fills a canvas, and nothing has switched it off."""
+        return (str(self.config.canvas).lower() != "off"
+                and bool(getattr(caps, "supports_canvas", False))
+                and callable(getattr(self.host.llm, "canvas_fill", None)))
+
+    def _canvas_generate(self, task: Task, persona: Persona, lang: str, *,
+                         repair: bool, located: Sequence[Diagnostic],
+                         pinned: str, arch: str, interfaces: str,
+                         examples: str, staleness: str, diagnostics: str,
+                         tail_extra: Sequence[str], caps: ModelCapabilities,
+                         attempt: int, request: str,
+                         autofixes: Sequence[str]
+                         ) -> tuple[str, Completion, bool, list[Message]] | None:
+        """(code, completion, False, messages) — or None: use the whole file.
+
+        Two jobs. A REPAIR rewrites the hole its error is in (or, when the
+        error names no line of this file, the body the model was least sure
+        of). A FIRST attempt at a file whose interface was pinned writes its
+        bodies one hole at a time, every signature held.
+        """
+        code = self._read(task.path)
+        context = [x for x in tail_extra
+                   if not x.startswith("[THE FILE AS IT STANDS]")]
+        epoch = self.codemap.store.epoch if self.codemap else 0
+        count = self.host.llm.count_tokens
+
+        def messages(task_text: str, blocks: Sequence[str], contract: str,
+                     who: Persona = persona, diags: str = diagnostics
+                     ) -> list[Message]:
+            return self.prompts.build(
+                who, task_text, architecture=arch, epoch=epoch,
+                interfaces=interfaces, examples=examples,
+                staleness=staleness, diagnostics=diags, contract=contract,
+                extra=[*context, *blocks]).messages()
+
+        def fits(msgs: Sequence[Message], canvases: int) -> bool:
+            try:
+                used = sum(count(m.content) for m in msgs)
+            except Exception:                            # noqa: BLE001
+                return False
+            # the server reserves one canvas MORE than the reply can use
+            # (it must fit the prompt, the canvases, and the commit of the
+            # last one): `fit = (n_ctx - prompt) / canvas - 1 >= 1`
+            return used + cv.CANVAS_TOKENS * (canvases + 1) + 64 \
+                <= int(caps.context_tokens or 0)
+
+        if repair:
+            hole = cv.repair_hole(code, lang, task.path, located,
+                                  same_file=_same_file, count_tokens=count)
+            err = cv.located_error(located, task.path, _same_file)
+            # DOUBT only for a failure that names no line here. A located
+            # error whose hole did not fit is a whole-file repair — not a
+            # rewrite of some other function the model happened to doubt.
+            doubted = ""
+            if (hole is None and err is None and lang == "python"
+                    and self.doubt.get(task.path)):
+                tried = self._doubt_tried.setdefault(task.path, set())
+                name = cv.least_sure(self.doubt[task.path], code, tried)
+                if name:
+                    tried.add(name)
+                    doubted = name
+                    hole = cv.function_hole(code, task.path, name)
+                    if hole is not None and not cv._fits(hole, count):
+                        hole = None
+            if hole is None:
+                if err is not None:
+                    why = (f"the error at line {err.line} could not be cut "
+                           f"out as a hole that fits one canvas and the "
+                           f"model's context")
+                elif doubted:
+                    why = (f"the failure names no line of this file, and "
+                           f"the body the model was least sure of "
+                           f"(`{doubted}`) could not be cut out as a hole "
+                           f"that fits one canvas — the next attempt tries "
+                           f"the next one")
+                elif self.doubt.get(task.path):
+                    why = ("the failure names no line of this file, and "
+                           "every body the model doubted has been tried")
+                else:
+                    why = "the failure names no line of this file"
+                self._canvas_skip(task, attempt, why)
+                return None
+            # the same FUNCTION (or, for a window, the same error line) with
+            # the same error: the region's text changes every attempt, so
+            # it cannot be part of the key
+            key = (hole.kind, hole.name or str(hole.line),
+                   (err.message if err is not None else "doubt"))
+            tried = self._holes_tried.setdefault(task.path, set())
+            if key in tried:
+                self._emit("status",
+                           f"{task.path}: {hole.label} was rewritten already "
+                           f"and the same error came back — the fault is not "
+                           f"in those lines, so this attempt rewrites the "
+                           f"whole file",
+                           {"task": task.path, "attempt": attempt,
+                            "canvas": {"kind": "repeat",
+                                       "region": hole.label}})
+                self._canvas_skip(task, attempt,
+                                  f"{hole.label} was rewritten already and "
+                                  f"the same error came back — the fault is "
+                                  f"not in those lines")
+                return None
+            return self._canvas_repair(task, lang, code, hole, messages,
+                                       fits, caps, attempt, request,
+                                       autofixes, tried=(tried, key))
+        if pinned and lang == "python" and _is_pinned(code):
+            return self._canvas_bodies(task, persona, lang, code, messages,
+                                       fits, caps, attempt, request)
+        return None
+
+    def _canvas_repair(self, task: Task, lang: str, code: str, hole: Any,
+                       messages: Any, fits: Any, caps: ModelCapabilities,
+                       attempt: int, request: str, autofixes: Sequence[str],
+                       tried: tuple | None = None
+                       ) -> tuple[str, Completion, bool, list[Message]] | None:
+        view = cv.marked_view(code, hole, _comment_for(lang))
+        task_text = cv.repair_text(task.path, task.purpose, request,
+                                   autofixes)
+        blocks = [f"[THE FILE AS IT STANDS — {task.path}, the lines to "
+                  f"rewrite are marked]\n{view}", cv.hole_block(hole)]
+
+        def for_style(style: str) -> list[Message]:
+            return messages(task_text, blocks, cv.contract(hole, style),
+                            who=PERSONAS["repairer"])
+        plan = cv.requests_for(hole, for_style,
+                               max(1, int(self.config.canvas_candidates or 1)),
+                               seed=self.config.seed, attempt=attempt,
+                               count_tokens=self.host.llm.count_tokens,
+                               lang=lang)
+        if not plan or not fits(plan[0][2].messages, 1):
+            self._canvas_skip(
+                task, attempt,
+                f"no canvas could be planned for {hole.label}" if not plan
+                else f"the prompt for {hole.label} leaves no room for a "
+                     f"canvas in the model's context")
+            return None
+        why = ("its error is there" if hole.why == "located" else
+               "the failure names no line of this file, and the model was "
+               "least sure of this body when it wrote it")
+        self._emit("status",
+                   f"{task.path}: attempt {attempt} rewrites "
+                   f"{hole.label}{f' (`{hole.name}`)' if hole.name else ''} "
+                   f"as a hole — {why}; {len(plan)} canvas(es)",
+                   {"task": task.path, "attempt": attempt,
+                    "canvas": {"kind": "repair", "region": hole.label,
+                               "why": hole.why}})
+        cands: list[cv.Candidate] = []
+        for style, noise, req in plan:
+            self._check_cancel(f"a hole in {task.path}")
+            result = self.host.llm.canvas_fill(req, cancel=self.cancel)
+            if result.finish_reason == "cancelled":
+                return "", Completion(text="", finish_reason="cancelled",
+                                      model=result.model or caps.name), \
+                    False, list(req.messages)
+            cands.append(cv.judge(code, hole, style, noise, result, lang))
+        pick = cv.choose(cands)
+        self._journal_canvas(task, attempt, "repair", hole, cands, pick)
+        if pick is None:
+            reasons = "; ".join(sorted({c.problem for c in cands}))
+            self._emit("warning",
+                       f"{task.path}: no hole came back usable ({reasons}); "
+                       f"this attempt rewrites the whole file instead",
+                       {"task": task.path, "attempt": attempt})
+            return None
+        chosen = cands[pick]
+        if tried is not None:
+            # recorded only once a hole was KEPT: a hole that never came
+            # back usable has not been "rewritten already"
+            tried[0].add(tried[1])
+        self._via_canvas[task.path] = attempt
+        self._emit_canvas(task, attempt, hole, chosen)
+        if hole.kind == "body" and hole.name:
+            self.doubt.setdefault(task.path, {})[hole.name] = chosen.least
+        return chosen.code, self._canvas_completion(cands, chosen, caps), \
+            False, list(plan[pick][2].messages)
+
+    def _canvas_bodies(self, task: Task, persona: Persona, lang: str,
+                       code: str, messages: Any, fits: Any,
+                       caps: ModelCapabilities, attempt: int, request: str
+                       ) -> tuple[str, Completion, bool, list[Message]] | None:
+        holes = cv.stub_holes(code, task.path)
+        if not holes:
+            self._canvas_skip(task, attempt,
+                              "the file is pinned, but no stub body was "
+                              "found to write as a hole")
+            return None
+        names = [h.name for h in holes]
+        task_text = cv.stub_text(task.path, task.purpose, request)
+        # Will the first body fit at all — with room for the notes? Asked
+        # BEFORE the notes call, which is a whole generation to waste.
+        room = ["[IMPLEMENTATION NOTES]\n" + "note " * (cv.NOTES_CHARS // 5)]
+        first = messages(task_text, [
+            *room, f"[THE FILE BEING WRITTEN — {task.path}]\n"
+            f"{cv.marked_view(code, holes[0], _comment_for(lang))}",
+            cv.hole_block(holes[0])], cv.contract(holes[0], "open"))
+        if not fits(first, cv.OPEN_CANVASES_STUB):
+            self._canvas_skip(task, attempt,
+                              f"the first body's prompt leaves no room for "
+                              f"{cv.OPEN_CANVASES_STUB} canvases in the "
+                              f"model's context")
+            return None
+        notes = ""
+        if self.config.canvas_notes:
+            notes = self._canvas_notes(task, names, messages, attempt)
+        notes_block = ([f"[IMPLEMENTATION NOTES — planned before any body "
+                        f"was written]\n{notes}"] if notes else [])
+        self._emit("status",
+                   f"{task.path}: writing {len(names)} pinned bod"
+                   f"{'y' if len(names) == 1 else 'ies'} as holes; the "
+                   f"interface stays exactly as pinned"
+                   f"{' (notes planned first)' if notes else ''}",
+                   {"task": task.path, "attempt": attempt,
+                    "canvas": {"kind": "bodies", "functions": names}})
+        current = code
+        written: list[cv.Candidate] = []
+        failed: list[str] = []
+        sent: list[Message] = []
+        for i, name in enumerate(names):
+            self._check_cancel(f"the body of {name} in {task.path}")
+            hole = next((h for h in cv.stub_holes(current, task.path)
+                         if h.name == name), None)
+            if hole is None:
+                # not skipped silently: it is neither written nor tried,
+                # and the summary must name it
+                failed.append(name)
+                self._readable(task, attempt,
+                               f"`{name}` was not written as a hole — its "
+                               f"stub could not be found again after the "
+                               f"bodies before it were written")
+                continue
+            view = cv.marked_view(current, hole, _comment_for(lang))
+            msgs = messages(task_text, [
+                *notes_block,
+                f"[THE FILE BEING WRITTEN — {task.path}]\n{view}",
+                cv.hole_block(hole)], cv.contract(hole, "open"))
+            if not fits(msgs, cv.OPEN_CANVASES_STUB):
+                self._canvas_skip(task, attempt,
+                                  f"the prompt for `{name}` leaves no room "
+                                  f"for {cv.OPEN_CANVASES_STUB} canvases in "
+                                  f"the model's context ({len(written)} "
+                                  f"bod{'y' if len(written) == 1 else 'ies'}"
+                                  f" written before it are discarded)")
+                return None
+            sent = msgs
+            got = None
+            tries: list[cv.Candidate] = []
+            for k in range(2):         # a second seed when the first fails
+                seed = (None if self.config.seed is None
+                        else self.config.seed + 7919 * k + 31 * i)
+                result = self.host.llm.canvas_fill(CanvasRequest(
+                    messages=tuple(msgs), head=hole.head, seed=seed,
+                    max_canvases=cv.OPEN_CANVASES_STUB), cancel=self.cancel)
+                if result.finish_reason == "cancelled":
+                    return "", Completion(text="", finish_reason="cancelled",
+                                          model=result.model or caps.name), \
+                        False, msgs
+                cand = cv.judge(current, hole, "open", 1.0, result, lang)
+                tries.append(cand)
+                if cand.usable:
+                    got = cand
+                    break
+            self._journal_canvas(task, attempt, "body", hole, tries,
+                                 len(tries) - 1 if got else None)
+            if got is None:
+                failed.append(name)
+                continue
+            current = got.code
+            written.append(got)
+            self._emit_canvas(task, attempt, hole, got)
+            self.doubt.setdefault(task.path, {})[name] = got.least
+        if not written or len(failed) * 2 > len(names):
+            self._emit("warning",
+                       f"{task.path}: {len(failed)} of {len(names)} bodies "
+                       f"did not come back usable as holes; this attempt "
+                       f"writes the whole file instead",
+                       {"task": task.path, "attempt": attempt})
+            self._canvas_skip(task, attempt,
+                              f"{len(failed)} of {len(names)} bodies did "
+                              f"not come back usable as holes")
+            return None
+        if failed:
+            # Left as `raise NotImplementedError`: the tests fail THERE, at
+            # a located line, and the next attempt repairs exactly that hole.
+            self._emit("warning",
+                       f"{task.path}: {', '.join(f'`{n}`' for n in failed)} "
+                       f"not written yet — the tests will say so at its "
+                       f"line, and the next attempt fills it",
+                       {"task": task.path, "attempt": attempt})
+        self._readable(task, attempt,
+                       f"{len(written)} of {len(names)} pinned bod"
+                       f"{'y' if len(names) == 1 else 'ies'} written as "
+                       f"holes" + (f"; left as stubs for the tests to "
+                                   f"locate: {', '.join(failed)}"
+                                   if failed else ""))
+        self._via_canvas[task.path] = attempt
+        final = strip_stub_sentinel(current)
+        return final, self._canvas_completion(written, written[-1], caps,
+                                              text=final), False, sent
+
+    def _canvas_notes(self, task: Task, names: Sequence[str],
+                      messages: Any, attempt: int = 0) -> str:
+        """One ordinary call: plain notes on how each body works."""
+        msgs = messages(cv.notes_text(task.path, names), [],
+                        cv.NOTES_CONTRACT, who=personas.ENGINEER, diags="")
+        try:
+            completion = self._complete(msgs,
+                                        temperature=personas.ENGINEER.temperature)
+        except Exception as exc:                         # noqa: BLE001
+            self._readable(task, attempt, "no implementation notes — the "
+                           "planning call failed; bodies are written "
+                           "without them", details=[f"error: {exc}"])
+            return ""
+        if completion.finish_reason in ("error", "cancelled"):
+            self._readable(task, attempt, f"no implementation notes — the "
+                           f"planning call ended "
+                           f"({completion.finish_reason}); bodies are "
+                           f"written without them")
+            return ""
+        text = strip_think(completion.text or "").strip()
+        self._readable(
+            task, attempt,
+            f"implementation notes planned for {len(names)} bod"
+            f"{'y' if len(names) == 1 else 'ies'} before any was written"
+            + ("" if text else " — the model wrote none"),
+            details=[f"prefill {completion.prompt_ms} ms, decode "
+                     f"{getattr(completion, 'decode_ms', 0)} ms, "
+                     f"{len(text):,} characters"
+                     + (f" (the first {cv.NOTES_CHARS:,} are shown to "
+                        f"every body)" if len(text) > cv.NOTES_CHARS
+                        else "")],
+            blocks=[("the notes", text)])
+        if self.journal is not None:
+            self.journal.log("canvas", task=task.path, kind="notes",
+                             functions=list(names), chars=len(text),
+                             prompt_ms=completion.prompt_ms,
+                             model=completion.model)
+        return text[:cv.NOTES_CHARS]
+
+    def _canvas_completion(self, cands: Sequence[Any], chosen: Any,
+                           caps: ModelCapabilities, text: str = ""
+                           ) -> Completion:
+        """A Completion for the journal and the attempt record: what the
+        canvases cost, summed, and what they produced."""
+        results = [c.result for c in cands]
+        out = text or chosen.code
+        return Completion(
+            text=out, finish_reason="stop",
+            tokens_in=0, tokens_out=self.host.llm.count_tokens(out)
+            if out else 0,
+            model=chosen.result.model or caps.name,
+            prompt_ms=sum(int(r.prompt_ms or 0) for r in results),
+            decode_ms=sum(int(r.decode_ms or 0) for r in results))
+
+    def _journal_canvas(self, task: Task, attempt: int, kind: str, hole: Any,
+                        cands: Sequence[Any], pick: int | None) -> None:
+        self._log_canvas(task, attempt, kind, hole, cands, pick)
+        if self.journal is None:
+            return
+        self.journal.log("canvas", task=task.path, attempt=attempt,
+                         kind=kind, region=hole.label, hole=hole.kind,
+                         function=hole.name, line=hole.line, why=hole.why,
+                         candidates=[c.summary() for c in cands],
+                         chosen=pick)
+
+    def _log_canvas(self, task: Task, attempt: int, kind: str, hole: Any,
+                    cands: Sequence[Any], pick: int | None) -> None:
+        """Every canvas of one hole, in BUILD_LOG.txt: why this hole, what
+        each canvas cost and why any was rejected, and the kept lines with
+        how sure the model was of each."""
+        name = f" (`{hole.name}`)" if hole.name else ""
+        what = "rewrite" if kind == "repair" else "write"
+        if pick is not None:
+            outcome = f"kept canvas {pick + 1} of {len(cands)}"
+        else:
+            outcome = (f"none of {len(cands)} canvas(es) usable"
+                       + (" — this attempt writes the whole file"
+                          if kind == "repair" else ""))
+        if hole.kind == "stub":
+            why = (f"`{hole.name}` is a pinned stub: its body is written "
+                   f"with the signature held")
+        elif hole.why == "doubt":
+            why = ("the failure names no line of this file, and the model "
+                   "was least sure of this body when it wrote it")
+        else:
+            why = f"its error is at line {hole.line}"
+        details = [f"why this hole: {why}",
+                   *(f"canvas {i}: {c.describe()}"
+                     for i, c in enumerate(cands, 1))]
+        blocks: list[tuple[str, str]] = []
+        if kind == "repair" and hole.original.strip():
+            blocks.append(("the lines cut out", hole.original))
+        for i, c in enumerate(cands, 1):
+            if i - 1 == pick:
+                blocks.append((f"the hole as kept — {cv.DOUBT_LEGEND}",
+                               "\n".join(cv.doubt_rows(c))))
+            elif c.fill:
+                blocks.append((f"canvas {i} as it came back "
+                               f"({'usable, not chosen' if c.usable else 'rejected'})",
+                               c.fill))
+            elif (c.result.text or "").strip():
+                blocks.append((f"canvas {i}'s raw text (rejected)",
+                               c.result.text))
+        self._readable(task, attempt,
+                       f"{what} {hole.label}{name} as a hole — {outcome}",
+                       details=details, blocks=blocks)
+
+    def _canvas_skip(self, task: Task, attempt: int, why: str) -> None:
+        """Diffusion mode stepping aside for a whole-file attempt: said in
+        both logs, because a silent fallback is indistinguishable from a
+        diffusion mode that never ran."""
+        self._readable(task, attempt,
+                       f"no hole this attempt — {why}; the whole file is "
+                       f"written instead")
+        if self.journal is not None:
+            try:
+                self.journal.log("canvas", task=task.path, attempt=attempt,
+                                 kind="skip", reason=why)
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def _readable(self, task: Task, attempt: int, headline: str, *,
+                  details: Sequence[str] = (),
+                  blocks: Sequence[tuple[str, str]] = ()) -> None:
+        """One diffusion decision in BUILD_LOG.txt. Never fails a build."""
+        write = getattr(getattr(self, "log", None), "diffusion", None)
+        if write is None:
+            return
+        try:
+            write(task.path, attempt, headline, details=details,
+                  blocks=blocks)
+        except Exception:                                # noqa: BLE001
+            pass          # a log must never fail a build
+
+    def _emit_canvas(self, task: Task, attempt: int, hole: Any,
+                     chosen: Any) -> None:
+        """The kept hole, with how sure the model was of each line — what a
+        host draws to colour the code by confidence."""
+        r = chosen.result
+        lead = cv._edge_blanks(hole.original)[0].count("\n")
+        self._emit("status",
+                   f"{task.path}: {hole.label}"
+                   f"{f' (`{hole.name}`)' if hole.name else ''} filled — "
+                   f"{chosen.style} canvas, {r.steps} step(s), the model "
+                   f"{chosen.mean:.0%} sure on average",
+                   {"task": task.path, "attempt": attempt,
+                    "canvas": {"kind": hole.kind, "region": hole.label,
+                               "first_line": hole.start + 1 + lead,
+                               "function": hole.name,
+                               "style": chosen.style, "noise": chosen.noise,
+                               "steps": r.steps, "seed": r.seed,
+                               "lines": cv.doubt_html_lines(chosen),
+                               # None: a line past the readout (unknown)
+                               "line_confidence": [
+                                   c if c == c else None
+                                   for c in chosen.confidence],
+                               "line_flips": list(chosen.flips)}})
 
     def _fit_to_context(self, messages: list[Message],
                         caps: ModelCapabilities, task: Task, attempt: int,
@@ -1428,6 +1943,7 @@ class Loop:
         #: deliberately does not keep: the code itself. The snapshots hold
         #: every version, but reading a build means following the attempts
         #: in order, and that is a different job from restoring one.
+        canvas = self._via_canvas.get(task.path) == n
         log = getattr(self, "log", None)
         if log is not None:
             try:
@@ -1439,7 +1955,9 @@ class Loop:
                     tokens_out=completion.tokens_out,
                     prompt_ms=completion.prompt_ms,
                     decode_ms=getattr(completion, "decode_ms", 0),
-                    text=completion.text)
+                    text=completion.text,
+                    via=("diffusion canvases (each one is logged above)"
+                         if canvas else ""))
             except Exception:                            # noqa: BLE001
                 pass
         self.journal.generation(
@@ -1447,7 +1965,8 @@ class Loop:
             provider=getattr(self.host.llm, "name", "host"),
             completion=completion, prompt=list(sent) or task.purpose,
             temperature=self.config.temperature, seed=self.config.seed,
-            verify=verify, remote=remote)
+            verify=verify, remote=remote,
+            **({"via": "canvas"} if canvas else {}))
 
     def _emit(self, kind: str, message: str, data: dict | None = None) -> None:
         self.host.emit(kind, message, data)

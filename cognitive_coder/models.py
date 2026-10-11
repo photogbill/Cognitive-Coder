@@ -31,6 +31,11 @@ CODING_MARKERS: tuple[str, ...] = (
     "magicoder", "opencoder", "stable-code", "yi-coder", "seed-coder",
     "codeqwen", "qwen2.5-coder", "qwen3-coder", "glm-4-code", "codegeex",
     "replit-code", "santacoder", "phi-4", "nxcode", "autocoder",
+    # Not a code specialist by name, but its own report measures it as one
+    # (HumanEval 94.5, LiveCodeBench v6 69.1 with thinking), and the engine
+    # has a mode built for it (canvas.py). Unrecognised, every build with it
+    # opened with "expect more attempts".
+    "diffusiongemma", "diffusion-gemma", "diffusion_gemma",
 )
 
 #: Substrings that mean "trained for something else entirely".

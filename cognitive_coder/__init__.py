@@ -83,6 +83,7 @@ from .ports import (
                AutoApprove,
                Cancel,
                CancelToken,
+               CanvasLLM,
                DenyAll,
                EventPort,
                ExecPort,
@@ -103,6 +104,8 @@ from .ports import (
 from .providers import RemoteGate, available_providers, make_provider
 from .redact import Budget, RedactionReport
 from .session import Session, SessionConfig
+from .debugrepair import DebugReport, DebugResult, DebugRound
+from .debugrepair import history as debug_history
 from .skills import SKILLS_DIR, STARTER_SKILLS, Skill, SkillLoad, load_skills
 
 # -- the contract (§5) -----------------------------------------------------
@@ -112,6 +115,8 @@ from .types import (
                JOURNAL_EVENTS,
                ROLES,
                AttemptRecord,
+               CanvasRequest,
+               CanvasResult,
                CodemapStats,
                Completion,
                Diagnostic,
@@ -146,10 +151,12 @@ __all__ = [
     "ProcResult", "Diagnostic", "GuardFinding", "PhaseResult", "RunResult",
     "Task", "Plan", "Edit", "EditResult", "TransactionRecord", "Symbol",
     "CodemapStats", "JournalEvent", "AttemptRecord", "TaskOutcome",
+    "CanvasRequest", "CanvasResult",
     "ROLES", "FINISH_REASONS", "EVENT_KINDS", "JOURNAL_EVENTS",
     # ports — the other half
     "LLMPort", "FileSystemPort", "ExecPort", "StoragePort", "EventPort",
     "ApprovalPort", "CancelToken", "Cancel", "NeverCancelled", "Host",
+    "CanvasLLM",
     # null implementations, so the engine runs hostless (M20)
     "NullLLM", "ScriptedLLM", "MemoryFileSystem", "LocalFileSystem",
     "SubprocessExec", "MemoryStorage", "SilentEvents", "RecordingEvents",
@@ -164,6 +171,8 @@ __all__ = [
     "detect_commentary", "strip_commentary", "strip_think",
     "Session", "SessionConfig", "RemoteGate", "make_provider",
     "available_providers",
+    # Debug & Repair: the operator's own run, fed back (debugrepair.py)
+    "DebugReport", "DebugResult", "DebugRound", "debug_history",
     # deployed skills (F3)
     "Skill", "SkillLoad", "load_skills", "SKILLS_DIR", "STARTER_SKILLS",
     # the audit: review an existing project, report, plan the fix

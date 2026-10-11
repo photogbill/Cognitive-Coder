@@ -124,6 +124,27 @@ class SessionConfig:
     build_timeout: float | None = None
     run_timeout: float | None = None
     test_timeout: float | None = None
+    #: DIFFUSION MODE (docs/DIFFUSION_MODE.md). "auto": when the loaded model
+    #: fills a canvas (DiffusionGemma behind a host that says so), repairs
+    #: rewrite the hole the error is in and pinned files are written body by
+    #: body with every signature held; "off": the whole-file path always.
+    #: Nothing changes for a model that cannot fill a canvas.
+    diffusion: str = "auto"
+    #: Canvases per repair attempt (the best usable one goes to the tests).
+    diffusion_candidates: int = 2
+    #: Plan a pinned file's bodies in plain notes before writing them.
+    diffusion_notes: bool = True
+    #: THE REQUEST'S HARD REQUIREMENTS (constraints.py): the sentences with
+    #: MUST / NEVER / DO NOT, word for word, pinned in every prompt's cached
+    #: prefix for the whole session.
+    pin_constraints: bool = True
+    #: THE MUTATION CHECK (mutation.py), after a build: deliberate bugs put
+    #: into a COPY of each verified Python module, its tests run against
+    #: each; a bug the tests do not notice is reported as a WARNING. Never
+    #: changes the project or the verdict.
+    mutation_check: bool = True
+    mutation_max: int = 5                # mutants per file
+    mutation_budget_s: float = 120.0     # for the whole check
 
 
 class Session:
@@ -192,7 +213,10 @@ class Session:
                 wall_clock_s=self.config.per_task_s,
                 timeouts=Timeouts(build=self.config.build_timeout,
                                   run=self.config.run_timeout,
-                                  test=self.config.test_timeout)))
+                                  test=self.config.test_timeout),
+                canvas=self.config.diffusion,
+                canvas_candidates=self.config.diffusion_candidates,
+                canvas_notes=self.config.diffusion_notes))
         #: The readable log is the Loop's too — it is where the verify
         #: phases happen, and their output is the whole point of the file.
         self.loop.log = self.log
@@ -210,6 +234,10 @@ class Session:
         #: What `Planner.skeleton` returned: files, pinned, fallback, note.
         self.skeleton_result: dict = {}
         self.last_review: Any = None
+        #: The hard requirements pinned this session (constraints.py).
+        self.constraints: Any = None
+        #: One MutationReport per checked file (mutation.py).
+        self.mutation: list = []
         self._model: str = ""
         self._context: int = 0
         self._started = 0.0
@@ -254,7 +282,9 @@ class Session:
                         "temperature": self.config.temperature,
                         "max_tokens": self.config.max_tokens,
                         "max_files": self.config.max_files,
-                        "lang": self.config.lang})
+                        "lang": self.config.lang,
+                        "diffusion": self._diffusion_state(caps)})
+        self._pin_constraints(request, source="the request")
         self._git_warning()
 
         stats = self.codemap.index_project()
@@ -733,7 +763,11 @@ class Session:
                            "allow_any_model is set.",
                            {"phase": "model_check", "model": caps.name,
                             "verdict": verdict.verdict, "refused": False})
-        elif verdict.verdict == "unknown":
+        elif verdict.verdict == "unknown" and not getattr(
+                caps, "supports_canvas", False):
+            # A model that fills a canvas is DiffusionGemma by what it DOES,
+            # whatever its file is called (Bill's stock file is
+            # `Dg_Rc0P1_Patched`); the host knows it from the architecture.
             self.host.emit("warning", verdict.reason,
                            {"phase": "model_check", "model": caps.name,
                             "verdict": verdict.verdict})
@@ -741,6 +775,41 @@ class Session:
             self.host.emit("warning", verdict.context_note,
                            {"phase": "model_check", "model": caps.name,
                             "context_tokens": caps.context_tokens})
+        # DIFFUSION MODE is decided by the model, so it is said here, once,
+        # where the operator reads what this build will be.
+        canvas = bool(getattr(caps, "supports_canvas", False))
+        if canvas and str(self.config.diffusion).lower() != "off":
+            self.host.emit("status",
+                           "diffusion mode: this model fills a canvas, so "
+                           "a repair rewrites only the lines its error is "
+                           "in, and a file whose interface was pinned is "
+                           "written one body at a time",
+                           {"phase": "model_check", "model": caps.name,
+                            "diffusion": True})
+        elif canvas:
+            self.host.emit("status",
+                           "diffusion mode is off for this session: whole "
+                           "files, as with any model",
+                           {"phase": "model_check", "model": caps.name,
+                            "diffusion": False})
+
+    def _diffusion_state(self, caps: Any) -> str:
+        """For the build log's config line: whether this build can cut
+        holes, and if not, why not."""
+        try:
+            if not bool(getattr(caps, "supports_canvas", False)):
+                return "unavailable (the model fills no canvas)"
+            if str(self.config.diffusion).lower() == "off":
+                return "off (switched off for this session)"
+            from . import canvas as cv
+            # what the loop will actually ask for: the schedule caps it
+            n = min(max(1, int(self.config.diffusion_candidates or 1)),
+                    len(cv.REPAIR_SCHEDULE))
+            return (f"on ({n} canvas(es) per repair, notes "
+                    f"{'on' if self.config.diffusion_notes else 'off'})")
+        except Exception as exc:                         # noqa: BLE001
+            # a log line must never stop a session from starting
+            return f"unknown ({type(exc).__name__}: {exc})"
 
     def _count_earlier_sessions(self) -> int:
         """How many builds the folder's log already records. Read BEFORE
@@ -1004,6 +1073,177 @@ class Session:
             final[o.path] = o
         return list(final.values())
 
+    def _pin_constraints(self, text: str, *, source: str) -> None:
+        """Take the hard requirements out of `text` and pin them in every
+        prompt from here on — said in the log either way."""
+        if not self.config.pin_constraints:
+            self.log.line("  requirements  not pinned (switched off)")
+            return
+        from . import constraints as constraints_mod
+        found = constraints_mod.extract(text or "")
+        self.constraints = found
+        self.prompts.constraints = found.block()
+        self.journal.log("constraints", source=source, items=found.items,
+                         more=found.more)
+        if not found.items:
+            self.log.line(f"  requirements  none found in {source} (no "
+                          f"MUST / NEVER / DO NOT sentence)")
+            return
+        self.log.rule(f"HARD REQUIREMENTS — from {source}, pinned in "
+                      f"every prompt")
+        for item in found.items:
+            self.log.line(f"  - {item}")
+        if found.more:
+            self.log.line(f"  … and {found.more} more, not pinned (the "
+                          f"first {constraints_mod.MAX_CONSTRAINTS} are)")
+        self.host.emit("status",
+                       f"{len(found.items)} hard requirement"
+                       f"{'' if len(found.items) == 1 else 's'} from "
+                       f"{source} pinned in every prompt",
+                       {"phase": "constraints", "items": found.items})
+
+    def _mutation_check(self) -> None:
+        """Deliberate bugs in a copy of each verified Python module: do
+        its tests notice? Survivors are WARNINGS (mutation.py)."""
+        from . import mutation
+        from .ports import LocalFileSystem
+        fs = self.host.fs
+        deadline = time.monotonic() + float(self.config.mutation_budget_s
+                                            or 0)
+        header = False
+        for o in self._final_outcomes():
+            if (not o.ok or o.path in self.loop.unverified
+                    or _looks_like_test(o.path)
+                    or langs.id_for_path(o.path) != "python"):
+                continue
+            task = (self.plan.task(o.task_id.removesuffix("-fix"))
+                    if self.plan else None)
+            test_path = task.test_path if task else ""
+            if not test_path or not fs.exists(test_path):
+                continue
+            if not header:
+                self.log.rule("MUTATION CHECK — do the tests notice a "
+                              "deliberate bug?")
+                header = True
+            if time.monotonic() > deadline:
+                self.log.line(f"  {o.path}: not checked — the time for "
+                              f"the check ran out")
+                continue
+            self._where = f"the mutation check of {o.path}"
+            stem = o.path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+            def run_tests(**kw: Any) -> Any:
+                return runner.run_tests("python", stem=stem, **kw)
+
+            try:
+                rep = mutation.check(
+                    fs=fs, ex=self.host.exec, make_fs=LocalFileSystem,
+                    run_tests=run_tests, path=o.path, test_path=test_path,
+                    code=fs.read(o.path),
+                    max_mutants=int(self.config.mutation_max or 0),
+                    deadline=deadline, timeout=self.config.test_timeout,
+                    cancel=self.cancel_token)
+            except Cancelled:
+                raise
+            except Exception as exc:                      # noqa: BLE001
+                rep = mutation.MutationReport(o.path, test_path,
+                                              note=f"the check failed: "
+                                                   f"{exc}")
+            self.mutation.append(rep)
+            self.log.event(f"MUTATION {o.path}", rep.line())
+            for m, killed in rep.tried:
+                self.log.line(f"  line {m.line} {m.what}: "
+                              f"{'caught' if killed else 'NOT CAUGHT'}")
+            self.journal.log("mutation", task=o.path, test=test_path,
+                             tried=len(rep.tried), killed=rep.killed,
+                             survived=[{"line": m.line, "change": m.what}
+                                       for m in rep.survivors],
+                             note=rep.note)
+            if rep.survivors:
+                self.host.emit("warning", rep.line(),
+                               {"phase": "mutation", "task": o.path})
+            else:
+                self.host.emit("status", rep.line(),
+                               {"phase": "mutation", "task": o.path})
+
+    def debug(self, report: Any) -> Any:
+        """DEBUG & REPAIR (debugrepair.py): the operator ran the program,
+        it failed, and this is what they saw — the error, the command, a
+        description, the file. Locate, repair through the ordinary loop,
+        run their command again to confirm, record every round.
+
+        A session of its own: started, logged and ended like a build, so
+        BUILD_LOG.txt and the journal hold it in order with the builds.
+        Returns a `DebugResult` and never raises: a stop, a refused model or
+        an unexpected failure is a result ("stopped", "error") with its
+        sentence, recorded like any other.
+        """
+        from . import debugrepair
+        self._started = time.monotonic()
+        self._where = "debug & repair"
+        said = report.description or report.error_text or report.command
+        result = None
+        try:
+            caps = self._capabilities(boundary="session start")
+            self.journal.log("session_start", request=f"DEBUG: {said[:500]}",
+                             model=caps.name, session=self.id, profile={},
+                             config={"attempts": self.config.attempts,
+                                     "lang": self.config.lang,
+                                     "debug": {"command": report.command,
+                                               "files": list(report.files),
+                                               "rounds": report.rounds}})
+            self._check_model(caps)
+            self.log.start("DEBUG & REPAIR\n" + debugrepair.clip(said, 1500),
+                           caps.name,
+                           {"attempts": self.config.attempts,
+                            "temperature": self.config.temperature,
+                            "max_tokens": self.config.max_tokens,
+                            "lang": self.config.lang,
+                            "diffusion": self._diffusion_state(caps)})
+            # a repair keeps the requirements the project was built to: the
+            # spec ATK saved beside it, when there is one
+            try:
+                spec = (self.host.fs.read("BUILD_SPEC.md")
+                        if self.host.fs.exists("BUILD_SPEC.md") else "")
+            except Exception:                             # noqa: BLE001
+                spec = ""
+            if spec:
+                self._pin_constraints(spec, source="BUILD_SPEC.md")
+            try:
+                stats = self.codemap.index_project()
+                self.journal.log("codemap", files=stats.files,
+                                 symbols=stats.symbols, edges=stats.edges,
+                                 unresolved=stats.unresolved,
+                                 resolution=round(stats.resolution_rate, 3))
+            except Exception as exc:                      # noqa: BLE001
+                self.host.emit("warning", f"the project could not be "
+                                          f"indexed ({exc}); debugging "
+                                          f"without the code map")
+            result = debugrepair.run(self, report)
+        except Exception as exc:                          # noqa: BLE001
+            # Never raised to the host: a model that is not a coding model,
+            # an exhausted budget, a port that failed — each is a RESULT
+            # with its sentence, journaled and recorded like any other, so
+            # the host's result box never stays at "working on it".
+            wrapped = (exc if isinstance(exc, CognitiveCoderError) else
+                       CognitiveCoderError.wrap(
+                           exc, self._unexpected_sentence(exc)))
+            self._report_failure(wrapped)
+            result = debugrepair.DebugResult("error", str(wrapped))
+            try:
+                debugrepair._finish(self, report, result, {})
+            except Exception:                             # noqa: BLE001
+                pass
+        self.journal.log("session_end", ok=result.state in ("fixed",
+                                                            "repaired"),
+                         files=sorted(result.diffs), failed=[],
+                         unverified=[], untested=[],
+                         seconds=round(time.monotonic() - self._started, 1),
+                         debug=result.state)
+        self.log.close(result.verdict)
+        self._finished = True
+        return result
+
     def run(self, request: str = "", profile: dict | None = None
             ) -> list[TaskOutcome]:
         """Plan and build everything. The one-call path for a CLI.
@@ -1077,6 +1317,13 @@ class Session:
             # not instead — and not at all if the session was cancelled or
             # ran out of budget, because a review of half-finished work
             # reads as authoritative and is not.
+            if self.config.mutation_check and any(o.ok
+                                                  for o in self.outcomes):
+                self._where = "the mutation check"
+                try:
+                    self._mutation_check()
+                except Cancelled:
+                    self.journal.log("cancel", where="mutation check")
             if self.config.review_after_build and any(o.ok
                                                       for o in self.outcomes):
                 self._where = "the review"
@@ -1463,6 +1710,11 @@ class Session:
             lines.append(f"[tests]     {len(untested)} of {len(built)} "
                          f"file(s) have no tests — built and run, not "
                          f"tested: {', '.join(untested)}")
+        for rep in self.mutation:
+            lines.append(f"[mutation]  {rep.line()}")
+        if self.constraints is not None and self.constraints.items:
+            lines.append(f"[pinned]    {len(self.constraints.items)} hard "
+                         f"requirement(s) in every prompt")
         lines.append(f"[codemap]   {self.codemap.stats().one_line()}")
         lines.append(f"[journal]   {self.journal.summary()}")
         # Every snapshot after the first is a planned full read of the

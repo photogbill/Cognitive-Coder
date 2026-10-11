@@ -41,7 +41,15 @@ import threading
 import time
 from typing import Any, Protocol, runtime_checkable
 
-from .types import Completion, Message, ModelCapabilities, ProcResult, ToolSpec
+from .types import (
+    CanvasRequest,
+    CanvasResult,
+    Completion,
+    Message,
+    ModelCapabilities,
+    ProcResult,
+    ToolSpec,
+)
 
 # How SubprocessExec keeps a child's output, per stream: the first HEAD bytes
 # and a rolling window of the last TAIL, with the gap stated. Both ends,
@@ -178,6 +186,42 @@ class LLMPort(Protocol):
 
         Tokenizer dependencies (`mistral-common`, `tiktoken`, …) live in the
         HOST or the provider, never in the core (M14, §10.3).
+        """
+        ...
+
+
+@runtime_checkable
+class CanvasLLM(Protocol):
+    """OPTIONAL, beside `LLMPort`: a model that fills a laid-out canvas.
+
+    A diffusion model (DiffusionGemma) writes a whole block of its reply at
+    once and can be told to keep some of it fixed. A host whose loaded model
+    can do that sets `ModelCapabilities.supports_canvas` and implements this
+    one method on the SAME object as its `LLMPort`; the core then repairs
+    and writes by holes (`canvas.py`). Nothing else changes for a host that
+    does not — it never sees a call, exactly like `ExecPort.ensure_packages`.
+    """
+
+    def canvas_fill(self, request: CanvasRequest, *,
+                    cancel: CancelToken | None = None) -> CanvasResult:
+        """Fill the free region of one laid-out canvas.
+
+        *A host may assume*: ``request.head`` and ``request.tail`` are whole
+        lines; the core will not call this concurrently on one instance, and
+        calls it only while `capabilities().supports_canvas` is True.
+
+        *A host must guarantee*:
+
+        1. **This MUST NOT raise** (as M11 for `complete`). A model or
+           server failure, a request that does not fit one canvas, a Stop —
+           each comes back as a `CanvasResult` with ``finish_reason``
+           "error" (and an ``error`` sentence) or "cancelled". The core
+           falls back to the whole-file path on any of them.
+        2. The held text is held: the model's reply starts with ``head``
+           and, when ``tail`` is given, continues with ``tail`` right after
+           the free region. ``text`` is the free region only.
+        3. Generation-wise the request is a non-thinking reply: the free
+           region starts at the very first position of the reply.
         """
         ...
 

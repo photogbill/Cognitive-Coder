@@ -378,17 +378,46 @@ class SessionLog:
 
     def generation(self, task: str, attempt: int, *, temperature: float,
                    seed: Any, tokens_in: int, tokens_out: int,
-                   prompt_ms: int, decode_ms: int, text: str = "") -> None:
+                   prompt_ms: int, decode_ms: int, text: str = "",
+                   via: str = "") -> None:
+        """One attempt's code. ``via`` names a path that did not sample at
+        ``temperature`` (diffusion canvases): printing a temperature and a
+        seed that were never used would send a reader after the wrong knob.
+        """
         with self._batch():
             rate = (round(tokens_out / (decode_ms / 1000), 1)
                     if decode_ms > 0 and tokens_out else 0)
             self.line()
             self.event(f"generate {task}", f"attempt {attempt}")
-            self.line(f"  temperature={temperature} seed={seed} "
+            knobs = (f"via {via}:" if via else
+                     f"temperature={temperature} seed={seed}")
+            self.line(f"  {knobs} "
                       f"in={tokens_in} out={tokens_out} "
                       f"prefill={prompt_ms}ms decode={decode_ms}ms"
                       + (f" ({rate} tok/s)" if rate else ""))
             self.block("produced", text)
+
+    def diffusion(self, task: str, attempt: int, headline: str, *,
+                  details: Sequence[str] = (),
+                  blocks: Sequence[tuple[str, str]] = ()) -> None:
+        """One diffusion-mode decision, in words a reader can follow.
+
+        Bill, 2026-10-10: comprehensive logging is a rule for anything in
+        development. Until this, a canvas repair reached this file only as
+        the finished file, under a `generate` line naming a temperature it
+        never used. Which lines were cut out and why, every canvas tried
+        and why each was rejected, how sure the model was of each kept
+        line, and every time diffusion mode stepped aside for a whole-file
+        rewrite — all of that went to the JSONL as numbers, or nowhere.
+        """
+        with self._batch():
+            self.line()
+            self.event(f"diffusion {task}",
+                       f"attempt {attempt}: {headline}")
+            for row in details:
+                self.line(f"  {row}")
+            for title, body in blocks:
+                self.block(title, body)
 
     def close(self, summary: str) -> None:
         with self._batch():

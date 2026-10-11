@@ -451,6 +451,10 @@ class PromptBuilder:
     model_system_prompt: str = ""
     conventions: str = ""
     profile: dict = field(default_factory=dict)
+    #: The request's hard requirements (constraints.py), word for word —
+    #: set once at session start, before the first prompt, and fixed for
+    #: the session like the conventions, so the prefix cache holds.
+    constraints: str = ""
 
     # -- the stable half --------------------------------------------------
     def prefix_for(self, persona: Persona, *, architecture: str = "",
@@ -475,6 +479,8 @@ class PromptBuilder:
         parts = []
         if self.conventions:
             parts.append("[PROJECT CONVENTIONS]\n" + self.conventions)
+        if self.constraints:
+            parts.append(self.constraints)
         if architecture:
             parts.append("[EXECUTION CONSTRAINTS]\n"
                          "This is the project you are working in. Do not "

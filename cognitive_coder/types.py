@@ -63,7 +63,8 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "autofix", "patch", "rollback", "codemap", "review",
                   "budget", "cancel", "epoch", "error", "skills",
                   "blocked", "audit", "model_check", "baseline",
-                  "interfaces")
+                  "interfaces", "canvas", "debug", "constraints",
+                  "mutation")
 
 
 # --------------------------------------------------------------------------
@@ -205,6 +206,13 @@ class ModelCapabilities:
     supports_fim: bool = False   # fill-in-the-middle (G.4)
     is_remote: bool = False      # drives the C3 network banner
     token_count_is_estimate: bool = True
+    #: The model fills a CANVAS: a diffusion model (DiffusionGemma) that
+    #: writes a block of the reply at once, around lines the core holds
+    #: fixed. A host that says True also answers `canvas_fill` (see
+    #: `ports.CanvasLLM`), and the loop repairs by HOLES instead of whole
+    #: files (`canvas.py`, docs/DIFFUSION_MODE.md). Defaulted: a minor
+    #: version, and every existing host keeps today's path.
+    supports_canvas: bool = False
 
     @property
     def loaded(self) -> bool:
@@ -214,6 +222,80 @@ class ModelCapabilities:
         than by raising, so the core can say so plainly instead of catching.
         """
         return bool(self.name)
+
+
+@dataclass(frozen=True)
+class CanvasRequest:
+    """One canvas, laid out by the core and filled by a diffusion model.
+
+    The reply the model writes starts with ``head``, held fixed (whole lines,
+    so the hole begins at a line boundary). After it comes the FREE region,
+    the only part the model writes. Then, when ``tail`` is given, ``tail`` is
+    held fixed right after the free region and the reply ends there: the
+    model writes the hole SEEING the code on both sides of it. With no
+    ``tail`` the free region runs on until the model ends its reply ("open"),
+    and the code that follows the hole is shown only in the prompt.
+
+    ``seed_text`` is what the free region STARTS as (a warm start: the lines
+    being repaired); ``noise`` is the fraction of it scrambled before the
+    first step, and also how far along the denoising path the model starts —
+    1.0 is from noise, 0.5 keeps about half the draft and lets the model's
+    own uncertainty decide what changes, 0.0 is a single reading of the
+    draft. With a ``tail`` and no ``seed_text``, ``slack`` alone sets the
+    free region's size; with both, the region is the seed's length plus
+    ``slack`` (blank lines pad what is not needed — legal in every language
+    the engine builds, and stripped before the code is used).
+
+    The HOST turns text into canvas positions (tokens are its business, M14)
+    and answers a request that does not fit one canvas with an error, never
+    a truncated hole.
+    """
+    messages: tuple[Message, ...]
+    head: str
+    seed_text: str = ""
+    tail: str = ""
+    noise: float = 1.0
+    slack: int = 16
+    seed: int | None = None
+    #: Canvases the reply may run to. Only an OPEN request (no tail) can use
+    #: more than one; the confidence readout covers the first.
+    max_canvases: int = 1
+
+
+@dataclass(frozen=True)
+class CanvasResult:
+    """What ``canvas_fill`` returns. Like `Completion`, never an exception.
+
+    ``text`` is the FREE region only — never the held head or tail.
+    ``line_confidence`` has one value per line of ``text`` (``text.count
+    ("\n") + 1`` of them; fewer when an open reply ran past the first
+    canvas, which is the only one read out): the least certain token on
+    that line, as exp(-entropy), so 1.0 is certain. ``line_flips`` is, per line, the most
+    times any token on it changed its best guess while the canvas settled — a
+    word that changed three times was contested. Both are empty when the host
+    cannot read them.
+    """
+    text: str = ""
+    finish_reason: str = "stop"      # stop | length | cancelled | error
+    error: str = ""
+    model: str = ""
+    line_confidence: tuple[float, ...] = ()
+    line_flips: tuple[int, ...] = ()
+    steps: int = 0
+    seed: int | None = None
+    prompt_ms: int = 0
+    decode_ms: int = 0
+    #: prompt tokens the server reused from its prefix cache (0 = none/unknown)
+    cached_tokens: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.finish_reason == "stop" and not self.error
+
+    @property
+    def mean_confidence(self) -> float:
+        c = [x for x in self.line_confidence if x == x]
+        return sum(c) / len(c) if c else 0.0
 
 
 # --------------------------------------------------------------------------

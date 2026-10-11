@@ -10,6 +10,206 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — Debug & Repair, the mutation check, the pinned requirements (2026-10-10, night)
+
+**Debug & Repair** (`debugrepair.py`, `Session.debug`). Bill: *"if I can
+try running it myself on my own and then feed the errors back into
+cognitive coder … a codebase debug / repair tab"*. A `DebugReport` carries
+any of: the error text as printed, the command that was run, a description
+in words, the file(s). The session LOCATES the fault (the parser every
+build uses; the deepest frame in THIS project, made relative; otherwise ONE
+model call naming at most three files from the project's list — an
+invented name is dropped — with `confirm_targets` stopping there with the
+proposal), REPAIRS each file through the ordinary `Loop.run_task(seed=…,
+baseline=…)` (same attempts, verification, transaction, snapshots and
+approval as a build; a no-change "repair" stops at once), CONFIRMS by
+running the operator's command again (a program still running at the
+timeout with no error counts as clean, and says so; the same error back is
+a failed round, a different one drives the next, up to `rounds`), and
+RECORDS every round: BUILD_LOG.txt in words, `debug` journal events,
+`.cc_state/debug/<session>.md` with each file's diff, and
+`.cc_state/debug/history.jsonl`. States: fixed, repaired (unconfirmed — no
+command), still-failing, no-change, nothing-to-repair, located, not-located,
+stopped. A debug session also pins the requirements of the project's
+BUILD_SPEC.md (below). Public: `DebugReport`, `DebugResult`, `DebugRound`,
+`debug_history`.
+
+**The mutation check** (`mutation.py`, `SessionConfig.mutation_check`, on).
+"Verified" means the tests passed, not that they would fail on wrong code —
+and a small model writing both is where they might not. After a build, up
+to `mutation_max` deliberate bugs (`<`→`>=`, `==`→`!=`, `+`→`-`,
+`and`→`or`, a returned constant changed) go into a COPY of each verified
+Python module under `.cc_state/mutants/`, its own test file runs against
+each, and a bug the tests do not notice is a WARNING with the line and the
+change ("may not check" — an equivalent mutant is possible). The control
+run must pass in the copy first, or the check says it cannot judge. Never
+changes the project or the verdict; bounded by `mutation_budget_s`; `[mutation]`
+lines in the report, `mutation` journal events, every mutant in the log.
+
+**The pinned requirements** (`constraints.py`, `SessionConfig.pin_constraints`,
+on). The request's MUST / NEVER / DO NOT sentences are taken out ONCE, by
+rule, word for word (never paraphrased; code blocks skipped; at most 15,
+the rest counted), and pinned in the cached prefix of every prompt for the
+session, after the conventions (`PromptBuilder.constraints`) — so the sixth
+file's repair still sees "do not add dependencies". Logged as HARD
+REQUIREMENTS; `constraints` journal event (the golden trace gains it,
+read and re-written).
+
+**Fixed before it shipped — an independent review of Debug & Repair found
+ten defects, five serious, each now a test:** the locate step listed
+`**/*`, which misses every top-level file (`main.py`) and filled its cap
+with the project's `.venv` (now `*`, with venv / node_modules / build
+output left out BEFORE the cap; the mutation check's copy had the same
+bug); a run that was already clean BEFORE the repair was reported "fixed"
+afterwards (now a confirming run counts only when a run here showed the
+problem first; otherwise "repaired — running it here cannot confirm");
+a command that could not start (`main.py` alone, `npm` on Windows, `cd … &&`)
+was treated as the program's error and files were rewritten for it (now
+`command-failed`, with the reason, and shell features are refused before
+anything runs); an assertion failing inside a TEST file made the test the
+target and the model bent it (now a failing test points at the module it
+tests — by name and by its imports — and is never rewritten unless named);
+a program waiting for keyboard input, or still running at the timeout with
+nothing built to keep running, was judged fixed (now "needs input" /
+"may hang" — unconfirmed; a game or GUI anywhere in the project still counts
+as running cleanly); a question or a stop in a later round lost the record
+of earlier rounds (one result throughout; diffs computed on every way out);
+`Session.debug` raised on a refused model or an exhausted budget (now a
+result, journaled and recorded); locating used the build's language box
+(now every parser); a failed repair left the model's broken attempt in the
+operator's file (debug tasks are atomic — put back as it was); "the same
+error" compared line numbers and object addresses. Windows' own argument
+splitting (CommandLineToArgvW) for the command.
+
+Tests: `test_debugrepair` (16), `test_mutation_constraints` (10), the
+golden trace re-written for the new `constraints` event. Whole suite on the
+Linux VM: 1241 pass, 20 skipped, the same 3 baseline failures.
+
+### Added — every diffusion decision in BUILD_LOG.txt (2026-10-10, evening)
+
+Bill: comprehensive logging *"really should be a rule for anything during
+development"*. Diffusion mode reached BUILD_LOG.txt only as the finished
+file, under a `generate` line naming a temperature it never sampled at;
+what it decided went to the JSONL as numbers, or nowhere. Now the readable
+log says, per hole:
+
+- **which lines and why** — `diffusion src/calc.py — attempt 1: rewrite
+  lines 3-4 (`add`) as a hole — kept canvas 1 of 2`, then `why this hole:
+  its error is at line 3` (or: the model was least sure of this body; or:
+  a pinned stub, signature held);
+- **every canvas** — style, noise, seed, steps, prefill (and how many prompt
+  tokens came from the server's cache), decode, and *usable: 85% sure on
+  average, least sure line 61%* or *REJECTED:* with the exact reason;
+- **the lines cut out**, **the hole as kept** with a confidence column per
+  line (`?` under 50 %, `~` under 85 %, `--` not read back — searchable,
+  since a text file cannot be coloured), and each rejected canvas as it came
+  back;
+- **every time diffusion mode steps aside** — no line of the file named,
+  every doubted body tried, the hole or its prompt does not fit, the same
+  hole failing the same way twice, most bodies unusable — as `no hole this
+  attempt — <why>; the whole file is written instead` (also a `canvas`
+  journal event, `kind: "skip"`);
+- **the implementation notes** written before a pinned file's bodies, in
+  full, or that the planning call failed;
+- the `generate` line of an attempt made by canvases says `via diffusion
+  canvases`, and the session's config line says `diffusion=on (2
+  canvas(es) per repair, notes on)` / `off` / `unavailable (the model fills
+  no canvas)`.
+
+`SessionLog.diffusion` (new), `SessionLog.generation(via=)`,
+`canvas.Candidate.describe`, `canvas.doubt_rows`, `canvas.SURE/UNSURE`
+(ATK's doubt-map bands).
+
+An independent review of the change found four things, each now fixed and
+a test: a doubted body that did not fit a canvas was logged as "every
+doubted body has been tried" (it names the body now — the next attempt
+tries the next one); the config line's candidate count could stop a
+session from starting on a bad value and claimed more canvases than the
+schedule asks (clamped, and never raises — nor does the loop on a `None`
+count); a stub body that could not be found again was skipped without a
+word (it is named, and counted as not written); a usable canvas that was
+not chosen was headed "(rejected)".
+
+Tests: 9 more in `test_canvas` (40). Whole suite on the Linux VM: 1215
+pass, 20 skipped, the same 3 baseline failures.
+
+### Added — diffusion mode: holes instead of whole files (2026-10-10)
+
+Bill: *"most of the problems it runs into could be fixed with a
+bidirectional model"* — and *"go ahead and build those"*. When the loaded
+model fills a CANVAS (DiffusionGemma behind a host that says so), a repair
+rewrites only the hole its error is in, and a pinned file is written body
+by body. Design and limits: `docs/DIFFUSION_MODE.md`.
+
+- **`canvas.py` (new)** decides, by rule: WHERE a hole goes (the body of
+  the function the located error is in; a window when the body is long or
+  the file does not parse; nothing when no error names a line here), what
+  the canvas holds (head, tail, the old lines for a warm start, the noise),
+  and how a fill comes back (padding and a run-on cut, the file outside the
+  region byte for byte unchanged, the old lines and a fill that does not
+  parse refused). Pure, so every rule is a test.
+- **The loop** asks for a hole before it asks for a file
+  (`Loop._canvas_generate`): `diffusion_candidates` canvases per repair
+  attempt (default 2: a warm start with the far side held, and an open
+  rewrite from noise), the usable one the model was surest of goes to the
+  tests. No usable hole → that attempt is the whole-file repair, said in a
+  warning. A pinned file: one notes call (`diffusion_notes`), then each
+  `raise NotImplementedError` body as an open hole, signatures held; a body
+  that will not come back is left as the stub, so its test fails AT that
+  line and the next attempt fills it.
+- **Doubt-guided repair**: a failure that names no line of the file (an
+  assertion in its test) is repaired in the body the model was least sure
+  of when it wrote it (`Loop.doubt`), then the next.
+- **The same hole twice is not tried a third time**: the same function (or
+  error line) failing with the same error after its hole was rewritten
+  says the fault is elsewhere, and that attempt rewrites the whole file.
+- **The contract**: `ModelCapabilities.supports_canvas` (defaulted),
+  `CanvasRequest` / `CanvasResult` (types.py), the optional
+  `ports.CanvasLLM.canvas_fill` — never raises, like `complete`. Journal
+  event `canvas` (every candidate, which was kept); host events carry the
+  filled lines with their per-line confidence and flips, for a doubt map.
+  All minor-version additions; a host without the capability sees nothing.
+- `SessionConfig.diffusion` ("auto" / "off"), `diffusion_candidates`,
+  `diffusion_notes`; `LoopConfig.canvas`, `canvas_candidates`,
+  `canvas_notes`. The session says once, at the model check, whether
+  diffusion mode is on.
+- `models.py` recognises DiffusionGemma by name ("diffusiongemma"), and the
+  model check does not warn "unknown model" about a model that fills a
+  canvas whatever its file is called (Bill's stock file is
+  `Dg_Rc0P1_Patched`).
+
+**Fixed before it shipped — an independent review of the change found
+eleven defects, five of them silent** (the spliced file parsed, so nothing
+downstream would have caught them), each now a test:
+- the run-on cut compared stripped text, so an inner `}` or `return None`
+  truncated a hole — it now needs the next lines WITH their indentation, in
+  order, and a cut the parser accepts; outside Python there is no run-on
+  cut at all and every candidate holds the far side;
+- a `# comment` at column 0 inside a body ended the body (the function then
+  returned None) — comments and lines inside strings are never cut points;
+  and no line, whitespace or blank line inside a fill is changed any more;
+- lines were split with `str.splitlines`, which counts form feeds and
+  Unicode separators the parser does not — a form feed before a `def` made
+  the splice delete it; lines now end where the parser says;
+- a one-line `def f(): return x` made a hole of its signature; it gets a
+  window, and a one-line stub is not a body hole;
+- a model that wrote only the FIRST lines of the held tail kept them twice;
+- lines past the first canvas (never read out) counted as certain;
+- a hole was counted as "tried" before any candidate came back, so a
+  server hiccup ended diffusion mode for that error; a located error whose
+  hole did not fit was sent to the doubt rule; the context check was one
+  canvas looser than the server; the notes call ran before the size check.
+
+Also proved against the REAL patched server (a CPU build with a tiny
+random-weight model): a repair asks three canvases, the 2nd and 3rd reuse
+1,096 of 1,163 prompt tokens from the server's cache, every candidate is
+judged, and the attempt falls back to the whole file as designed.
+
+Tests: `test_canvas` (31). Whole suite on the Linux VM: 1206 pass, 20
+skipped, 3 fail exactly as before this change (Python 3.10 there: the
+doctor's 3.11 floor ×2, the SQLite-threading test).
+
+
 ### Fixed — the skeleton pins the interfaces; tests sit beside their modules; a repair answers for its result (2026-10-03)
 
 The racing spec on Qwen3-Coder-30B-A3B (Q4_K_M, 32k), Oct 2, 23:23: 998 s,
