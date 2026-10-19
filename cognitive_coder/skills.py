@@ -35,6 +35,14 @@ THE RULES, AND WHY EACH ONE EXISTS:
   * **Provenance.** The journal records each active skill's name, path and
     content hash at session start (C8) — a generated line influenced by a
     skill is traceable to the exact revision of the skill that did it.
+  * **Triggers (2026-10-19).** A skill whose header says
+    `triggers: pygame, sprite` loads only for a request that names one of
+    those words (whole words, any case) — OpenHands' keyword "knowledge
+    microagents", for the same reason: guidance about pygame is context a
+    small model spends on every call, and a CSV tool does not need it. The
+    match is made ONCE, against the request, before the first prompt, so
+    the prefix still never changes mid-session. A skill with no triggers
+    loads for every request, as before.
 """
 
 from __future__ import annotations
@@ -66,6 +74,18 @@ class Skill:
     description: str = ""
     langs: tuple[str, ...] = ()     # header `lang:`; empty = every language
     body: str = ""
+    #: header `triggers:` — words, any one of which in the request loads
+    #: this skill; empty = always loaded
+    triggers: tuple[str, ...] = ()
+
+    def triggered_by(self, text: str) -> str:
+        """The first trigger word ``text`` names, whole-word, or ""."""
+        import re
+        for word in self.triggers:
+            if re.search(rf"(?<![\w]){re.escape(word)}(?![\w])", text or "",
+                         re.I):
+                return word
+        return ""
 
     def applies_to(self, lang: str) -> bool:
         """Empty scope applies everywhere; otherwise exact id match."""
@@ -89,6 +109,46 @@ class SkillLoad:
     """
     skills: tuple[Skill, ...] = ()
     skipped: tuple[tuple[str, str], ...] = ()   # (path, reason)
+    #: Skills with triggers, held until the request is known
+    #: (`for_request`). Not in the prompt; not yet in the budget.
+    held: tuple[Skill, ...] = ()
+    #: Characters the active skills spend, and the session's ceiling.
+    total: int = 0
+    budget: int = 12_000
+
+    def for_request(self, text: str, events: EventPort | None = None
+                    ) -> SkillLoad:
+        """This load with each held skill whose trigger the request names
+        made active — in sorted order, within the budget. Called ONCE,
+        before the first prompt (the prefix rule)."""
+        if not self.held:
+            return self
+        active = list(self.skills)
+        skipped = list(self.skipped)
+        total = self.total
+        for skill in self.held:
+            word = skill.triggered_by(text)
+            if not word:
+                skipped.append((skill.path, "its triggers ("
+                                + ", ".join(skill.triggers)
+                                + ") are not in the request"))
+                continue
+            if total + len(skill.body) > self.budget:
+                skipped.append((skill.path, f"total budget of {self.budget} "
+                                            f"chars reached; earlier-sorting "
+                                            f"files won"))
+                if events is not None:
+                    events.event("warning", f"skill {skill.path} matched "
+                                            f"`{word}` but was not loaded: "
+                                            f"the skills budget is spent")
+                continue
+            total += len(skill.body)
+            active.append(skill)
+        order = {s.path: i for i, s in enumerate(sorted(
+            active, key=lambda s: s.path))}
+        active.sort(key=lambda s: order[s.path])
+        return SkillLoad(skills=tuple(active), skipped=tuple(skipped),
+                         held=(), total=total, budget=self.budget)
 
     def block(self) -> str:
         """The prompt text, for the CACHED prefix. Empty when no skills.
@@ -108,11 +168,13 @@ class SkillLoad:
     def provenance(self) -> list[dict]:
         """One dict per active skill, for the journal (C8)."""
         return [{"path": s.path, "name": s.name, "sha256": s.sha256[:12],
-                 "chars": len(s.body)} for s in self.skills]
+                 "chars": len(s.body),
+                 **({"triggers": list(s.triggers)} if s.triggers else {})}
+                for s in self.skills]
 
 
 #: The keys that make a `---` fence pair a header rather than two rules.
-_HEADER_KEYS = ("name", "description", "lang")
+_HEADER_KEYS = ("name", "description", "lang", "triggers")
 
 
 def parse_skill(path: str, text: str) -> Skill:
@@ -125,7 +187,7 @@ def parse_skill(path: str, text: str) -> Skill:
     """
     stem = posixpath.basename(path)
     stem = stem[:-3] if stem.lower().endswith(".md") else stem
-    name, description, langs = stem, "", ()
+    name, description, langs, triggers = stem, "", (), ()
     # A UTF-8 BOM (what Windows editors write) made `\ufeff---` fail the
     # fence test, so the header went into the cached prefix as rule text.
     text = (text or "").lstrip("\ufeff")
@@ -152,10 +214,14 @@ def parse_skill(path: str, text: str) -> Skill:
                 langs = tuple(sorted(
                     t.strip().lower()
                     for t in fields["lang"].split(",") if t.strip()))
+            if fields.get("triggers"):
+                triggers = tuple(
+                    t.strip() for t in fields["triggers"].split(",")
+                    if t.strip())
             body = "\n".join(lines[i + 1:])
             break
     return Skill(path=path, name=name, description=description,
-                 langs=langs, body=body.strip("\n"))
+                 langs=langs, body=body.strip("\n"), triggers=triggers)
 
 
 def load_skills(fs: FileSystemPort, *, lang: str = "",
@@ -177,6 +243,7 @@ def load_skills(fs: FileSystemPort, *, lang: str = "",
     except Exception:                                    # noqa: BLE001
         paths = []
     active: list[Skill] = []
+    held: list[Skill] = []
     skipped: list[tuple[str, str]] = []
     total = 0
     for path in paths:
@@ -199,6 +266,9 @@ def load_skills(fs: FileSystemPort, *, lang: str = "",
                                   f"limit {max_skill_chars}). Split it — "
                                   "it will not be truncated."))
             continue
+        if skill.triggers:
+            held.append(skill)        # decided by the request, at start
+            continue
         if total + len(skill.body) > max_total_chars:
             skipped.append((path, f"total budget of {max_total_chars} chars "
                                   "reached; earlier-sorting files won"))
@@ -216,7 +286,8 @@ def load_skills(fs: FileSystemPort, *, lang: str = "",
             events.event("warning", f"skill {path} not loaded: {reason}"
                          + (" — set the session language to apply it"
                             if reason.startswith("scoped to") else ""))
-    return SkillLoad(skills=tuple(active), skipped=tuple(skipped))
+    return SkillLoad(skills=tuple(active), skipped=tuple(skipped),
+                     held=tuple(held), total=total, budget=max_total_chars)
 
 
 # --------------------------------------------------------------------------

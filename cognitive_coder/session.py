@@ -182,6 +182,28 @@ class SessionConfig:
     #: model port, never for the scripted test doubles (`ScriptedLLM`,
     #: `NullLLM`), whose replies are counted. True/False: always/never.
     speed_probe: bool | None = None
+    #: THE DROPPED-CODE GUARD (keep.py): a reply for a file that already
+    #: had real code is refused before it is written when it leaves out a
+    #: definition the request does not name, or has a placeholder where
+    #: code was (`# ... rest unchanged`).
+    keep_existing: bool = True
+    #: NARROWED EDITS (symedit.py, F5): "auto" — a Python repair returns
+    #: only the definitions it changes when the file is over
+    #: `narrow_min_lines` lines or after the same attempt twice, and any
+    #: repair or change does when the whole file does not fit the context;
+    #: "always" — every repair and change of an existing Python file;
+    #: "off" — the whole file, always.
+    narrow: str = "auto"
+    narrow_min_lines: int = 150
+    #: Each located error's line marked, with the def/class lines around
+    #: it, in every repair prompt (diagnostics.where_block).
+    mark_errors: bool = True
+    #: REGRESSION MEMORY (F10): a repair is told how the same error was
+    #: fixed before in this project.
+    recall_fixes: bool = True
+    #: Opt-in: one short "what is wrong and what to change" call before
+    #: each repair, shown to the repair (Aider's architect/editor split).
+    diagnose_first: bool = False
 
 
 class Session:
@@ -256,7 +278,13 @@ class Session:
                 canvas_notes=self.config.diffusion_notes,
                 adjudicate=self.config.adjudicate,
                 request_chars_first=self.config.request_chars_first,
-                request_chars_repair=self.config.request_chars_repair))
+                request_chars_repair=self.config.request_chars_repair,
+                keep_existing=self.config.keep_existing,
+                narrow=self.config.narrow,
+                narrow_min_lines=self.config.narrow_min_lines,
+                mark_errors=self.config.mark_errors,
+                recall_fixes=self.config.recall_fixes,
+                diagnose_first=self.config.diagnose_first))
         #: The readable log is the Loop's too — it is where the verify
         #: phases happen, and their output is the whole point of the file.
         self.loop.log = self.log
@@ -311,6 +339,7 @@ class Session:
         self._started = time.monotonic()
         self._where = "planning"
         self.profile = dict(profile or {})
+        self._apply_skill_triggers(request)
         caps = self._capabilities(boundary="session start")
         earlier_sessions = self._count_earlier_sessions()
         self.journal.log("session_start", request=request,
@@ -406,6 +435,22 @@ class Session:
         self._write_spec_vectors(request)
         self._emit_plan(revised=False)
         return self.plan
+
+    def _apply_skill_triggers(self, text: str) -> None:
+        """Load the skills whose `triggers:` the request names (skills.py)
+        — once, before the first prompt, so the cached prefix is fixed for
+        the session from here on exactly as before."""
+        if not self.skill_load.held:
+            return
+        self.skill_load = self.skill_load.for_request(text, self.host.events)
+        self.prompts.conventions = "\n\n".join(
+            part for part in (self.config.conventions,
+                              self.skill_load.block()) if part)
+        loaded = [s for s in self.skill_load.skills if s.triggers]
+        if loaded:
+            self.host.emit("status", "skills loaded for this request: "
+                           + ", ".join(f"{s.name} (`{s.triggered_by(text)}`)"
+                                       for s in loaded))
 
     def _write_spec_vectors(self, request: str) -> None:
         """The request's own examples, as tests the harness owns
@@ -1492,6 +1537,9 @@ class Session:
         self._where = "debug & repair"
         said = report.description or report.error_text or report.command
         result = None
+        self._apply_skill_triggers(" ".join(
+            (report.description or "", report.error_text or "",
+             report.command or "")))
         try:
             caps = self._capabilities(boundary="session start")
             self.journal.log("session_start", request=f"DEBUG: {said[:500]}",

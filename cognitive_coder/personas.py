@@ -373,8 +373,25 @@ JUDGE = Persona(
                "one sentence of reasoning. JSON only."),
     temperature=0.0)
 
+#: Changes an existing file by returning only the definitions that change
+#: (symedit.py, F5) — Aider's "editor", with the repairer's discipline. The
+#: reply is put back by NAME, so the persona never has to reproduce the
+#: rest of the file, and is told what it gets for that: nothing it leaves
+#: out is lost.
+EDITOR = Persona(
+    id="editor", label="Editor",
+    self_model=("You change an existing file by rewriting only the "
+                "definitions that must change. You return each one "
+                "complete — every line of it written out — and nothing of "
+                "the file you are not changing, because what you do not "
+                "return stays exactly as it is."),
+    directive=("Return each function, method or class you change, whole, "
+               "and any import lines you add. Change nothing the task did "
+               "not force you to change."),
+    temperature=0.15)
+
 PERSONAS = {p.id: p for p in (ENGINEER, TESTER, PLANNER, REVIEWER, REPAIRER,
-                              ARCHITECT, JUDGE)}
+                              ARCHITECT, JUDGE, EDITOR)}
 
 
 # --------------------------------------------------------------------------
@@ -402,6 +419,22 @@ CONTRACT_EDIT = (
     ">>>CC-END\n"
     "The text to replace must appear EXACTLY ONCE in the file — include "
     "enough surrounding lines to make it unique. Nothing outside the block.")
+
+#: For a narrowed edit (symedit.py): definitions, put back by name.
+CONTRACT_SYMBOLS = (
+    "OUTPUT CONTRACT\n"
+    "Return only the definitions you change or add, in one fenced code "
+    "block: each function, method or class complete, from its decorators "
+    "and its `def` or `class` line to its last line, plus any import lines "
+    "you add, at the top. To change a method, write its `class` line and "
+    "then only that method. Everything you do not return stays exactly as "
+    "it is. No prose before or after the block.")
+
+#: For the opt-in describe-first pass before a repair.
+CONTRACT_DIAGNOSIS = (
+    "OUTPUT CONTRACT\n"
+    "Plain sentences, at most five: what is wrong, where, and what must "
+    "change. No code, no headings, no lists.")
 
 CONTRACT_LIST = (
     "OUTPUT CONTRACT\n"
@@ -601,6 +634,65 @@ def repair_task(path: str, purpose: str, diagnostics: str = "",
                   "undo them:"]
         lines += [f"  - {f}" for f in autofixes]
     return "\n".join(lines)
+
+
+def narrow_task(path: str, purpose: str, *, targets: Sequence[str] = (),
+                request: str = "", autofixes: Sequence[str] = (),
+                change: bool = False) -> str:
+    """The task text for a narrowed edit (symedit.py, F5).
+
+    A REPAIR names where the error is; a CHANGE names what the request
+    names, when it names something. Either way the model returns only what
+    it rewrites — the file is put back together by name, so leaving out
+    what does not change is the instruction, not a risk.
+    """
+    # a property's setter is `Cls.v@setter` inside the engine; a person —
+    # and a model — reads it as `Cls.v` (setter)
+    names = ", ".join(
+        f"`{t.partition('@')[0]}` ({t.partition('@')[2]})" if "@" in t
+        else f"`{t}`" for t in targets)
+    if change:
+        lines = [f"`{path}` already exists. Change it as this request asks, "
+                 f"by rewriting only the definitions that must change."]
+        if request.strip():
+            text = request.strip()
+            if len(text) > REPAIR_REQUEST_CHARS:
+                text = text[:REPAIR_REQUEST_CHARS].rstrip() + \
+                    "… (the request continues)"
+            lines += ["", f"The request: {text}"]
+        lines += ["", f"What this file is for: {purpose}"]
+        if names:
+            lines += ["", f"The request names {names} in this file."]
+    else:
+        lines = [f"The file `{path}` does not work yet. Its purpose: "
+                 f"{purpose}"]
+        if request.strip():
+            text = request.strip()
+            if len(text) > REPAIR_REQUEST_CHARS:
+                text = text[:REPAIR_REQUEST_CHARS].rstrip() + \
+                    "… (the request continues)"
+            lines += ["", f"It is part of this request: {text}"]
+        where = (f"The error is in {names}. " if names else "")
+        lines += ["", f"{where}Fix the errors reported below by rewriting "
+                      f"what must change — usually just "
+                      f"{'that' if len(targets) <= 1 else 'those'}"
+                      f"{' function' if len(targets) <= 1 else ''} — and "
+                      f"return only what you rewrote. Change nothing the "
+                      f"errors did not force you to change."]
+    if autofixes:
+        lines += ["",
+                  "These were already fixed for you automatically, so do not "
+                  "undo them:"]
+        lines += [f"  - {f}" for f in autofixes]
+    return "\n".join(lines)
+
+
+def diagnose_task(path: str, purpose: str) -> str:
+    """The describe-first pass: say what to change before anyone writes."""
+    return (f"The file `{path}` does not work yet. Its purpose: {purpose}\n\n"
+            f"Before anyone changes it, explain what is wrong and what must "
+            f"change to fix the errors reported below. Do not write the "
+            f"code; another step writes it from what you say.")
 
 
 def fresh_start_task(path: str, purpose: str, request: str = "",

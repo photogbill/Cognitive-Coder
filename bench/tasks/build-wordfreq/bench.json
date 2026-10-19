@@ -1,0 +1,2 @@
+{"kind": "build", "lang": "python", "timeout_s": 900,
+ "note": "Exact ordering rules stated in words: spec slicing, the judge, the tie-break the request states."}

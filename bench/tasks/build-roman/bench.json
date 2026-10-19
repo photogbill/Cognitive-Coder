@@ -1,0 +1,2 @@
+{"kind": "build", "lang": "python", "timeout_s": 900,
+ "note": "One module, exact behaviour, several error cases: the basics of build → verify → repair."}

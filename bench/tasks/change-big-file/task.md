@@ -1,0 +1,1 @@
+`parse_duration` in `textutils.py` only understands minutes ("90m"). Make it also accept hours: "2h" is 120, "1h30m" is 90, "1H05M" is 65 (any case, surrounding spaces ignored). Anything else, including an empty string or "h", MUST still raise `ValueError`. Nothing else in the file changes.

@@ -794,3 +794,107 @@ def signature(diags: Sequence[Diagnostic]) -> tuple:
     """
     return tuple(sorted(f"{d.file}:{d.line}:{(d.message or '')[:60]}"
                         for d in diags))
+
+
+# --------------------------------------------------------------------------
+# where the errors are, marked (2026-10-19)
+# --------------------------------------------------------------------------
+#
+# Aider shows a lint error as the lines around it, the error line marked
+# with █, under the def/class lines that hold it ("TreeContext"). A small
+# model told "line 61" has to count to find line 61 in a 400-line file and
+# often fixes line 41; shown the line, marked, inside `def update(...)`, it
+# does not have to count. Nothing here changes the file the model is
+# shown — the marks live in their own block, so they cannot be copied into
+# the code.
+
+#: Lines shown before and after each error line.
+WHERE_AROUND = 3
+#: Located errors shown, at most.
+WHERE_MAX = 3
+WHERE_MARK = "█"
+
+
+def _scope_lines(lines: Sequence[str], idx: int, lang_id: str) -> list[int]:
+    """0-based indexes of the lines that OPEN the scopes holding line
+    ``idx``, outermost first (at most three): each nearest line above it
+    that is less indented and opens a block — ends in `:` (Python) or `{`,
+    or starts a definition."""
+    def indent(s: str) -> int:
+        return len(s) - len(s.lstrip(" \t"))
+
+    target = lines[idx] if idx < len(lines) else ""
+    level = indent(target) if target.strip() else 10 ** 6
+    out: list[int] = []
+    for j in range(idx - 1, -1, -1):
+        line = lines[j]
+        if not line.strip() or indent(line) >= level:
+            continue
+        s = line.rstrip()
+        if _OPENS.match(line) or s.endswith((":", "{")):
+            out.append(j)
+            level = indent(line)
+            if level == 0:
+                break
+    return list(reversed(out))[-3:]
+
+
+#: A line that starts a definition, in the languages this engine builds.
+_OPENS = re.compile(r"^\s*(?:async\s+def|def|class|fn|func|function|impl|"
+                    r"struct|enum|interface|trait|module|namespace)\b")
+
+
+def where_block(code: str, diags: Sequence[Diagnostic], path: str, *,
+                same_file: Any = None, lang_id: str = "python") -> str:
+    """[WHERE THE ERRORS ARE] for the located errors of ``path``, or ""."""
+    if not code or not diags:
+        return ""
+
+    def mine(d: Diagnostic) -> bool:
+        if same_file is not None:
+            return bool(same_file(d.file, path))
+        a = (d.file or "").replace("\\", "/")
+        b = (path or "").replace("\\", "/")
+        return bool(a) and (a == b or a.endswith("/" + b)
+                            or b.endswith("/" + a))
+
+    # lines as the PARSER counts them: `str.splitlines` also splits on form
+    # feeds and Unicode separators, and the mark landed on the wrong line
+    from .symedit import lines_of
+    lines = [ln.rstrip("\r\n") for ln in lines_of(code)]
+    located = []
+    for d in diags:
+        if d.is_error and d.line and 0 < d.line <= len(lines) and mine(d):
+            if d.line not in [x.line for x in located]:
+                located.append(d)
+        if len(located) >= WHERE_MAX:
+            break
+    if not located:
+        return ""
+    width = len(str(len(lines)))
+    blocks = []
+    for d in located:
+        idx = d.line - 1
+        shown: list[int] = []
+        for j in _scope_lines(lines, idx, lang_id):
+            shown.append(j)
+        lo = max(0, idx - WHERE_AROUND)
+        hi = min(len(lines), idx + WHERE_AROUND + 1)
+        while hi - 1 > idx and not lines[hi - 1].strip():
+            hi -= 1
+        while lo < idx and not lines[lo].strip():
+            lo += 1
+        rows = []
+        last = -1
+        for j in sorted(set(shown) | set(range(lo, hi))):
+            if last >= 0 and j > last + 1:
+                rows.append(f"{'':>{width + 2}} ⋮")
+            mark = WHERE_MARK if j == idx else " "
+            rows.append(f"{mark} {j + 1:>{width}} | {lines[j]}")
+            last = j
+        msg = (d.message or "").strip().splitlines()[0][:160] \
+            if (d.message or "").strip() else ""
+        blocks.append(f"line {d.line}: {msg}\n" + "\n".join(rows))
+    return ("[WHERE THE ERRORS ARE — " + path + ", each error's line marked "
+            + WHERE_MARK + "; line numbers are for finding it, never part "
+            "of the code]\n" + "\n\n".join(blocks))

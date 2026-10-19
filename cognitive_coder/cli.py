@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 import os
+from pathlib import Path
 import sys
 import urllib.parse
 
@@ -594,7 +595,10 @@ def build(args: argparse.Namespace) -> int:
         skeleton_first=not args.no_skeleton,
         pin_interfaces=not getattr(args, "no_interfaces", False),
         test_first=getattr(args, "test_first", None),
-        use_skills=not args.no_skills)
+        use_skills=not args.no_skills,
+        narrow=getattr(args, "narrow", "auto"),
+        keep_existing=not getattr(args, "no_keep", False),
+        diagnose_first=getattr(args, "diagnose_first", False))
     # With --remote the session exists FIRST: its gate is what the provider
     # is bound to. Without it, nothing is built until a model is known to be
     # there, as before.
@@ -782,7 +786,7 @@ def skills_cmd(args) -> int:
 
     # list — show exactly what a session would load, and what it would not.
     load = load_skills(fs, lang=args.lang)
-    if not load.skills and not load.skipped:
+    if not load.skills and not load.skipped and not load.held:
         print(f"No skills deployed (nothing in {SKILLS_DIR}/).")
         print("`ccoder skills deploy` writes an editable starter pack.")
         return 0
@@ -794,6 +798,11 @@ def skills_cmd(args) -> int:
             desc = f"  — {sk.description}" if sk.description else ""
             print(f"  {sk.name:<20} {sk.path}  [{langs_note}, "
                   f"{len(sk.body)} chars, {sk.sha256[:12]}]{desc}")
+    if load.held:
+        print("Loaded only for a request that names one of its triggers:")
+        for sk in load.held:
+            print(f"  {sk.name:<20} {sk.path}  [triggers: "
+                  f"{', '.join(sk.triggers)}; {len(sk.body)} chars]")
     if load.skipped:
         print("Not loaded:")
         for path, reason in load.skipped:
@@ -916,6 +925,19 @@ def _add_build_parser(sub, common) -> Handler:
     b.add_argument("--no-skills", action="store_true",
                    help="build without the deployed skills in "
                         f"{SKILLS_DIR}/ (see `ccoder skills`)")
+    b.add_argument("--narrow", choices=("auto", "always", "off"),
+                   default="auto",
+                   help="narrowed edits: a repair or change returns only "
+                        "the functions it rewrites (auto: long files, files "
+                        "too large to show whole, and after the same "
+                        "attempt twice)")
+    b.add_argument("--no-keep", action="store_true",
+                   help="do not refuse a reply that leaves out code the "
+                        "existing file had (not advised)")
+    b.add_argument("--diagnose-first", action="store_true",
+                   help="before each repair, one short call says what is "
+                        "wrong and what to change (one more call per "
+                        "repair)")
     _add_remote_option(b)
     return build
 
@@ -974,6 +996,96 @@ def _add_audit_parser(sub, common) -> Handler | None:
     return audit.run_cli
 
 
+def bench_cmd(args: argparse.Namespace) -> int:
+    """`ccoder bench` — the regression suite (bench.py): every task run
+    headless, graded by hidden tests, compared with the run before.
+
+    Exit 0 when every task passed, 1 when some failed, 2 for a bad suite or
+    flag, 3 when no model answered (a live run needs one; a replay does not).
+    """
+    from . import bench
+    suite = Path(args.suite) if args.suite else bench.SUITE_DIR
+    out = Path(args.out) if args.out else bench.RUNS_DIR
+    only = tuple(args.only or ())
+    if args.check:
+        problems = bench.check_suite(suite, scratch=out / "_check",
+                                     only=only)
+        for p in problems:
+            print(f"  {p}")
+        print("The suite is sound: every task's hidden tests pass on its "
+              "reference and fail on its start files." if not problems
+              else f"{len(problems)} problem(s) with the suite.")
+        return 0 if not problems else 2
+    if args.replay:
+        recorded = Path(args.replay)
+        if not recorded.is_dir():
+            recorded = out / args.replay
+        if not recorded.is_dir():
+            print(f"There is no run called {args.replay!r} in {out}.",
+                  file=sys.stderr)
+            return 2
+
+        def make_llm(task, _folder):
+            path = recorded / task.name / bench.REPLIES
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{recorded.name} recorded nothing for {task.name}")
+            return bench.ReplayLLM(path)
+        label = args.label or f"replay-{recorded.name[:15]}"
+    else:
+        problem = url_problem(args.url)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
+        model = make_provider("openai_compatible", base_url=args.url,
+                              model=args.model)
+        if not _loaded(Host(llm=model)):
+            return 3
+
+        def make_llm(_task, folder):
+            return bench.RecordingLLM(model, folder / bench.REPLIES)
+        label = args.label
+    config = {"attempts": args.attempts, "narrow": args.narrow,
+              "diagnose_first": args.diagnose_first}
+    print(f"Suite {suite} → {out}")
+    run = bench.run_suite(make_llm, suite=suite, out=out, only=only,
+                          label=label, config=config)
+    print()
+    print(run.summary)
+    print(f"Written to {run.path}")
+    if run.problems and not run.rows:
+        return 2
+    return 0 if all(r.get("ok") for r in run.rows) else 1
+
+
+def _add_bench_parser(sub, common) -> Handler:
+    b = sub.add_parser("bench", parents=[common],
+                       help="run the regression suite (bench/tasks) and "
+                            "compare with the last run")
+    b.add_argument("--suite", default="", metavar="DIR",
+                   help="the task folders (default: bench/tasks beside "
+                        "the engine)")
+    b.add_argument("--out", default="", metavar="DIR",
+                   help="where runs are written (default: bench/runs "
+                        "beside the engine)")
+    b.add_argument("--only", action="append", metavar="TASK",
+                   help="run just this task (repeatable)")
+    b.add_argument("--label", default="",
+                   help="a word added to the run folder's name")
+    b.add_argument("--replay", default="", metavar="RUN",
+                   help="answer with a recorded run's replies instead of a "
+                        "model — tests a parser or routing change at no "
+                        "inference cost")
+    b.add_argument("--check", action="store_true",
+                   help="check the suite itself: hidden tests pass on each "
+                        "reference and fail on each start, then stop")
+    b.add_argument("--attempts", type=_at_least(1), default=4)
+    b.add_argument("--narrow", choices=("auto", "always", "off"),
+                   default="auto")
+    b.add_argument("--diagnose-first", action="store_true")
+    return bench_cmd
+
+
 #: The subcommands, in `--help` order. A new one is a function above and a
 #: row here; `main()` itself does not change.
 SUBCOMMANDS: tuple[tuple[str, Callable[..., Handler | None]], ...] = (
@@ -983,6 +1095,7 @@ SUBCOMMANDS: tuple[tuple[str, Callable[..., Handler | None]], ...] = (
     ("history", _add_history_parser),
     ("skills", _add_skills_parser),
     ("audit", _add_audit_parser),
+    ("bench", _add_bench_parser),
 )
 
 

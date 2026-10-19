@@ -18,6 +18,7 @@ kind of thing that gets blamed on the model.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..types import Symbol
@@ -326,3 +327,85 @@ def _call_sites(root: Any, symbols: list[Symbol], raw: bytes):
 
     walk(root)
     return out
+
+
+# --------------------------------------------------------------------------
+# syntax errors, when there is no compiler (2026-10-19)
+# --------------------------------------------------------------------------
+#
+# Aider's linter checks every language it has a grammar for by walking the
+# tree for ERROR and MISSING nodes. Here that is the check of LAST resort:
+# a language whose toolchain is installed is checked by its compiler, as
+# before. With no compiler, a file used to be "not checked" — or the build
+# stopped as blocked — while a stray brace sat in it that a parser can see.
+# TypeScript is left out, as Aider leaves it out: its grammar flags valid
+# code often enough that a false error would send the model after nothing.
+
+_NO_SYNTAX_CHECK = {"typescript"}
+#: A line that opens with an ALL-CAPS word (two or more letters) before a
+#: type or a name: `EXPORT int add(`, `BEGIN_NAMESPACE {`.
+_MACRO_LINE = re.compile(r"^\s*[A-Z][A-Z0-9_]+\b(?:\s+\w|\s*[{(]|\s*$)")
+#: Conditional compilation or a macro definition anywhere in a C/C++ file.
+_PREPROCESSED = re.compile(r"(?m)^\s*#\s*(?:if|ifdef|ifndef|elif|define)\b")
+
+
+def syntax_errors(text: str, lang_id: str,
+                  limit: int = 3) -> list[tuple[int, int, str]] | None:
+    """[(1-based line, 1-based column, what)] — or None when there is no
+    parser for the language (which is not the same as "no errors")."""
+    lang = (lang_id or "").lower()
+    if lang in _NO_SYNTAX_CHECK or not available(lang):
+        return None
+    if lang in ("c", "cpp") and _PREPROCESSED.search(text or ""):
+        # The grammar parses C as written, not as the preprocessor leaves
+        # it: an `#ifdef` choosing between two function heads, a
+        # `#define EXPORT __declspec(dllexport)` before `EXPORT int f()`,
+        # brace macros — valid code it reports as broken (review,
+        # 2026-10-19). With conditionals or macros in play, only a
+        # compiler can say; "not checked" is the honest answer.
+        return None
+    key = _LANG_ALIASES.get(lang, "")
+    parser = _cache.get(key)
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse((text or "").encode("utf-8"))
+    except Exception:                                    # noqa: BLE001
+        return None
+    found: list[tuple[int, int, str]] = []
+    data = (text or "").encode("utf-8")
+    lines = (text or "").split("\n")
+
+    def walk(node: Any) -> None:
+        if len(found) >= limit:
+            return
+        try:
+            kind = node.type
+            missing = bool(getattr(node, "is_missing", False))
+        except Exception:                                # noqa: BLE001
+            return
+        if kind == "ERROR" or missing:
+            row, col = node.start_point
+            if lang in ("c", "cpp") and _MACRO_LINE.search(
+                    lines[row] if row < len(lines) else ""):
+                # an ALL-CAPS word at the start of a declaration is most
+                # likely a macro from a header the grammar cannot see
+                return
+            if missing:
+                what = f"`{kind}` is missing here"
+            else:
+                snippet = data[node.start_byte:node.end_byte].decode(
+                    "utf-8", "replace").strip().splitlines()
+                near = snippet[0][:40] if snippet else ""
+                what = (f"this does not parse, near `{near}`" if near
+                        else "this does not parse")
+            found.append((row + 1, col + 1, what))
+            return
+        for child in getattr(node, "children", []) or []:
+            walk(child)
+
+    try:
+        walk(tree.root_node)
+    except Exception:                                    # noqa: BLE001
+        return None
+    return found

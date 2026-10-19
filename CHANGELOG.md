@@ -10,6 +10,190 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — narrowed edits, the dropped-code guard, a ranked repo map, the regression suite; what Aider, OpenHands and Devika had worth taking (2026-10-19)
+
+Bill asked which features of Aider, OpenHands and Devika would improve this
+engine — to replicate, not to use. The three were read at source (Aider
+0.86.3.dev; OpenHands' current agent SDK and its 0.62.0 tag; Devika's last
+code commit, 2024-09-19) and compared with this engine's code. What follows
+is what was worth building, re-implemented here — no code was taken. Two
+gaps turned up in this engine's own code on the way and are fixed below:
+F5 was specified and never wired (`narrow_on_stagnation` was read by
+nothing), and F10's regression memory was written and never read. Design:
+`docs/NARROWED_EDITS.md`, `docs/BENCH.md`.
+
+**The dropped-code guard** (`keep.py`, `LoopConfig/SessionConfig.
+keep_existing`, on; `--no-keep`). A change to a file that already had real
+code asked for "the complete updated file", and only a file pinned THIS
+session was held to its names. A reply that left out `draw_hud`, or wrote
+`# ... rest of the methods unchanged`, was written to disk; with no tests,
+nothing failed. Now such a reply is refused BEFORE it is written — the
+operator's file is still whole for the next attempt — when it drops a
+function, class, method, UPPER_CASE constant or main guard the request does
+not name, renames one something still uses, turns a real body into `...`,
+or has a placeholder comment where code was (Aider counts these "lazy
+comments"). A rewrite request ("refactor", "remove", "rename", …) makes a
+missing definition a warning; a placeholder is always refused. The refusal
+is the next attempt's located error, and that attempt is a narrowed edit.
+
+**Narrowed edits** (`symedit.py`, F5; `SessionConfig.narrow` auto /
+always / off, `narrow_min_lines` 150; `--narrow`). A repair returns only the
+definitions it changes — each whole — and they are put back BY NAME:
+whole-file output at function size, the format Aider's leaderboard shows
+small models get right (Qwen2.5-Coder-32B: 99.6 % well-formed whole, 71.6 %
+with search/replace). "auto": a Python repair of a file over 150 lines; the
+rest of a task after the same attempt twice or a dropped-code refusal; and
+any repair or change of a file too large to show whole — which used to be
+refused before any model call, and is now shown condensed (targets in full,
+every other definition as its header). A bare method finds its class; new
+definitions go before the main guard, new imports into the leading block,
+`from __future__` first, a shebang stays line one; an ambiguous name, a
+placeholder body, a stray top-level statement, a partial class that changes
+class-level lines, a result that does not parse or defines a name twice
+refuse the whole reply. Unplaceable: the whole file in the same attempt, or,
+for a file too large for that, a refused attempt with the reason. New
+persona `editor`; contract `CONTRACT_SYMBOLS`; journal event `narrow`;
+`generate` events carry `via: narrow`.
+
+**Where the errors are** (`diagnostics.where_block`, `mark_errors`, on).
+Aider's lint context: every repair prompt carries each located error's line
+marked `█` inside the def/class lines that hold it, numbered, in its own
+block — never in the file the model copies.
+
+**A fresh start of a file that was here before** is shown the file as it
+stood when the task began. The ladder's third rung hid the broken attempts
+(D11) — and with them the operator's own file, which a fresh start then
+regenerated blind.
+
+**A forgiving anchor** (`patcher.forgiving_replace`). `CC-EDIT` blocks and
+`apply_patch` (and ATK's chat edits, through `ccoder_compat.apply`) matched
+exactly or not at all. Now, after the exact whole-word match: trailing
+spaces, an indentation shifted the same on every line (the replacement
+re-indented with it), blank edge lines, and `...` lines standing for the
+code between pieces — every fallback on WHOLE lines and unique, so the
+whole-word rule holds. A refusal names every match's line when there are
+several, the lines it probably meant when there are none ("Did you mean
+these lines, from line 12?"), and "already applied" when it is. Aider
+measured nine times more failed edits with its flexibility off.
+
+**A ranked repo map** (`codemap/rank.py`, `Store.file_graph`,
+`CodeMap.ranked`). Aider's PageRank over the reference graph the codemap
+already holds. The architecture block listed the first 60 files
+ALPHABETICALLY; past 60 it now keeps the most referenced (still printed in
+path order, still snapshotted per epoch, so byte-stable). Debug & Repair's
+locate step offers files most likely first — toward the names and paths the
+error and the description mention — instead of in path order under a cap;
+the audit reads the files the project depends on most before the biggest.
+
+**A parser's syntax check when there is no compiler**
+(`parse_treesitter.syntax_errors`, `runner.treesitter_syntax`). Aider lints
+every language it has a grammar for. With no toolchain, a C file was "not
+checked" by the audit and BLOCKED by the build, a stray brace in it. Now the
+brace is a located error the model can fix; a clean parse is still "not
+checked". TypeScript is left out, as Aider leaves it out.
+
+**Skills with triggers** (`skills.py`). OpenHands' keyword-triggered
+knowledge: `triggers: pygame, sprite` in a skill's header loads it only for a
+request that names one (whole words). Matched once, at session start,
+before the first prompt — the prefix still never changes mid-session.
+`ccoder skills` lists them apart.
+
+**Regression memory, read back** (F10, `recall_fixes`, on). A fix is
+recorded by what changed between the failing attempt and the passing one
+(`changed `Car.update` in src/car.py; added 1 import`), keyed by the error
+with numbers blanked; a later repair of the same error, in any file, is told
+how it was fixed before, as a hint. It used to record "model repair" for
+every model fix, and nothing read the table. Journal event `recall`.
+
+**Describe first** (opt-in: `diagnose_first`, `--diagnose-first`). Aider's
+architect/editor split with one model: one short call says what is wrong
+and what to change before each repair, and the repair is shown it. Aider
+measured gpt-4o-mini 55.6 % → 60.2 % with the same model in both roles. One
+more call per repair, so off by default.
+
+**The regression suite** (`bench.py`, `ccoder bench`, `bench/tasks/`). Aider's
+benchmark design and OpenHands' separate grading: tasks run headless, graded
+by hidden tests copied in after the run, each run compared with the one
+before task by task ("better: …, worse: …"), every reply recorded, and
+`--replay` answering from a recorded run with no model — saying where the
+prompts diverged, so a diverged replay is not mistaken for a result.
+`--check` proves each task's hidden tests pass on its reference and fail on
+its start files. Eight starter tasks (build, change, debug; two of them
+files over 150 lines). Runs go to `bench/runs/` beside the code
+(`.gitignore`d). For the engine, not for comparing models.
+
+**Not taken, and why.** Git auto-commits (the guard deliberately blocks git;
+snapshots and undo already exist); conversation summarising (this loop never
+accumulates history — M33); web research and browsers (offline by design);
+Docker sandboxes; a model-reported "security risk" field; a "think" tool;
+OpenHands' 6–7k-token prompts; Devika's pipeline as a whole (abandoned since
+2024; its search results never reached its coder). Grammar-constrained JSON
+for the judge and the audit is worth doing and is left for a build that can
+be tested against the real llama.cpp server.
+
+Public: `keep`, `symedit`, `bench` modules; `SessionConfig.keep_existing`,
+`narrow`, `narrow_min_lines`, `mark_errors`, `recall_fixes`,
+`diagnose_first`; `patcher.forgiving_replace`; `CodeMap.ranked`; journal
+events `narrow`, `keep`, `recall`; persona `editor`. All additive.
+
+**Fixed before it shipped — an independent review of the change found
+twenty-three defects, each reproduced, each now a test**
+(`test_review_oct19` and the module suites):
+- a method reply (`def run(self)`, the error in `App.run`) overwrote a
+  top-level function of the same name — silently, and the task "passed";
+- new definitions placed at one spot came out in REVERSE (a helper after
+  the main guard that calls it, a subclass before its base), and a new
+  constant that uses a function went above it — NameError at import;
+- the guard was switched off by ordinary wording: "remove", "split",
+  "merge" anywhere in a request made every loss a warning, and any name the
+  request or a traceback merely MENTIONED could be dropped unannounced —
+  the `change-todo` task built to test the guard did not trigger it. Intent
+  now has to sit in one sentence with the name; tracebacks exempt nothing;
+  a rewrite has to name the file;
+- the guard refused legitimate refactors forever: functions turned into a
+  class's methods, functions moved to another file and imported. Those are
+  now MOVES. "# Other functions", "# Keep the original implementation…" and
+  a docstring bullet were taken for placeholders;
+- refusals piled up — five in a row carried five copies of the refusal and
+  pushed the real NameError out of the prompt — and pointed at line 1 or at
+  a line of the reply, which the narrowed edit then took as the error's
+  function;
+- "did you mean" compared every window of the file character by character:
+  32 s for a 40-line anchor on a 1,000-line file, minutes beyond. Now
+  candidates are chosen by exact line overlap first (milliseconds);
+- an unplaceable narrowed reply could end the task as "the model returned
+  nothing" when the whole file did not fit either; it is now the attempt's
+  refusal, with the reason;
+- a fresh start of a file too large to show had its original CUT to fit
+  while being asked for the whole file; Debug & Repair round 2 regenerated
+  the operator's file blind; once narrowing was on it took over the
+  ladder's fresh start, while the log still said "starts fresh";
+- a partial class reply dropped a new base class, decorator or docstring
+  while reporting success; a nested class in a partial reply replaced the
+  whole nested class;
+- on Python 3.12+ a multi-line f-string inside a moved method had its value
+  changed by the re-indent (3.12 tokenizes f-strings in pieces);
+- a file saved with a byte-order mark switched the guard and narrowing off
+  (and, already before this change, failed the syntax check every time);
+- a dropped property setter passed the guard, and a setter could not be
+  repaired by name (a property and its setter are now `v` and `v@setter`);
+- the tree-sitter check reported valid C with `#ifdef` or macros as broken;
+- a debug task's replay always "diverged" at call one (the traceback named
+  the run's own, time-stamped folder; tasks now run in a fixed folder);
+- an unchanged narrowed reply lost the "return it unchanged if the test is
+  wrong" escape hatch; the "enriched" status went silent; the WHERE block
+  counted lines with `str.splitlines`; a fallback call was not journaled; a
+  path inside another file's name ranked as a mention; an anchor matching
+  twice after spacing was reported as missing; the suite's pytest totals
+  read the first "N passed" in the output rather than the summary.
+
+Tests: `test_symedit` (31), `test_keep` (13), `test_narrow` (9),
+`test_review_oct19` (21), `test_forgiving_edits` (9), `test_rank` (7),
+`test_treesitter_syntax` (5), `test_bench` (7), two more in `test_skills`.
+Whole suite (Python 3.11, Linux): 1451 pass, 8 skipped, and the same
+2 failures the untouched code has here (both assert how a `Tuple` alias
+is printed in an interface block; neither involves this change).
+
 ### Added — hybrid mode, the judge, spec vectors, the ladder; what two real builds taught (2026-10-16)
 
 The first two builds of a real specification (the Star Trek spec: 15,070

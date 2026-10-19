@@ -421,6 +421,247 @@ def _apply_diff(original: str, diff_text: str) -> tuple[str, str]:
     return "".join(out), ""
 
 
+# ---------------------------------------------------------------------------
+# a forgiving anchor (2026-10-19)
+# ---------------------------------------------------------------------------
+#
+# Aider applies a SEARCH block that does not match exactly by trying again
+# with the indentation normalised, a leading blank line dropped, and `...`
+# lines standing for unchanged code — and its own measurements found that
+# turning that flexibility off gave nine times more failed edits. The exact
+# match still comes first here, and every fallback works on WHOLE LINES
+# only, so the whole-word rule above cannot be broken by one: a fallback
+# match is a run of complete lines, never part of a name. Each must be
+# unique, or it is refused. And when nothing matches, the model is told
+# which lines it probably meant, with their numbers — the difference
+# between a retry that copies the file correctly and one that guesses.
+
+#: How alike a window of the file must be to the anchor to be offered as
+#: "did you mean" (difflib ratio over lines). A HINT only: never applied.
+SIMILAR_HINT = 0.7
+
+
+def _split_keep(text: str) -> list[str]:
+    return text.splitlines(keepends=True)
+
+
+def _occurrences(haystack: str, needle: str) -> list[int]:
+    """1-based line numbers where ``needle`` starts, whole words only."""
+    out = []
+    at = haystack.find(needle)
+    while at >= 0 and len(out) < 6:
+        if not _cuts_a_name(haystack, needle, at):
+            out.append(haystack.count("\n", 0, at) + 1)
+        at = haystack.find(needle, at + 1)
+    return out
+
+
+def _windows(lines: list[str], part: list[str], same) -> list[int]:
+    n = len(part)
+    return [i for i in range(len(lines) - n + 1)
+            if all(same(lines[i + k], part[k]) for k in range(n))]
+
+
+def _shift_of(file_lines: list[str], part: list[str]) -> str | None:
+    """The one indentation difference between a window and the anchor, as
+    the prefix the file has and the anchor lacks — or None."""
+    shift = None
+    for f, a in zip(file_lines, part, strict=False):
+        if not f.strip():
+            continue
+        f_lead = f[:len(f) - len(f.lstrip(" \t"))]
+        a_lead = a[:len(a) - len(a.lstrip(" \t"))]
+        if not f_lead.endswith(a_lead) and not a_lead.endswith(f_lead):
+            return None
+        delta = f_lead[:len(f_lead) - len(a_lead)] \
+            if len(f_lead) >= len(a_lead) else "-" + a_lead[:len(a_lead)
+                                                             - len(f_lead)]
+        if shift is None:
+            shift = delta
+        elif shift != delta:
+            return None
+    return shift if shift is not None else ""
+
+
+def _reshift(text: str, shift: str) -> str:
+    if not shift:
+        return text
+    out = []
+    for line in _split_keep(text):
+        if not line.strip():
+            out.append(line)
+        elif shift.startswith("-"):
+            cut = shift[1:]
+            out.append(line[len(cut):] if line.startswith(cut) else line)
+        else:
+            out.append(shift + line)
+    return "".join(out)
+
+
+def _line_match(before: str, old: str, new: str) -> tuple[str | None, str]:
+    """(the new text, how) by a whole-line fallback; (None, "") when none
+    matches; (None, "ambiguous: <lines>") when one matches in several
+    places — which is said, not reported as missing."""
+    lines = _split_keep(before)
+    part = _split_keep(old)
+    if not part:
+        return None, ""
+    if not part[-1].endswith("\n"):
+        part[-1] += "\n"
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    replacement = new if new.endswith("\n") or not new else new + "\n"
+
+    def splice(i: int, n: int, text: str) -> str:
+        return "".join(lines[:i]) + text + "".join(lines[i + n:])
+
+    # 1. trailing whitespace
+    hits = _windows(lines, part, lambda f, a: f.rstrip() == a.rstrip())
+    if len(hits) == 1:
+        return splice(hits[0], len(part), replacement), \
+            "matched after ignoring trailing spaces"
+    if len(hits) > 1:
+        return None, "ambiguous: " + ", ".join(str(i + 1) for i in hits[:6])
+    # 2. indentation, shifted the same on every line
+    hits = _windows(lines, part, lambda f, a: f.strip() == a.strip())
+    good = [(i, _shift_of(lines[i:i + len(part)], part)) for i in hits]
+    good = [(i, sh) for i, sh in good if sh is not None]
+    if len(good) == 1:
+        i, shift = good[0]
+        return splice(i, len(part), _reshift(replacement, shift)), \
+            "matched after correcting the indentation"
+    if len(good) > 1:
+        return None, "ambiguous: " + ", ".join(str(i + 1)
+                                               for i, _s in good[:6])
+    # 3. blank lines at either end of the anchor
+    trimmed = list(part)
+    while trimmed and not trimmed[0].strip():
+        trimmed.pop(0)
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    if trimmed and len(trimmed) < len(part):
+        got, how = _line_match(before, "".join(trimmed), new)
+        if got is not None:
+            return got, how + (", " if how else "") + \
+                "with the anchor's blank edge lines dropped"
+        if how.startswith("ambiguous"):
+            return None, how
+    return None, ""
+
+
+def _elided_match(before: str, old: str, new: str) -> tuple[str | None, str]:
+    """`...` lines in BOTH halves stand for unchanged code between them:
+    each anchor piece must occur once, in order, and is replaced by its
+    partner — Aider's `try_dotdotdots`, with the uniqueness kept."""
+    a_parts = re.split(r"(?m)^[ \t]*(?:\.\.\.|…)[ \t]*\n?", old)
+    b_parts = re.split(r"(?m)^[ \t]*(?:\.\.\.|…)[ \t]*\n?", new)
+    if len(a_parts) < 2 or len(a_parts) != len(b_parts):
+        return None, ""
+    text = before
+    at = 0
+    for a, b in zip(a_parts, b_parts, strict=False):
+        if not a.strip():
+            if b.strip():
+                return None, ""        # an insertion with no anchor
+            continue
+        pos = _unique_index(text[at:], a)
+        if pos < 0:
+            return None, ""
+        pos += at
+        text = text[:pos] + b + text[pos + len(a):]
+        at = pos + len(b)
+    return text, "matched piece by piece around `...` lines"
+
+
+#: A "did you mean" search compares characters only for these many
+#: windows, chosen first by how many of the anchor's lines they hold
+#: exactly — the whole-file character comparison it replaced took 32 s for
+#: a 40-line anchor on a 1,000-line file, and minutes beyond that.
+SIMILAR_CANDIDATES = 8
+SIMILAR_MAX_LINES = 80
+
+
+def _similar(before: str, old: str) -> tuple[int, str]:
+    """(1-based first line, the lines) of the window most like the anchor,
+    or (0, "") when nothing is alike enough to suggest."""
+    lines = before.splitlines()
+    part = old.splitlines()
+    n = len(part)
+    if not n or not lines or n > SIMILAR_MAX_LINES:
+        return 0, ""
+    wanted = {ln.strip() for ln in part if ln.strip()}
+    if not wanted:
+        return 0, ""
+    hit = [1 if ln.strip() in wanted else 0 for ln in lines]
+    # windows by exact line overlap — a running sum, linear in the file
+    span = min(n, len(lines))
+    total = sum(hit[:span])
+    scored = [(total, 0)]
+    for i in range(1, len(lines) - span + 1):
+        total += hit[i + span - 1] - hit[i - 1]
+        scored.append((total, i))
+    best_overlap = max(t for t, _i in scored)
+    if best_overlap == 0:
+        return 0, ""
+    candidates = [i for _t, i in sorted(scored, key=lambda x: (-x[0], x[1]))
+                  [:SIMILAR_CANDIDATES]]
+    target = "\n".join(ln.strip() for ln in part)
+    best, at = 0.0, -1
+    for i in candidates:
+        window = "\n".join(ln.strip() for ln in lines[i:i + n])
+        ratio = difflib.SequenceMatcher(None, window, target).ratio()
+        if ratio > best:
+            best, at = ratio, i
+    if at < 0 or best < SIMILAR_HINT:
+        return 0, ""
+    return at + 1, "\n".join(lines[at:at + n])
+
+
+def forgiving_replace(before: str, old: str, new: str
+                      ) -> tuple[str | None, str, str]:
+    """(the new text or None, how it matched, why it did not).
+
+    Exact first, whole words (`_unique_index`); then the whole-line
+    fallbacks; then `...` pieces. A refusal says why — with the line
+    numbers of every match when there are several, the lines the model
+    probably meant when there are none, and "already applied" when the
+    replacement is there and the anchor is not.
+    """
+    pos = _unique_index(before, old)
+    if pos >= 0:
+        return before[:pos] + new + before[pos + len(old):], "", ""
+    if pos == AMBIGUOUS:
+        where = _occurrences(before, old)
+        return None, "", (
+            "the text to replace appears more than once"
+            + (f" (at lines {', '.join(map(str, where))})" if where else "")
+            + " — refusing rather than guessing which one was meant; "
+              "include more of the surrounding lines")
+    if pos == INSIDE_A_NAME:
+        return None, "", _INSIDE_A_NAME
+    for attempt in (_line_match, _elided_match):
+        got, how = attempt(before, old, new)
+        if got is not None:
+            return got, how, ""
+        if how.startswith("ambiguous: "):
+            return None, "", (
+                f"the text to replace appears more than once once spacing "
+                f"is ignored (at lines {how[len('ambiguous: '):]}) — "
+                f"refusing rather than guessing which one was meant; "
+                f"include more of the surrounding lines")
+    if new.strip() and _unique_index(before, new.strip("\n")) >= 0:
+        return None, "", ("the text to replace is not in the file, but the "
+                          "replacement already is — this edit looks applied "
+                          "already")
+    line, near = _similar(before, old)
+    why = ("the text to replace is not in the file (it may have changed "
+           "since the model read it)")
+    if near:
+        why += (f". Did you mean these lines, from line {line}? They must "
+                f"be copied exactly:\n{near}")
+    return None, "", why
+
+
 def unified(before: str, after: str, path: str, context: int = 2) -> str:
     return "".join(difflib.unified_diff(
         before.splitlines(keepends=True), after.splitlines(keepends=True),
@@ -536,27 +777,20 @@ class Transaction:
             tf = textio.new_file(fs, "")
 
         # -- compute the new text -----------------------------------------
+        matched_how = ""
         if edit.kind == "replace":
             if not (edit.old or "").strip():
                 return EditResult(edit.path, False,
                                   "the anchor is empty — there is nothing to "
                                   "match against")
             anchor = textio.normalise(edit.old)
-            pos = _unique_index(before, anchor)
-            if pos == MISSING:
-                return EditResult(
-                    edit.path, False,
-                    "the text to replace is not in the file (it may have "
-                    "changed since the model read it)")
-            if pos == AMBIGUOUS:
-                return EditResult(
-                    edit.path, False,
-                    "the text to replace appears more than once — refusing "
-                    "rather than guessing which one was meant")
-            if pos == INSIDE_A_NAME:
-                return EditResult(edit.path, False, _INSIDE_A_NAME)
-            after = (before[:pos] + textio.normalise(edit.new)
-                     + before[pos + len(anchor):])
+            got, how, why = forgiving_replace(before, anchor,
+                                              textio.normalise(edit.new))
+            if got is None:
+                return EditResult(edit.path, False, why)
+            after = got
+            if how:
+                matched_how = how
         elif edit.kind == "diff":
             after, why = _apply_diff(before, textio.normalise(edit.new))
             if why:
@@ -614,8 +848,8 @@ class Transaction:
         # quietly — a mixed-EOL file had every minority line ending
         # rewritten, and the decode's assumption that says so was computed
         # and thrown away. On success `reason` carries these notes.
-        notes = [n for n in ((tf.assumption if existed else ""), widened)
-                 if n]
+        notes = [n for n in ((tf.assumption if existed else ""), widened,
+                             matched_how) if n]
         if notes:
             self._p.events("warning", f"{rel}: {'; '.join(notes)}",
                            {"seq": self.seq, "files": [rel],

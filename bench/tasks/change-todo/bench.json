@@ -1,0 +1,2 @@
+{"kind": "change", "lang": "python", "timeout_s": 900,
+ "note": "A change to an existing file: everything not mentioned must survive (the dropped-code guard)."}

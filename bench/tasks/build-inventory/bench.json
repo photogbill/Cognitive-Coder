@@ -1,0 +1,2 @@
+{"kind": "build", "lang": "python", "timeout_s": 1200,
+ "note": "Three files that must agree on one data type: the pinned interfaces, dependency order, tests beside modules."}

@@ -1,0 +1,2 @@
+{"kind": "change", "lang": "python", "timeout_s": 900,
+ "note": "A long file (over 150 lines) where one function changes: whole-file replies drop or alter others — the dropped-code guard and narrowed repairs."}

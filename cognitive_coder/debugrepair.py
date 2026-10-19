@@ -461,14 +461,37 @@ def _outline(session: Any, paths: Sequence[str]) -> str:
     return "\n".join(rows)
 
 
+def _likely_order(session: Any, every: Sequence[str], text: str
+                  ) -> list[str]:
+    """``every`` ordered most likely first by the codemap's ranking toward
+    ``text``; files the index does not know keep their order, after."""
+    codemap = getattr(session, "codemap", None)
+    if codemap is None or not hasattr(codemap, "ranked"):
+        return list(every)
+    try:
+        ranked = codemap.ranked(text)
+    except Exception:                                    # noqa: BLE001
+        return list(every)
+    known = {p.replace("\\", "/"): i for i, p in enumerate(ranked)}
+    return sorted(every, key=lambda p: (known.get(p.replace("\\", "/"),
+                                                  len(known)), p))
+
+
 def model_locate(session: Any, report: DebugReport, seen: str
                  ) -> tuple[list[str], str]:
     """One model call: which files most likely hold the fault, and why.
     Source files are offered before tests; a test is never picked when a
     source file was."""
     every = _listed(session)
-    files = ([f for f in every if not runner.is_test_path(f)]
-             + [f for f in every if runner.is_test_path(f)])[:LOCATE_FILES]
+    # MOST LIKELY FIRST (codemap/rank.py): toward the names and paths the
+    # error, the description and the command mention, then by how much the
+    # rest of the project uses each file. It was path order, so a project
+    # past the cap lost its likeliest files to the alphabet.
+    order = _likely_order(session, every,
+                          " ".join((report.description, seen,
+                                    report.command)))
+    files = ([f for f in order if not runner.is_test_path(f)]
+             + [f for f in order if runner.is_test_path(f)])[:LOCATE_FILES]
     if not files:
         return [], "the project has no source files to choose from"
     task = ["A program in this project misbehaves. Name the file(s) whose "

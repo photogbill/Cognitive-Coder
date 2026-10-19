@@ -1,0 +1,1 @@
+In `todo.py`, add a method `remove(index)` to `TodoList` that deletes the item at that index and returns its text. A bad index (out of range, or negative) MUST raise `IndexError`. Keep everything else exactly as it is.

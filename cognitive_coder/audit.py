@@ -498,21 +498,28 @@ def _verify(host: Any, files: Sequence[tuple[str, str, str]],
 # --------------------------------------------------------------------------
 
 def _worth_reading(files: Sequence[tuple[str, str, str]],
-                   found: Sequence[AuditFinding], limit: int
+                   found: Sequence[AuditFinding], limit: int,
+                   ranked: Sequence[str] = ()
                    ) -> list[tuple[str, str, str]]:
     """The files most worth a model's attention, best first.
 
     Where the tools already found something, a second reader is most
-    likely to find its cause or its neighbours; then the biggest sources.
-    Tests come last: they are read for what they check, not reviewed.
+    likely to find its cause or its neighbours; then the files the rest of
+    the project depends on most — or, with a focus, the files it names
+    (``ranked``, codemap/rank.py) — then the biggest sources. Size used to
+    come straight after the findings, so a 900-line data table outranked
+    the module everything calls. Tests come last: they are read for what
+    they check, not reviewed.
     """
     weight: Counter = Counter()
     for f in found:
         weight[f.path] += {"high": 6, "medium": 3, "low": 1}.get(
             f.severity, 0)
-    ranked = sorted(files, key=lambda f: (_looks_like_test(f[0]),
-                                          -weight[f[0]], -len(f[2])))
-    return ranked[:max(0, limit)]
+    place = {p.replace("\\", "/"): i for i, p in enumerate(ranked)}
+    order = sorted(files, key=lambda f: (
+        _looks_like_test(f[0]), -weight[f[0]],
+        place.get(f[0].replace("\\", "/"), len(place)), -len(f[2])))
+    return order[:max(0, limit)]
 
 
 def _numbered(text: str, max_chars: int) -> tuple[str, int, int]:
@@ -570,7 +577,11 @@ def _model_pass(host: Any, codemap: CodeMap,
     if not caps.loaded:
         return [], [], [], ("no model is loaded, so only the tools' "
                             "findings are here"), ""
-    chosen = _worth_reading(files, found, config.max_model_files)
+    try:
+        ranked = codemap.ranked(config.focus or "")
+    except Exception:                                    # noqa: BLE001
+        ranked = []
+    chosen = _worth_reading(files, found, config.max_model_files, ranked)
     if not chosen:
         return [], [], [], "there were no files to read", caps.name
 

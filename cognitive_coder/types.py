@@ -64,7 +64,8 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "budget", "cancel", "epoch", "error", "skills",
                   "blocked", "audit", "model_check", "baseline",
                   "interfaces", "canvas", "debug", "constraints",
-                  "mutation", "adjudicate", "phase", "swap")
+                  "mutation", "adjudicate", "phase", "swap", "narrow",
+                  "keep", "recall")
 
 
 # --------------------------------------------------------------------------

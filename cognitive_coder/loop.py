@@ -68,10 +68,12 @@ from . import (
     adjudicate,
     enrich,
     guard,
+    keep,
     langs,
     personas,
     runner,
     specslice,
+    symedit,
     textio,
 )
 from . import canvas as cv
@@ -177,6 +179,30 @@ class LoopConfig:
     #: and the errors, so its budget is the smaller one.
     request_chars_first: int = specslice.FIRST_CHARS
     request_chars_repair: int = specslice.REPAIR_CHARS
+    #: THE DROPPED-CODE GUARD (keep.py). A reply for a file that already
+    #: had real code in it is refused BEFORE it is written when it leaves
+    #: out a definition the request does not name, or puts a placeholder
+    #: (`# ... rest unchanged`, a body turned into `...`) where code was —
+    #: so the operator's file is still on disk, whole, for the next attempt.
+    keep_existing: bool = True
+    #: NARROWED EDITS (symedit.py, F5). "auto": a Python REPAIR returns only
+    #: the definitions it changes when the file is over `narrow_min_lines`
+    #: lines or after the same attempt came back twice
+    #: (`narrow_on_stagnation`), and any repair or change does when the
+    #: whole file does not fit the model's context; "always": every repair
+    #: and change of an existing Python file; "off": the whole file, always.
+    narrow: str = "auto"
+    narrow_min_lines: int = 150
+    #: Where the errors are, marked: each located error's line with the
+    #: def/class lines around it (diagnostics.where_block), for repairs.
+    mark_errors: bool = True
+    #: REGRESSION MEMORY (F10): a repair is told how the same error was
+    #: fixed before in this project, when the record has it.
+    recall_fixes: bool = True
+    #: TWO PASSES (Aider's architect/editor split, opt-in): before a repair,
+    #: one short call says in words what is wrong and what to change; the
+    #: repair is shown that diagnosis. One more model call per repair.
+    diagnose_first: bool = False
 
 
 @dataclass(frozen=True)
@@ -292,6 +318,32 @@ class Loop:
     #: the journal and BUILD_LOG.txt print the temperature and seed that
     #: were USED, never the config's (set per attempt by `_generate`).
     _sampling: dict = field(default_factory=dict, repr=False)
+    #: {path: the file as it stood when its task began} — for a file that
+    #: already had real code (not a stub): what a reply must keep
+    #: (keep.py), and what a fresh start of a file that was here before
+    #: this session wrote it is shown instead of nothing.
+    _original: dict = field(default_factory=dict, repr=False)
+    #: Paths this loop has written. A file NOT in it when its task begins
+    #: was here before — the operator's, or an earlier session's.
+    _written: set = field(default_factory=set, repr=False)
+    #: {path: was the file here before this loop first wrote it}, per task.
+    _here_before: dict = field(default_factory=dict, repr=False)
+    #: {path: True} — narrowing switched on for the rest of this task by
+    #: stagnation (F5: "identical diagnostics twice ⇒ narrow, don't retry").
+    _narrow_next: dict = field(default_factory=dict, repr=False)
+    #: {path: the attempt whose code came from a narrowed reply}.
+    _via_narrow: dict = field(default_factory=dict, repr=False)
+    #: A refusal raised while generating (a narrowed reply that could not be
+    #: placed in a file too large for any other path): the diagnostic the
+    #: attempt is recorded with. Consumed at once by `run_task`.
+    _refusal: Any = field(default=None, repr=False)
+    #: {path: its diagnosis} from the opt-in describe-first pass.
+    _diagnosis: dict = field(default_factory=dict, repr=False)
+    #: A narrowed reply that could not be placed, when the whole-file path
+    #: was to take the attempt instead: if that path then finds the file
+    #: too large to show, this becomes the attempt's refusal — it used to
+    #: end the task as "the model returned nothing" (review, 2026-10-19).
+    _unplaced: Any = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
     # the escalation ladder
@@ -423,7 +475,8 @@ class Loop:
         return re.findall(r"^\s+def (test_\d+_\w+)\(", text, re.M)
 
     def _next_rung_changes(self, attempt: int, persona: Persona,
-                           caps: ModelCapabilities | None) -> str:
+                           caps: ModelCapabilities | None,
+                           path: str = "") -> str:
         """Why attempt ``attempt + 1`` is a different try, or "" when it
         would be the same sampling again (so stagnation should stop)."""
         if not self.config.escalate:
@@ -432,6 +485,12 @@ class Loop:
         now = self.sampling_for(attempt, persona, caps)
         if nxt.fresh or nxt.seed != now.seed or \
                 nxt.temperature != now.temperature:
+            if path and self._narrow_next.get(path) and not nxt.fresh:
+                # said as it will be: narrowing is on for this task, so the
+                # attempt is a narrowed repair, not a whole file
+                return nxt.reason.replace("a whole-file repair",
+                                          "a narrowed repair (only the "
+                                          "definitions that change)")
             return nxt.reason
         return ""
 
@@ -538,6 +597,21 @@ class Loop:
         contract = strip_stub_sentinel(on_disk) \
             if lang == "python" and _is_pinned(on_disk) else ""
         self._contract = contract.strip()
+        # THE FILE AS IT STOOD (keep.py): a file with real code in it — not
+        # a stub, not a pinned skeleton — is what every reply must keep.
+        self._narrow_next.pop(task.path, None)
+        self._via_narrow.pop(task.path, None)
+        self._diagnosis.pop(task.path, None)
+        self._refusal = None
+        # FIRST SEEN, and kept: a Debug & Repair round 2 (or a queued repair)
+        # is a new task on a file this loop has written — its "original" is
+        # still the operator's file, and it was still here before.
+        if on_disk.strip() and not _is_our_stub(on_disk) and not contract:
+            self._original.setdefault(task.path, on_disk)
+        self._here_before.setdefault(task.path,
+                                     task.path not in self._written)
+        #: {attempt: the code it wrote} — what regression memory compares.
+        codes: dict[int, str] = {}
         baseline_id = (_code_identity(baseline, lang)[0]
                        if baseline is not None and baseline.strip() else "")
         caps = self._capabilities()
@@ -570,6 +644,12 @@ class Loop:
                     carried = tuple(seed)      # nothing newer to go on
                 else:
                     carried = ()
+                #: The real errors under any refusal: a refused attempt is
+                #: recorded with its refusal FIRST and the errors it was
+                #: answering after — carried on alone, never stacked, or
+                #: four refusals in a row pushed the real NameError out of
+                #: the prompt (review, 2026-10-19).
+                real = tuple(d for d in carried if d.code not in _REFUSALS)
                 if carried:
                     # M33: the DIAGNOSTICS carry forward, not the broken code.
                     lang_obj = langs.get(lang)
@@ -585,6 +665,9 @@ class Loop:
                     # same answer — this is what makes the prompt different.
                     facts = enrich.facts_for(carried, codemap=self.codemap,
                                              fs=self.host.fs, lang=lang)
+                    recalled = self._recall(task, carried, n)
+                    if recalled:
+                        diag_text = f"{diag_text}\n\n{recalled}"
                     if facts:
                         diag_text = f"{diag_text}\n\n{facts}"
                         self._emit("status",
@@ -613,6 +696,21 @@ class Loop:
 
                 if completion.finish_reason == "cancelled":
                     raise Cancelled(f"generating {task.path}")
+
+                # A narrowed reply that could not be placed, for a file no
+                # other path can take: an attempt, refused, with the reason
+                # as its error — never "the model returned nothing".
+                refusal, self._refusal = self._refusal, None
+                if refusal is not None:
+                    stopped = self._refused(
+                        task, n, code, lang, (refusal, *real), completion,
+                        continued, sent, (), "refused: the narrowed reply "
+                        "could not be placed", seen, history, attempts,
+                        error_counts, persona, caps,
+                        event={"narrow": "unplaced"})
+                    if stopped:
+                        break
+                    continue
 
                 if not code.strip():
                     note = ("the model used every tool round looking things "
@@ -687,6 +785,44 @@ class Loop:
                                {"task": task.path, "unchanged": True})
                     break
 
+                # -- what a change to a real file must keep (keep.py) -----
+                # BEFORE the write: refused, the operator's file is still on
+                # disk, whole, for the next attempt to be shown.
+                original = self._original.get(task.path, "")
+                if original and self.config.keep_existing and code.strip():
+                    finding = keep.check(
+                        original, code, lang, path=task.path,
+                        request=request,
+                        used_elsewhere=lambda name, _p=task.path:
+                            self._used_elsewhere(name, _p))
+                    if finding.any:
+                        self._log_keep(task, n, finding)
+                    if finding.refused:
+                        self._emit("warning",
+                                   f"{task.path}: attempt {n} was not "
+                                   f"written — the reply "
+                                   f"{finding.describe()}",
+                                   {"task": task.path, "attempt": n,
+                                    "keep": True})
+                        if self._narrow_possible(task, lang, caps):
+                            # the cure for a reply that leaves code out is
+                            # a reply that holds only what it changes
+                            self._narrow_next[task.path] = True
+                        stopped = self._refused(
+                            task, n, code, lang,
+                            (finding.diagnostic(), *real), completion,
+                            continued, sent, fixes,
+                            f"refused before writing: the reply "
+                            f"{finding.describe()}", seen, history,
+                            attempts, error_counts, persona, caps,
+                            event={"keep": "refused",
+                                   "dropped": list(finding.dropped),
+                                   "placeholders": len(
+                                       finding.placeholders)})
+                        if stopped:
+                            break
+                        continue
+
                 findings = guard.scan(code, lang, self.config.project_mode)
                 blocked = guard.blocked(findings)
                 if blocked:
@@ -725,6 +861,7 @@ class Loop:
                     stopped = ("the change was not approved, so nothing was "
                                "written")
                     break
+                codes[n] = code
                 # Reindex after EVERY write, not only a passing one (M30).
                 # It used to wait for `result.ok`, so after a failed attempt
                 # the query tools contradicted `[THE FILE AS IT STANDS]` in
@@ -784,7 +921,7 @@ class Loop:
                                          attempt=n, lines=len(
                                              code.splitlines()))
                     # Remember what worked, for next time (F10).
-                    self._remember(attempts, diags)
+                    self._remember(task, lang, attempts, codes)
                     break
 
                 # -- a test written first fails against the stub --------
@@ -860,13 +997,31 @@ class Loop:
                 history.append(sig)
                 error_counts.append(sum(1 for d in diags if d.is_error))
                 if stopped:
+                    # F5 FIRST: "identical diagnostics twice ⇒ narrow,
+                    # don't retry". The next attempt returns only the
+                    # function the error is in — a smaller, different
+                    # input — and the ladder's rung still applies to it.
+                    narrowed = self._narrow_on_stagnation(task, lang, diags,
+                                                          n, caps)
+                    if narrowed:
+                        self._emit("status",
+                                   f"{task.path}: {stopped} — attempt "
+                                   f"{n + 1} narrows the unit of work to "
+                                   f"{narrowed}",
+                                   {"task": task.path, "attempt": n + 1,
+                                    "narrow": True})
+                        self._log_line(f"  narrowing: {stopped} — attempt "
+                                       f"{n + 1} returns only {narrowed}")
+                        stopped = ""
+                if stopped:
                     # THE LADDER, NOT THE EXIT. Stagnation means the same
                     # input gave the same output; while a rung is left,
                     # the next attempt is a different input — a fresh
                     # start, a higher temperature, a new seed — and the
                     # reason is said. Only when nothing would change does
                     # the stagnation sentence end the file.
-                    change = (self._next_rung_changes(n, persona, caps)
+                    change = (self._next_rung_changes(n, persona, caps,
+                                                      task.path)
                               if n < max(1, self.config.attempts) else "")
                     if change:
                         self._emit("status",
@@ -1143,6 +1298,7 @@ class Loop:
         """
         if repair is None:
             repair = attempt > 1
+        self._unplaced = None
         caps = self.host.llm.capabilities()
         # THE LADDER: what this attempt samples at, and whether it is a
         # fresh start. Recorded per task so the journal and the build log
@@ -1241,11 +1397,45 @@ class Loop:
             if existing:
                 tail_extra.append(f"[THE FILE AS IT STANDS]\n{existing}")
                 tail_pieces.append(("THE FILE AS IT STANDS", existing))
+            original = self._original.get(task.path, "")
+            if fresh and original and self._here_before.get(task.path):
+                # A FRESH START OF A FILE THAT WAS HERE BEFORE. Not shown
+                # the broken attempts (D11) — but the operator's own file is
+                # not a broken attempt; it is what the change starts from.
+                # Without it a fresh start regenerated their file blind.
+                label = (f"THE FILE AS IT STOOD BEFORE THIS TASK — "
+                         f"{task.path}; keep everything the request does "
+                         f"not change")
+                tail_extra.append(f"[{label}]\n{original}")
+                tail_pieces.append((label, original))
+            if not fresh and self.config.mark_errors and located:
+                # WHERE THE ERRORS ARE: each error's line marked, inside
+                # the def/class lines that hold it — so a small model does
+                # not have to count lines to find it.
+                where = dx.where_block(self._read(task.path), located,
+                                       task.path, same_file=_same_file)
+                if where:
+                    tail_extra.append(where)
+                    tail_pieces.append(("WHERE THE ERRORS ARE", where))
+            if not fresh and self.config.diagnose_first:
+                said = self._diagnose(task, persona, lang, diagnostics,
+                                      arch, interfaces, tail_extra, attempt)
+                if said:
+                    label = "WHAT TO CHANGE — the diagnosis written for " \
+                            "this repair"
+                    tail_extra.append(f"[{label}]\n{said}")
+                    tail_pieces.append((label, said))
             if fresh:
+                shown_original = bool(original
+                                      and self._here_before.get(task.path))
                 self._emit("status",
                            f"{task.path}: attempt {attempt} starts fresh — "
-                           f"the broken file is not shown; the interface, "
-                           f"the test and the errors are",
+                           + ("the earlier attempts are not shown; the file "
+                              "as it stood before this task, the test and "
+                              "the errors are"
+                              if shown_original else
+                              "the broken file is not shown; the interface, "
+                              "the test and the errors are"),
                            {"task": task.path, "attempt": attempt,
                             "fresh": True})
             if pinned:
@@ -1346,6 +1536,27 @@ class Loop:
                     (f"THE MODULE UNDER TEST — {self._covers}",
                      f"{module_source}\n\n{rule}"))
 
+        # -- NARROWED EDITS: only the definitions that change (symedit.py) -
+        # F5. For a Python file that already has real code, when the file
+        # is long, when the same attempt came back twice, or when narrowing
+        # is always on: the reply holds only the functions it rewrites, and
+        # they are put back by name. Any reason it cannot serve falls
+        # through to the whole file, said in BUILD_LOG.txt.
+        narrow_args = {
+            "repair": repair, "located": located, "request": request,
+            "autofixes": autofixes, "diagnostics": diagnostics,
+            "arch": arch, "interfaces": interfaces, "examples": examples,
+            "staleness": staleness, "tail_extra": tail_extra,
+            "tail_pieces": tail_pieces, "caps": caps, "attempt": attempt,
+            "sampling": sampling}
+        narrow_why = self._narrow_why(task, lang, repair=repair, fresh=fresh,
+                                      caps=caps)
+        if narrow_why:
+            via = self._narrow_generate(task, lang, why=narrow_why,
+                                        must=False, **narrow_args)
+            if via is not None:
+                return via
+
         # -- DIFFUSION MODE: a hole, not the whole file (canvas.py) --------
         # Everything above — the interfaces, the pinned contract, the test,
         # the caller, the enriched errors — is the context of the hole too;
@@ -1384,15 +1595,59 @@ class Loop:
                     *([("HOW THIS CODEBASE DOES THINGS", examples)]
                       if examples else [])])
         if self._too_big:
+            why, self._too_big = self._too_big, ""
+            if self._unplaced is not None:
+                # the narrowed reply this attempt already paid for could not
+                # be placed, and there is no whole-file path: that is the
+                # attempt's refusal, with its reason, for the next attempt
+                self._refusal, self._unplaced = self._unplaced, None
+                return "", Completion(text="", finish_reason="stop",
+                                      model=caps.name), False, messages
+            # TOO LARGE TO SHOW WHOLE — which no longer means "cannot be
+            # changed": a narrowed edit shows what must change in full and
+            # the rest as headers (symedit.condensed_view).
+            if not narrow_why and self._narrow_possible(task, lang, caps):
+                via = self._narrow_generate(
+                    task, lang, why="the file is too large to show whole",
+                    must=True, **narrow_args)
+                if via is not None:
+                    return via
             # No model call: the answer could only be a truncated file.
             # Returned as an error completion so the attempt is journaled
             # and the loop stops with this sentence, like any provider
             # error (the same path, so the same guarantees).
-            why, self._too_big = self._too_big, ""
             return "", Completion(text="", finish_reason="error",
                                   error=why, model=caps.name), False, \
                 messages
 
+        text, completion, continued, messages = self._complete_text(
+            messages, caps, task, sampling, attempt, persona, lang)
+
+        # -- commentary detector at the CONSUMING call site (M36) -------
+        if detect_commentary(text, lang):
+            self._emit("warning",
+                       f"{task.path}: the model wrote commentary as well as "
+                       f"code; the code has been extracted from it.",
+                       {"task": task.path})
+            text = strip_commentary(text, lang)
+
+        # A copied stub marker would make a finished file read as a stub.
+        code = strip_stub_sentinel(_extract(text, lang, task.path))
+        # The prompt that produced the answer: after tool round-trips and
+        # the text-lookup fallback, before any continuation (a continuation
+        # is derived from this prompt, not a different one).
+        return code, completion, continued, list(messages)
+
+    def _complete_text(self, messages: list[Message],
+                       caps: ModelCapabilities, task: Task,
+                       sampling: Sampling, attempt: int, persona: Persona,
+                       lang: str
+                       ) -> tuple[str, Completion, bool, list[Message]]:
+        """(reply text, completion, continued, the messages sent): one
+        generation with its tool round-trips, the text-lookup fallback and
+        truncation continuation. Shared by the whole-file path and the
+        narrowed one, so both get every one of those guarantees.
+        """
         tools = ()
         if (self.config.use_tools and caps.supports_tools
                 and self.codemap is not None):
@@ -1471,20 +1726,460 @@ class Loop:
                 model=more.model or completion.model,
                 prompt_ms=more.prompt_ms or completion.prompt_ms)
 
-        # -- commentary detector at the CONSUMING call site (M36) -------
-        if detect_commentary(text, lang):
-            self._emit("warning",
-                       f"{task.path}: the model wrote commentary as well as "
-                       f"code; the code has been extracted from it.",
-                       {"task": task.path})
-            text = strip_commentary(text, lang)
-
-        # A copied stub marker would make a finished file read as a stub.
-        code = strip_stub_sentinel(_extract(text, lang, task.path))
         # The prompt that produced the answer: after tool round-trips and
         # the text-lookup fallback, before any continuation (a continuation
         # is derived from this prompt, not a different one).
-        return code, completion, continued, list(messages)
+        return text, completion, continued, list(messages)
+
+    # ------------------------------------------------------------------
+    # NARROWED EDITS (symedit.py, F5)
+    # ------------------------------------------------------------------
+    def _narrow_possible(self, task: Task, lang: str,
+                         caps: ModelCapabilities | None) -> bool:
+        """A narrowed edit could serve this file at all: Python, a real file
+        that parses, narrowing not switched off, no canvas model."""
+        if str(self.config.narrow or "off").lower() == "off" \
+                or lang != "python":
+            return False
+        if caps is not None and self._canvas_ready(caps):
+            return False
+        code = self._read(task.path)
+        if not code.strip() or _is_our_stub(code) or _is_pinned(code):
+            return False
+        return symedit.index(code) is not None
+
+    def _narrow_why(self, task: Task, lang: str, *, repair: bool,
+                    fresh: bool, caps: ModelCapabilities) -> str:
+        """Why this attempt is a narrowed edit, or "" — the whole file."""
+        if not self._narrow_possible(task, lang, caps):
+            return ""
+        mode = str(self.config.narrow or "auto").lower()
+        stagnated = bool(self._narrow_next.get(task.path))
+        if fresh:
+            # THE LADDER'S FRESH START WINS: a different input, the file
+            # written again from the request — announced as such, so it
+            # must be such. Narrowing resumes on the attempt after it.
+            # (A file too large to show whole still narrows: the
+            # too-large path asks for it.)
+            return ""
+        if stagnated:
+            return ("an earlier attempt came back the same, or left code "
+                    "out, so the unit of work is narrowed to the "
+                    "definitions that must change (F5)")
+        if mode == "always":
+            return "narrowed edits are always on"
+        if not repair:
+            return ""
+        n = len(symedit.lines_of(self._read(task.path)))
+        if n > max(1, int(self.config.narrow_min_lines or 1)):
+            return (f"the file is {n} lines, and only what the error is in "
+                    f"needs to change")
+        return ""
+
+    def _narrow_on_stagnation(self, task: Task, lang: str,
+                              diags: Sequence[Diagnostic], n: int,
+                              caps: ModelCapabilities | None) -> str:
+        """Switch narrowing on for the rest of this task, and name what the
+        next attempt returns — or "" when it cannot narrow."""
+        if not self.config.narrow_on_stagnation \
+                or self._narrow_next.get(task.path) \
+                or n >= max(1, self.config.attempts) \
+                or not self._narrow_possible(task, lang, caps):
+            return ""
+        code = self._read(task.path)
+        targets = self._narrow_targets(task, code, diags, "", repair=True)
+        if not targets:
+            return ""
+        self._narrow_next[task.path] = True
+        return ", ".join(f"`{symedit.shown_name(t)}`" for t in targets)
+
+    def _narrow_targets(self, task: Task, code: str,
+                        located: Sequence[Diagnostic], request: str, *,
+                        repair: bool) -> list[str]:
+        """The definitions a narrowed edit is about: where the error is —
+        the functions holding its lines, else the ones the failing test
+        calls — and, for a change, the ones the request names."""
+        targets: list[str] = []
+        if repair:
+            lines = [d.line for d in located
+                     if d.is_error and d.line and d.line > 0
+                     and _same_file(d.file, task.path)]
+            test_source = self._read(task.test_path) if task.test_path \
+                else ""
+            targets = symedit.targets_for(
+                code, lines,
+                named=lambda: cv.test_named_functions(code, located,
+                                                      test_source))
+        if not targets and request:
+            idx = symedit.index(code)
+            if idx is not None:
+                targets = [n for n in idx.names(("function", "method",
+                                                 "class"))
+                           if keep.mentioned(n, request)][:6]
+        return targets
+
+    def _whole_fits(self, code: str, caps: ModelCapabilities) -> bool:
+        """Roughly: would a whole-file prompt and reply fit the context?"""
+        total = int(getattr(caps, "context_tokens", 0) or 0)
+        if total <= 0:
+            return True
+        try:
+            need = self.host.llm.count_tokens(code)
+        except Exception:                                # noqa: BLE001
+            need = len(code) // CHARS_PER_TOKEN
+        # the file is in the prompt AND is the reply
+        return 2 * need + 1500 + int(self.config.max_tokens) <= total \
+            or need + 1500 + int(self.config.max_tokens) <= total
+
+    def _narrow_generate(self, task: Task, lang: str, *, why: str,
+                         must: bool, repair: bool,
+                         located: Sequence[Diagnostic], request: str,
+                         autofixes: Sequence[str], diagnostics: str,
+                         arch: str, interfaces: str, examples: str,
+                         staleness: str, tail_extra: Sequence[str],
+                         tail_pieces: Sequence[tuple[str, str]],
+                         caps: ModelCapabilities, attempt: int,
+                         sampling: Sampling
+                         ) -> tuple[str, Completion, bool, list[Message]] | None:
+        """(the whole file with the reply put back, completion, continued,
+        messages) — or None: the whole-file path takes this attempt.
+
+        ``must`` says there is no whole-file path (the file is too large to
+        show whole): a reply that cannot be placed is then this attempt's
+        refusal, with the reason as its error, instead of None.
+        """
+        code = self._read(task.path)
+        if symedit.index(code) is None:
+            self._narrow_skip(task, attempt, "the file does not parse, so its "
+                                             "definitions cannot be found by "
+                                             "name")
+            return None
+        targets = self._narrow_targets(task, code, located, request,
+                                       repair=repair)
+        must = must or not self._whole_fits(code, caps)
+        persona = PERSONAS["editor"]
+        context = [x for x in tail_extra
+                   if not x.startswith("[THE FILE AS IT STANDS]")]
+        task_text = personas.narrow_task(
+            task.path, task.purpose, targets=targets, request=request,
+            autofixes=autofixes, change=not repair)
+        epoch = self.codemap.store.epoch if self.codemap else 0
+        count = self.host.llm.count_tokens
+
+        def build(view_text: str, condensed: bool, extra: Sequence[str],
+                  with_refs: bool = True) -> list[Message]:
+            label = f"THE FILE AS IT STANDS — {task.path}"
+            if condensed:
+                label += (" (condensed: a definition shown with `...` as "
+                          "its body is not shown here, and stays exactly as "
+                          "it is unless you return it whole)")
+            return self.prompts.build(
+                persona, task_text, architecture=arch, epoch=epoch,
+                interfaces=interfaces if with_refs else "",
+                examples=examples if with_refs else "",
+                staleness=staleness, diagnostics=diagnostics,
+                contract=personas.CONTRACT_SYMBOLS,
+                extra=[*extra, f"[{label}]\n{view_text}"]).messages()
+
+        total = int(getattr(caps, "context_tokens", 0) or 0)
+        margin = max(64, total // 50) if total > 0 else 0
+        limit = total - int(self.config.max_tokens) - margin
+
+        def fits(msgs: Sequence[Message]) -> bool:
+            if total <= 0:
+                return True
+            try:
+                return sum(count(m.content) for m in msgs) <= limit
+            except Exception:                            # noqa: BLE001
+                return False
+
+        condensed = False
+        messages = build(code, False, context)
+        if not fits(messages):
+            if not targets:
+                self._narrow_skip(task, attempt,
+                                  "the file does not fit whole and no "
+                                  "definition was named to show in full")
+                return None
+            condensed = True
+            view = symedit.condensed_view(code, targets)
+            messages = build(view, True, context)
+            if not fits(messages):
+                # the reference blocks go before the file itself does
+                messages = build(view, True, [x for x in context
+                                              if x.startswith("[WHERE")],
+                                 with_refs=False)
+            if not fits(messages):
+                self._narrow_skip(task, attempt,
+                                  "even the condensed view of the file "
+                                  "does not fit the model's context")
+                return None
+        named = ", ".join(f"`{symedit.shown_name(t)}`" for t in targets)
+        shown = (f"the file condensed — {named} in full, every other "
+                 f"definition as its header"
+                 if condensed else "the whole file shown")
+        asked = named or "whatever it changes"
+        self._emit("status",
+                   f"{task.path}: attempt {attempt} returns only {asked} "
+                   f"— {why}",
+                   {"task": task.path, "attempt": attempt,
+                    "narrow": {"targets": list(targets), "why": why,
+                               "condensed": condensed}})
+        self._decision("narrow", task, attempt,
+                       f"return only {asked}",
+                       details=[f"why: {why}", f"view: {shown}"])
+
+        text, completion, continued, messages = self._complete_text(
+            messages, caps, task, sampling, attempt, persona, lang)
+        if completion.finish_reason == "cancelled":
+            return "", completion, continued, messages
+        if completion.finish_reason == "error" or not text.strip():
+            return "", completion, continued, messages
+        applied = symedit.apply(code, text, targets=targets)
+        if not applied.ok and detect_commentary(text, lang):
+            second = symedit.apply(code, strip_commentary(text, lang),
+                                   targets=targets)
+            if second.ok:
+                applied = second
+        self._journal_narrow(task, attempt, why, targets, condensed, applied)
+        if not applied.ok and applied.unchanged:
+            # "nothing here needs to change" — the model's own escape hatch
+            # (the test is wrong, the caller is wrong). The file comes back
+            # as it is, so the loop's unchanged-file rule and the judge
+            # answer it, exactly as for a whole file returned unchanged.
+            self._decision("narrow", task, attempt,
+                           "the reply returned every definition unchanged")
+            return code, completion, continued, messages
+        if applied.ok:
+            self._via_narrow[task.path] = attempt
+            self._decision("narrow", task, attempt,
+                           f"the reply was put back: {applied.describe()}")
+            return applied.code, completion, continued, messages
+        self._emit("warning",
+                   f"{task.path}: the narrowed reply could not be placed — "
+                   f"{applied.problem}"
+                   + ("" if must else "; this attempt writes the whole file "
+                                      "instead"),
+                   {"task": task.path, "attempt": attempt})
+        self._decision("narrow", task, attempt,
+                       f"the reply could not be placed: {applied.problem}",
+                       details=[("this attempt is refused with that reason; "
+                                 "the file is too large for any other path")
+                                if must else
+                                "this attempt writes the whole file instead"],
+                       blocks=[("the reply", text)])
+        refusal = Diagnostic(
+            file=task.path, line=0, severity="error",
+            code="narrow-unplaced", tool="symedit",
+            message=(f"Your last reply could not be put into "
+                     f"{task.path}: {applied.problem}. Return only "
+                     f"complete definitions — each function or class "
+                     f"whole, a method under its `class` line — and "
+                     f"any import lines you add."))
+        if must:
+            self._refusal = refusal
+            return "", completion, continued, messages
+        # the whole-file path takes this attempt: one attempt, two calls —
+        # the first one journaled here, so its tokens are not lost
+        self._unplaced = refusal
+        self._journal_call(task, attempt, completion, messages,
+                           "narrowed reply, not placed")
+        return None
+
+    def _journal_call(self, task: Task, attempt: int, completion: Completion,
+                      sent: Sequence[Message], what: str) -> None:
+        """A `generate` event for a call that is not the attempt's own —
+        a narrowed reply that fell back, a diagnosis — so the journal holds
+        every call and every token, not one per attempt."""
+        if self.journal is None:
+            return
+        try:
+            self.journal.generation(
+                task=task.path, attempt=attempt,
+                provider=getattr(self.host.llm, "name", "host"),
+                completion=completion, prompt=list(sent) or task.purpose,
+                temperature=getattr(self._sampling.get(task.path),
+                                    "temperature", self.config.temperature),
+                verify={"call": what})
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _narrow_skip(self, task: Task, attempt: int, why: str) -> None:
+        self._decision("narrow", task, attempt,
+                       f"no narrowed edit this attempt — {why}; the whole "
+                       f"file is written instead")
+
+    def _journal_narrow(self, task: Task, attempt: int, why: str,
+                        targets: Sequence[str], condensed: bool,
+                        applied: Any) -> None:
+        if self.journal is None:
+            return
+        try:
+            self.journal.log(
+                "narrow", task=task.path, attempt=attempt, why=why,
+                targets=list(targets), condensed=condensed,
+                placed=applied.ok, replaced=list(applied.replaced),
+                added=list(applied.added), imports=list(applied.imports),
+                skipped=[list(x) for x in applied.skipped],
+                problem=applied.problem)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _decision(self, kind: str, task: Task, attempt: int, headline: str,
+                  *, details: Sequence[str] = (),
+                  blocks: Sequence[tuple[str, str]] = ()) -> None:
+        """One engine decision in BUILD_LOG.txt, in words. Never fails."""
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        try:
+            log.decision(kind, task.path, attempt, headline,
+                         details=details, blocks=blocks)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # refusals before writing, the dropped-code guard (keep.py)
+    # ------------------------------------------------------------------
+    def _refused(self, task: Task, n: int, code: str, lang: str,
+                 diags: Sequence[Diagnostic], completion: Completion,
+                 continued: bool, sent: Sequence[Message],
+                 fixes: Sequence[str], note: str, seen: set, history: list,
+                 attempts: list, error_counts: list, persona: Persona,
+                 caps: ModelCapabilities | None, *, event: dict) -> str:
+        """Record an attempt refused before it was written; "" to go on, or
+        the sentence that ends the task. The ladder applies, as for any
+        other attempt that came back the same."""
+        diags = tuple(diags)
+        sig = _signature(code, lang, diags)
+        attempts.append(AttemptRecord(
+            n=n, code_sha=sig.code, diag_sha=sig.diags, diagnostics=diags,
+            autofixes=tuple(fixes), finish_reason=completion.finish_reason,
+            continued=continued, note=note))
+        self._journal_attempt(task, n, completion, sent,
+                              {"ok": False, **event})
+        stopped = self._stagnation(sig, seen, history, attempts,
+                                   error_counts, diags)
+        seen.add(sig.pair)
+        history.append(sig)
+        error_counts.append(sum(1 for d in diags if d.is_error) or 1)
+        if not stopped:
+            return ""
+        change = (self._next_rung_changes(n, persona, caps, task.path)
+                  if n < max(1, self.config.attempts) else "")
+        if change:
+            self._log_line(f"  escalation: {stopped} — attempt {n + 1} is "
+                           f"{change}")
+            return ""
+        return stopped
+
+    def _log_keep(self, task: Task, n: int, finding: Any) -> None:
+        verdict = ("refused before writing" if finding.refused
+                   else "written, with a warning" + (
+                       " (the request asks for this file to be rewritten)"
+                       if finding.warn_only else ""))
+        details = []
+        if finding.dropped:
+            details.append("left out: " + ", ".join(
+                f"`{symedit.shown_name(x)}`" for x in finding.dropped))
+        if finding.allowed:
+            details.append("left out, as the request asks: " + ", ".join(
+                f"`{symedit.shown_name(x)}`" for x in finding.allowed))
+        for name, where in finding.moved:
+            details.append(f"moved: `{symedit.shown_name(name)}` — {where}")
+        for old, new in finding.renamed:
+            details.append(f"renamed `{old}` → `{new}` (allowed: nothing "
+                           f"uses `{old}` any more)")
+        for old, new, where in finding.still_used:
+            details.append(f"renamed `{old}` → `{new}`, but {where} still "
+                           f"uses `{old}`")
+        if finding.stubbed:
+            details.append("bodies turned into placeholders: " + ", ".join(
+                f"`{x}`" for x in finding.stubbed))
+        for line, text in finding.placeholders[:5]:
+            details.append(f"placeholder at line {line} of the reply: "
+                           f"`{text.strip()}`")
+        if finding.approximate:
+            details.append("(names found by pattern-matching for this "
+                           "language)")
+        self._decision("keep", task, n, f"the reply {verdict}",
+                       details=details)
+        if self.journal is not None:
+            try:
+                self.journal.log(
+                    "keep", task=task.path, attempt=n,
+                    refused=finding.refused, dropped=list(finding.dropped),
+                    allowed=list(finding.allowed),
+                    moved=[list(x) for x in finding.moved],
+                    renamed=[list(x) for x in finding.renamed],
+                    still_used=[list(x) for x in finding.still_used],
+                    stubbed=list(finding.stubbed),
+                    placeholders=[list(x) for x in finding.placeholders],
+                    warn_only=finding.warn_only)
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def _used_elsewhere(self, name: str, path: str) -> str:
+        """Another project file that still uses ``name``, or ""."""
+        short = name.rsplit(".", 1)[-1]
+        pattern = re.compile(rf"(?<![\w]){re.escape(short)}(?![\w])")
+        paths: list[str] = []
+        if self.codemap is not None:
+            try:
+                paths = [r["path"] for r in self.codemap.store.files()]
+            except Exception:                            # noqa: BLE001
+                paths = []
+        for other in paths:
+            if _same_file(other, path):
+                continue
+            if pattern.search(self._read(other)):
+                return other
+        return ""
+
+    # ------------------------------------------------------------------
+    # the opt-in describe-first pass (Aider's architect/editor split)
+    # ------------------------------------------------------------------
+    def _diagnose(self, task: Task, persona: Persona, lang: str,
+                  diagnostics: str, arch: str, interfaces: str,
+                  tail_extra: Sequence[str], attempt: int) -> str:
+        """Three to five sentences on what is wrong and what to change, from
+        one short call — or "" when it says nothing usable."""
+        if not diagnostics.strip():
+            return ""
+        prompt = self.prompts.build(
+            PERSONAS["repairer"], personas.diagnose_task(task.path,
+                                                         task.purpose),
+            architecture=arch,
+            epoch=(self.codemap.store.epoch if self.codemap else 0),
+            interfaces=interfaces, diagnostics=diagnostics,
+            contract=personas.CONTRACT_DIAGNOSIS, extra=list(tail_extra))
+        messages = prompt.messages()
+        caps = self._capabilities()
+        total = int(getattr(caps, "context_tokens", 0) or 0)
+        if total > 0:
+            try:
+                used = sum(self.host.llm.count_tokens(m.content)
+                           for m in messages)
+            except Exception:                            # noqa: BLE001
+                used = 0
+            if used + 300 + max(64, total // 50) > total:
+                self._decision("diagnose", task, attempt,
+                               "no diagnosis this attempt — its prompt does "
+                               "not fit the model's context")
+                return ""
+        completion = self._complete(messages, temperature=0.1,
+                                    max_tokens=300)
+        self._journal_call(task, attempt, completion, messages, "diagnosis")
+        said = strip_think(completion.text or "").strip()
+        said = re.sub(r"```.*?```", "", said, flags=re.S).strip()
+        if completion.finish_reason in ("error", "cancelled") or not said:
+            return ""
+        said = said[:1200]
+        self._diagnosis[task.path] = said
+        self._decision("diagnose", task, attempt,
+                       "a diagnosis was written before the repair",
+                       blocks=[("the diagnosis", said)])
+        return said
 
     # ------------------------------------------------------------------
     # DIFFUSION MODE (canvas.py)
@@ -2022,7 +2717,8 @@ class Loop:
         fixed = used - movable
         room = limit - fixed
         whole = [text for label, text in pieces
-                 if label == "THE FILE AS IT STANDS"]
+                 if label == "THE FILE AS IT STANDS"
+                 or label.startswith("THE FILE AS IT STOOD BEFORE THIS TASK")]
         # The file being repaired is the one piece that may NOT be cut: the
         # contract asks for the complete corrected file, and a model shown
         # its first half returns its first half — the rest of the file
@@ -2082,10 +2778,11 @@ class Loop:
 
     def _complete(self, messages: Sequence[Message], *, tools=(),
                   temperature: float = 0.15,
-                  seed: int | None | object = _UNSET) -> Completion:
+                  seed: int | None | object = _UNSET,
+                  max_tokens: int = 0) -> Completion:
         return self.host.llm.complete(
             messages, tools=tools, temperature=temperature,
-            max_tokens=self.config.max_tokens,
+            max_tokens=max_tokens or self.config.max_tokens,
             seed=self.config.seed if seed is _UNSET else seed,
             cancel=self.cancel)
 
@@ -2242,25 +2939,66 @@ class Loop:
         return (f"gave up after {len(attempts)} attempt"
                 f"{'s' * (len(attempts) != 1)} ({'; '.join(tried)}).{detail}")
 
-    def _remember(self, attempts: Sequence[AttemptRecord],
-                  diags: Sequence[Diagnostic]) -> None:
+    def _remember(self, task: Task, lang: str,
+                  attempts: Sequence[AttemptRecord],
+                  codes: dict) -> None:
         """Record the fix that worked, per project (F10).
 
         Only recorded when a repair actually succeeded — a first-attempt pass
         teaches nothing, and filling the table with non-fixes would make the
-        recall useless.
+        recall useless. The SHAPE is what changed between the failing
+        attempt and the passing one, by name (`changed `Car.update`; added
+        `import math``) — it used to be the string "model repair" for every
+        model fix, which no later prompt could learn anything from, and
+        nothing read the table back anyway.
         """
         if self.codemap is None or len(attempts) < 2:
             return
-        previous = attempts[-2]
+        last, previous = attempts[-1], attempts[-2]
         if not previous.diagnostics:
             return
-        signature = "\n".join(dx.signature(previous.diagnostics))
-        shape = "; ".join(previous.autofixes) or "model repair"
+        before = codes.get(previous.n) or self._original.get(task.path, "")
+        after = codes.get(last.n, "")
+        shape = _change_shape(before, after, lang, task.path)
+        fixes = "; ".join(last.autofixes)
+        if fixes:
+            shape = f"{shape}; {fixes}" if shape else fixes
+        if not shape:
+            return
         try:
-            self.codemap.store.remember_fix(_sha(signature), shape)
+            self.codemap.store.remember_fix(
+                _sha(_recall_key(previous.diagnostics)), shape)
         except Exception:                                # noqa: BLE001
             pass
+
+    def _recall(self, task: Task, carried: Sequence[Diagnostic],
+                attempt: int) -> str:
+        """How the same error was fixed before in this project, or ""."""
+        if not self.config.recall_fixes or self.codemap is None \
+                or not carried:
+            return ""
+        try:
+            rows = self.codemap.store.recall_fix(_sha(_recall_key(carried)))
+        except Exception:                                # noqa: BLE001
+            return ""
+        if not rows:
+            return ""
+        lines = ["[HOW THIS SAME ERROR WAS FIXED BEFORE IN THIS PROJECT — a "
+                 "hint, not an instruction]"]
+        for row in rows:
+            times = int(row.get("hits") or 1)
+            lines.append(f"- {row.get('shape')} "
+                         f"({'once' if times == 1 else f'{times} times'})")
+        self._decision("recall", task, attempt,
+                       "the same error was fixed before in this project",
+                       details=lines[1:])
+        if self.journal is not None:
+            try:
+                self.journal.log("recall", task=task.path, attempt=attempt,
+                                 shapes=[r.get("shape") for r in rows])
+            except Exception:                            # noqa: BLE001
+                pass
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # verification and writing
@@ -2291,6 +3029,7 @@ class Loop:
     def _write(self, tx: Any, task: Task, code: str) -> bool:
         if tx is None:
             self.host.fs.write(task.path, code)
+            self._written.add(task.path)
             return True
         existing = self._read(task.path)
         edit = Edit(path=task.path, kind="whole", new=code,
@@ -2298,6 +3037,7 @@ class Loop:
         results = tx.apply([edit],
                            summary=f"{task.path} — {task.purpose}")
         if results and results[0].ok:
+            self._written.add(task.path)
             return True
         if results and "no change" in (results[0].reason or ""):
             return bool(existing)
@@ -2399,7 +3139,9 @@ class Loop:
             verify=verify, remote=remote,
             **({"rung": used.rung, "fresh": used.fresh,
                 "escalation": used.reason} if used is not None else {}),
-            **({"via": "canvas"} if canvas else {}))
+            **({"via": "canvas"} if canvas else {}),
+            **({"via": "narrow"}
+               if self._via_narrow.get(task.path) == n else {}))
 
     def _emit(self, kind: str, message: str, data: dict | None = None) -> None:
         self.host.emit(kind, message, data)
@@ -2408,6 +3150,55 @@ class Loop:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+#: Diagnostic codes that are the ENGINE's refusals of a reply, not errors in
+#: the file: carried to the next attempt once, never accumulated.
+_REFUSALS = ("dropped-code", "narrow-unplaced")
+
+
+def _recall_key(diags: Sequence[Diagnostic]) -> str:
+    """A diagnostic set's identity for regression memory: the messages, with
+    numbers and addresses blanked, so the same error on another line, in
+    another file or in another run is the same error."""
+    rows = []
+    for d in diags:
+        if not d.is_error:
+            continue
+        msg = re.sub(r"0x[0-9a-fA-F]+", "ADDR", d.message or "")
+        msg = re.sub(r"\d+", "N", msg)[:120]
+        rows.append(f"{d.code or ''}:{msg}")
+    return "\n".join(sorted(set(rows)))
+
+
+def _change_shape(before: str, after: str, lang: str, path: str) -> str:
+    """What changed between two versions of a file, by name — "" when it
+    cannot be said (not Python, does not parse, nothing named changed)."""
+    if lang != "python" or not before or not after:
+        return ""
+    a, b = symedit.index(before), symedit.index(after)
+    if a is None or b is None:
+        return ""
+    lines_a = symedit.lines_of(symedit._norm(before))
+    lines_b = symedit.lines_of(symedit._norm(after))
+
+    def text(lines: list, span: Any) -> str:
+        return "".join(lines[span.start:span.end]).strip()
+
+    changed = [n for n, sp in b.spans.items()
+               if n in a.spans and sp.kind != "class"
+               and text(lines_b, sp) != text(lines_a, a.spans[n])]
+    added = [n for n in b.spans if n not in a.spans and "." not in n]
+    imports = len(set(b.imports) - set(a.imports))
+    bits = []
+    if changed:
+        bits.append("changed " + ", ".join(f"`{n}`" for n in changed[:4])
+                    + f" in {path}")
+    if added:
+        bits.append("added " + ", ".join(f"`{n}`" for n in added[:3]))
+    if imports:
+        bits.append(f"added {imports} import{'s' * (imports != 1)}")
+    return "; ".join(bits)
+
 
 def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]

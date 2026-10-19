@@ -51,3 +51,7 @@ Thumbs.db
 # source, and the default state directory is configurable per host.
 .s/
 .cc_state/
+
+# The regression suite's runs (ccoder bench): results, logs and the
+# projects each run left behind. Kept beside the code, never committed.
+bench/runs/

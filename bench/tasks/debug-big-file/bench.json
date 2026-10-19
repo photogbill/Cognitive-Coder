@@ -1,0 +1,11 @@
+{
+ "kind": "debug",
+ "lang": "python",
+ "timeout_s": 900,
+ "note": "A crash inside one function of a long module (over 150 lines): the repair should return only that function (a narrowed edit).",
+ "debug": {
+  "error_text": "Traceback (most recent call last):\n  File \"{PROJECT}/report.py\", line 6, in <module>\n    print(describe(SQUARE))\n          ~~~~~~~~^^^^^^^^\n  File \"{PROJECT}/geometry.py\", line 134, in describe\n    cx, cy = centroid(points)\n             ~~~~~~~~^^^^^^^^\n  File \"{PROJECT}/geometry.py\", line 64, in centroid\n    return (sx / len(point), sy / len(point))\n                     ^^^^^\nNameError: name 'point' is not defined. Did you mean: 'points'?",
+  "command": "python report.py",
+  "description": "The geometry report crashes."
+ }
+}

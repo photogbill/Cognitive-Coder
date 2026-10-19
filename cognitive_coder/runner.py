@@ -295,7 +295,10 @@ def syntax_check(code: str, lang_id: str, *, ex: Any = None,
         # diagnostic carries it, and the object itself travels with the
         # phase so nothing has to re-read it from text.
         try:
-            ast.parse(code, filename=src_path or "<unknown>")
+            # a byte-order mark is an encoding marker, not code: a file
+            # saved by a Windows editor failed this check every time
+            ast.parse(code[1:] if code.startswith("\ufeff") else code,
+                      filename=src_path or "<unknown>")
             return PhaseResult(name="syntax", ok=True)
         except SyntaxError as exc:
             diag = Diagnostic(
@@ -308,16 +311,40 @@ def syntax_check(code: str, lang_id: str, *, ex: Any = None,
                 note="the file does not parse", diagnostics=(diag,))
 
     lang = langs.get(lang_id)
-    if not lang or not lang.syntax_cmd or ex is None:
+    if lang and lang.syntax_cmd and ex is not None:
+        tool = lang.which_build(ex) or lang.which_run(ex)
+        if tool and tool != "-":
+            argv = langs.render(lang.syntax_cmd, build=tool, run=tool,
+                                src=src_path, dirpath=cwd,
+                                stem=_stem(src_path))
+            return _phase(ex, "syntax", argv, cwd=cwd or ".",
+                          timeout=min(30.0, lang.build_timeout))
+    # No compiler to ask: a parser can still see a stray brace. Errors only —
+    # a clean parse stays "not checked", because a grammar is not a compiler.
+    return treesitter_syntax(code, lang_id, src_path)
+
+
+def treesitter_syntax(code: str, lang_id: str,
+                      src_path: str = "") -> PhaseResult | None:
+    """A failed `syntax` phase from tree-sitter's ERROR/MISSING nodes, or
+    None — no grammar, or nothing found (which is not "checked and fine")."""
+    try:
+        from .codemap import parse_treesitter
+        found = parse_treesitter.syntax_errors(code, lang_id)
+    except Exception:                                    # noqa: BLE001
         return None
-    tool = lang.which_build(ex) or lang.which_run(ex)
-    if not tool or tool == "-":
+    if not found:
         return None
-    argv = langs.render(lang.syntax_cmd, build=tool, run=tool,
-                        src=src_path, dirpath=cwd,
-                        stem=_stem(src_path))
-    return _phase(ex, "syntax", argv, cwd=cwd or ".",
-                  timeout=min(30.0, lang.build_timeout))
+    diags = tuple(Diagnostic(
+        file=src_path, line=line, col=col, severity="error",
+        message=f"syntax error: {what} (found by tree-sitter — there is no "
+                f"compiler for this language here to check it properly)",
+        code="syntax", tool="tree-sitter") for line, col, what in found)
+    text = "\n".join(d.one_line() for d in diags)
+    return PhaseResult(name="syntax", ok=False,
+                       proc=ProcResult(exit_code=1, stderr=text),
+                       note="the file does not parse (tree-sitter)",
+                       diagnostics=diags)
 
 
 def _stem(path: str) -> str:
@@ -426,6 +453,12 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
     if lang.needs_build:
         tool = lang.which_build(ex)
         if not tool:
+            # No compiler — but a syntax error a parser can see is still the
+            # model's to fix, not the environment's to report.
+            pre = treesitter_syntax(code, lang_id, src)
+            if pre is not None:
+                phases.append(pre)
+                return finish(False)
             return RunResult(False, lang_id, phases=tuple(phases),
                              blocked=lang.missing_note(ex))
         argv = langs.render(lang.build_cmd, build=tool, src=src,

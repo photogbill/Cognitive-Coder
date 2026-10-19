@@ -1,0 +1,11 @@
+{
+ "kind": "debug",
+ "lang": "python",
+ "timeout_s": 900,
+ "note": "A pasted traceback and the command that produced it: locate from the deepest project frame, repair, confirm by running it again.",
+ "debug": {
+  "error_text": "Traceback (most recent call last):\n  File \"{PROJECT}/main.py\", line 6, in <module>\n    print(receipt(ORDER, \"10%\"))\n          ~~~~~~~^^^^^^^^^^^^^^\n  File \"{PROJECT}/shop.py\", line 16, in receipt\n    return f\"total {apply_discount(total, discount):.2f}\"\n                    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"{PROJECT}/shop.py\", line 11, in apply_discount\n    return round(total * (1 - discount / 100), 2)\n                              ~~~~~~~~~^~~~~\nTypeError: unsupported operand type(s) for /: 'str' and 'int'",
+  "command": "python main.py",
+  "description": "The receipt crashes when I give it a discount like \"10%\". It should work with 10 or \"10%\"."
+ }
+}

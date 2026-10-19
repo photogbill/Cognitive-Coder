@@ -172,6 +172,9 @@ numbered obligations is met; 48 have a test that asserts it
 | **Review** | deterministic scanners, then one structured model pass, then the Recommendation Document — with the non-independence line where it belongs |
 | **Remote** | five providers behind a per-session gate, every outbound message redacted including tool results, budgets that halt |
 | **ATK** | six Port implementations, a workspace panel, and a dry-run-by-default migration for the six modules this engine grew out of |
+| **Narrowed edits** | a repair or change returns only the functions it rewrites, put back by name; long files and files too large to show whole become repairable (F5) |
+| **The dropped-code guard** | a reply that leaves out code the file had, or writes `# ... rest unchanged`, is refused before it is written |
+| **The regression suite** | `ccoder bench`: tasks graded by hidden tests, each run compared with the last, replay of recorded replies with no model |
 
 **The review stage says something worth knowing about C5.** On the worked
 example the model reported "reads fine to me" while the deterministic scanner
@@ -239,6 +242,9 @@ never reported as unqualified success.**
 - `docs/EMBEDDING.md` — how to host it, including vendoring as a git submodule
 - `docs/PROVIDERS.md` — models, endpoints, and the offline default
 - `docs/AUDIT.md` — auditing an existing project, and the fix loop
+- `docs/NARROWED_EDITS.md` — how an existing file is changed: narrowed
+  edits, the dropped-code guard, marked error lines, regression memory
+- `docs/BENCH.md` — the regression suite, `ccoder bench`, and replay
 - `COGNITIVE_CODER_BUILD_SPEC_v1.1.md` — the full specification this
   implements, including the reasoning behind every constraint
 

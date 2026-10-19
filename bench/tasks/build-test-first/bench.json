@@ -1,0 +1,2 @@
+{"kind": "build", "lang": "python", "timeout_s": 900,
+ "note": "A request that asks for tests first: the pinned interface, the test written against the stub, the module built to pass it."}

@@ -44,7 +44,7 @@ from typing import Any
 
 from .. import langs
 from ..types import CodemapStats, Diagnostic, Edit, Symbol, ToolSpec
-from . import parse_python, parse_regex, parse_treesitter, zoom
+from . import parse_python, parse_regex, parse_treesitter, rank, zoom
 from .store import Store
 
 MAX_TEXT_LOOKUPS = 3          # the fallback's hard cap (M31)
@@ -353,6 +353,26 @@ class CodeMap:
         return zoom.generate_architecture_context(
             self.store, target, max_tokens=max_tokens,
             count_tokens=count_tokens)
+
+    def ranked(self, text: str = "") -> list[str]:
+        """Every indexed file, most important first (codemap/rank.py).
+
+        With ``text`` — an error, a description, an audit focus — ranked
+        TOWARD what it names; without, by the reference graph alone (plus a
+        little for entry points). Never raises: an unreadable index is the
+        files in path order.
+        """
+        try:
+            paths, edges = self.store.file_graph()
+            defined = self.store.defined_names() if text else {}
+        except Exception:                                # noqa: BLE001
+            try:
+                return [r["path"] for r in self.store.files()]
+            except Exception:                            # noqa: BLE001
+                return []
+        pers = rank.personalization(paths, defined, text)
+        scores = rank.pagerank(paths, edges, pers or None)
+        return rank.ordered({p: scores.get(p, 0.0) for p in paths})
 
     def prefix_block(self, target: str = "") -> str:
         """The stable, cacheable architecture block (G.7.1).

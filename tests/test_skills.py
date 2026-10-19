@@ -245,3 +245,53 @@ def test_a_language_scoped_skill_on_an_unset_session_is_reported():
         {".ccoder/skills/10-r.md": b"---\nlang: rust\n---\nUse Result.\n"}),
         lang="python", events=events)
     assert not events.rows
+
+
+# --------------------------------------------------------------------------
+# triggers (2026-10-19): OpenHands' keyword-triggered knowledge, loaded once
+# --------------------------------------------------------------------------
+
+def test_a_triggered_skill_loads_only_for_a_request_that_names_it():
+    from cognitive_coder.ports import MemoryFileSystem
+    from cognitive_coder.skills import load_skills
+    fs = MemoryFileSystem({
+        ".ccoder/skills/10-always.md": b"Always do this.\n",
+        ".ccoder/skills/20-pygame.md": (b"---\nname: pygame\ntriggers: "
+                                         b"pygame, sprite\n---\n"
+                                         b"Call pygame.init() first.\n")})
+    load = load_skills(fs)
+    assert [s.name for s in load.skills] == ["10-always"]
+    assert [s.name for s in load.held] == ["pygame"]
+    assert "pygame.init" not in load.block()
+    hit = load.for_request("A racing game using Pygame")
+    assert [s.name for s in hit.skills] == ["10-always", "pygame"]
+    assert "pygame.init" in hit.block()
+    assert hit.provenance()[1]["triggers"] == ["pygame", "sprite"]
+    miss = load.for_request("a CSV report tool")
+    assert [s.name for s in miss.skills] == ["10-always"]
+    assert any("not in the request" in why for _p, why in miss.skipped)
+    # whole words: "spritely" is not "sprite"
+    assert not load.for_request("a spritely app").skills[1:]
+
+
+def test_a_session_applies_the_triggers_before_the_first_prompt(tmp_path):
+    from cognitive_coder import Session, SessionConfig
+    from cognitive_coder.ports import (
+        AutoApprove,
+        Host,
+        LocalFileSystem,
+        ScriptedLLM,
+    )
+    skills = tmp_path / ".ccoder" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "20-csv.md").write_text("---\ntriggers: csv\n---\n"
+                                      "Use the csv module, never split(',').\n")
+    host = Host(llm=ScriptedLLM(["m.py — the module\n",
+                                 "```python\nX = 1\n```"],
+                                supports_tools=False),
+                fs=LocalFileSystem(str(tmp_path)), approval=AutoApprove())
+    session = Session(host, config=SessionConfig(attempts=1,
+                                                 review_after_build=False))
+    session.run("read a CSV file")
+    first = "\n".join(m.content for m in host.llm.prompts[0])
+    assert "never split(',')" in first

@@ -73,14 +73,39 @@ def architecture_prefix(store: Any, *, target: str = "",
     """
     files = store.files()
     lines = ["# PROJECT ARCHITECTURE (low resolution — names and paths only)"]
-    shown = sorted(files, key=lambda f: f["path"])[:max_files]
+    shown = sorted(files, key=lambda f: f["path"])
+    ranked_out = False
+    if len(shown) > max_files:
+        # THE MOST REFERENCED FILES, not the first in the alphabet
+        # (codemap/rank.py). The rank depends only on the graph, and this
+        # block is snapshotted per epoch, so it is as byte-stable as the
+        # path order was; it is still printed in path order.
+        keep = set(_ranked_paths(store)[:max_files])
+        if len(keep) == max_files:
+            shown = [f for f in shown if f["path"] in keep]
+            ranked_out = True
+        else:
+            shown = shown[:max_files]
     for row in shown:
         lines.append(_arch_line(store, row))
     if len(files) > len(shown):
-        lines.append(f"  … and {len(files) - len(shown)} more files not "
-                     f"listed here. Use search_codemap to look any of them "
-                     f"up.")
+        lines.append(f"  … and {len(files) - len(shown)} more files "
+                     + ("— the least referenced — " if ranked_out else "")
+                     + "not listed here. Use search_codemap to look any of "
+                       "them up.")
     return "\n".join(lines)
+
+
+def _ranked_paths(store: Any) -> list[str]:
+    """The project's files by global rank (graph only), best first."""
+    from . import rank
+    try:
+        paths, edges = store.file_graph()
+    except Exception:                                    # noqa: BLE001
+        return []
+    pers = rank.personalization(paths, {}, "")
+    scores = rank.pagerank(paths, edges, pers or None)
+    return rank.ordered({p: scores.get(p, 0.0) for p in paths})
 
 
 def _arch_line(store: Any, row: dict) -> str:

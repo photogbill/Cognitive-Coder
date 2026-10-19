@@ -421,6 +421,20 @@ class SessionLog:
             for title, body in blocks:
                 self.block(title, body)
 
+    def decision(self, kind: str, task: str, attempt: int, headline: str,
+                 *, details: Sequence[str] = (),
+                 blocks: Sequence[tuple[str, str]] = ()) -> None:
+        """One engine decision that is not diffusion mode's — a narrowed
+        edit, the dropped-code guard, regression memory, a diagnosis — in
+        the same shape: what was decided, why, and what it was given."""
+        with self._batch():
+            self.line()
+            self.event(f"{kind} {task}", f"attempt {attempt}: {headline}")
+            for row in details:
+                self.line(f"  {row}")
+            for title, body in blocks:
+                self.block(title, body)
+
     def close(self, summary: str) -> None:
         with self._batch():
             self.rule("SUMMARY")

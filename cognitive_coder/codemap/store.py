@@ -640,6 +640,35 @@ class Store:
         return [dict(r) for r in self.db.execute(
             "SELECT path, lang, hash, approximate FROM files ORDER BY path")]
 
+    def file_graph(self) -> tuple[list[str], dict[tuple[str, str], float]]:
+        """(every indexed path, {(from, to): weight}) for `rank.pagerank`.
+
+        One edge per pair of files, weighted by the square root of how many
+        calls and imports bind from one into the other — Aider's weighting,
+        so a file called once from fifty places outranks one called fifty
+        times from one place.
+        """
+        paths = [r["path"] for r in self.db.execute(
+            "SELECT path FROM files ORDER BY path")]
+        rows = self.db.execute(
+            "SELECT fs.path AS a, fd.path AS b, COUNT(*) AS n FROM edges e "
+            "JOIN symbols ss ON ss.id = e.src_symbol_id "
+            "JOIN files fs ON fs.id = ss.file_id "
+            "JOIN symbols sd ON sd.id = e.dst_symbol_id "
+            "JOIN files fd ON fd.id = sd.file_id "
+            "WHERE e.kind IN ('calls', 'imports') AND fs.id != fd.id "
+            "GROUP BY fs.path, fd.path").fetchall()
+        return paths, {(r["a"], r["b"]): float(r["n"]) ** 0.5 for r in rows}
+
+    def defined_names(self) -> dict[str, list[str]]:
+        """{path: the names its symbols define} (modules left out)."""
+        out: dict[str, list[str]] = {}
+        for r in self.db.execute(
+                "SELECT f.path AS path, s.name AS name FROM symbols s "
+                "JOIN files f ON f.id = s.file_id WHERE s.kind != 'module'"):
+            out.setdefault(r["path"], []).append(r["name"])
+        return out
+
     def file_of(self, symbol: str) -> str:
         rows = self.find(symbol, limit=1)
         return rows[0]["path"] if rows else ""
