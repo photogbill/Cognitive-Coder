@@ -146,6 +146,12 @@ class Planner:
     interface_reply: Any = None
     #: {path: pinned stub text} from the current skeleton (`stub_for`).
     _pinned_text: dict = field(default_factory=dict, repr=False)
+    #: The request's hard-requirement sentences (constraints.py), set by the
+    #: session before the skeleton: the ones naming a pinned file, or a
+    #: name it declares, go into that file's docstring word for word.
+    conventions: list = field(default_factory=list)
+    #: What the import of the skeleton said, per module, for the log.
+    import_notes: list = field(default_factory=list)
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -657,6 +663,17 @@ class Planner:
             if not stub:
                 self.pin_fallback[task.path] = "; ".join(dropped)
                 continue
+            # A dataclass the model (or the spec) wrote with defaulted
+            # fields before required ones cannot be imported. Made valid
+            # without moving a field, and said.
+            stub, reordered = interfaces.fix_dataclass_order(stub)
+            for change in reordered:
+                notes.append(f"{task.path}: {change}")
+            # The request's own sentences that name this file or what it
+            # declares, in its docstring — where the body's author and the
+            # test's author will actually look.
+            stub = interfaces.with_conventions(stub, task.path,
+                                               self.conventions)
             out[task.path] = stub
             if dropped:
                 notes.append(f"{task.path}: dropped "
@@ -915,6 +932,14 @@ class Planner:
         if missing:
             return False, ("the skeleton's files disagree: "
                            + "; ".join(missing[:3]))
+        # IMPORTED, NOT ONLY PARSED. `ast.parse` passed the Star Trek
+        # skeleton whose `Ship` dataclass could not be built, and the
+        # TypeError surfaced two attempts later at models.py's first run.
+        broken_imports = self._import_skeleton(
+            [p for p in paths if p.endswith(".py")])
+        if broken_imports:
+            return False, ("the skeleton does not import: "
+                           + "; ".join(broken_imports[:3]))
         pinned = [p for p in paths if p in self.pinned]
         if pinned:
             return True, (f"interfaces pinned for {len(pinned)} of "
@@ -922,6 +947,83 @@ class Planner:
                           f"compile")
         return True, (f"stubs written, imports resolved, {len(paths)} file(s) "
                       f"compile")
+
+    #: The one-process import of every stub, in order; prints one line per
+    #: module so a failure names the module, the exception and the line.
+    _IMPORT_SCRIPT = (
+        "import importlib, sys, traceback\n"
+        "for name in sys.argv[1:]:\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except Exception as exc:\n"
+        "        tb = traceback.extract_tb(exc.__traceback__)\n"
+        "        where = ''\n"
+        "        for fr in reversed(tb):\n"
+        "            if 'importlib' not in fr.filename.replace('\\\\', '/'):\n"
+        "                where = fr.filename + ':' + str(fr.lineno)\n"
+        "                break\n"
+        "        print('FAIL ' + name + ' | ' + type(exc).__name__ + ': '\n"
+        "              + str(exc)[:200] + ' | ' + where)\n"
+        "    else:\n"
+        "        print('OK ' + name)\n")
+
+    def _import_skeleton(self, paths: Sequence[str]) -> list[str]:
+        """Import every Python stub in one interpreter; the failures, in
+        words naming the file. A third-party module that is not installed
+        yet is a NOTE, not a failure: the preinstall or the build's first
+        import will say so, and it is not the skeleton's fault."""
+        self.import_notes = []
+        if (self.lang or "python") != "python" or not paths:
+            return []
+        from . import runner
+        lang = langs.get("python")
+        tool = lang.which_run(self.host.exec) if lang else ""
+        if not tool:
+            return []
+        modules = [_module(p) for p in paths]
+        root = self.host.fs.root()
+        try:
+            proc = self.host.exec.run(
+                [tool, "-c", self._IMPORT_SCRIPT, *modules], cwd=root,
+                timeout=120, env=runner.scrubbed_env(root, root))
+        except Exception as exc:                         # noqa: BLE001
+            self.import_notes.append(f"the skeleton could not be imported "
+                                     f"to check it ({exc})")
+            return []
+        if proc.timed_out:
+            return ["importing the skeleton did not finish in 120s — a stub "
+                    "runs something at import (a loop, a window, input())"]
+        broken: list[str] = []
+        by_module = dict(zip(modules, paths, strict=True))
+        for line in (proc.stdout or "").splitlines():
+            if not line.startswith("FAIL "):
+                continue
+            rest = line[5:]
+            name, _, detail = rest.partition(" | ")
+            path = by_module.get(name.strip(), name.strip())
+            exc, _, where = detail.partition(" | ")
+            missing = re.search(r"No module named ['\"]([\w.]+)['\"]", exc)
+            ours = set()
+            for m in modules:
+                ours.update({m, m.split(".")[0], m.rsplit(".", 1)[-1]})
+            if (exc.startswith("ModuleNotFoundError") and missing
+                    and missing.group(1).split(".")[0] not in ours
+                    and missing.group(1) not in ours):
+                # `No module named 'pygame'`: an environment matter
+                self.import_notes.append(
+                    f"{path}: {exc} — not installed in the project's "
+                    f"environment yet; the build installs it or fails at "
+                    f"the first file that needs it")
+                continue
+            broken.append(f"{path} — {exc}"
+                          + (f" (at {where.strip()})" if where.strip()
+                             else ""))
+        if not (proc.stdout or "").strip() and proc.exit_code != 0:
+            tail = (proc.stderr or "").strip().splitlines()
+            self.import_notes.append(
+                "the skeleton import check could not run: "
+                + (tail[-1] if tail else f"exit {proc.exit_code}"))
+        return broken
 
     def _skeleton_imports(self, paths: Sequence[str]) -> list[str]:
         """Imports of PROJECT modules that no planned file provides.

@@ -40,6 +40,10 @@ from cognitive_coder import canvas as cv
 from cognitive_coder.interfaces import PINNED_TEXT
 from cognitive_coder.loop import _same_file
 
+# The judge (adjudicate.py, 2026-10-16) is OFF here: these tests script
+# the replies of the flow where a disagreeing test blames its module
+# outright, and a judge's question would consume a scripted reply.
+
 CALC = '''def add(a: int, b: int) -> int:
     """The sum."""
     total = a + c
@@ -233,11 +237,13 @@ def test_the_candidate_schedule():
     h = _hole()
     plan = cv.requests_for(h, lambda style: (), 3, seed=10, attempt=2)
     styles = [(s, n) for s, n, _r in plan]
-    assert styles == [("tail", 0.5), ("open", 1.0), ("tail", 1.0)]
-    warm = plan[0][2]
+    #: `open` first since 2026-10-16 (the kept `tail` canvas of the Star
+    #: Trek build echoed the markers and re-opened the function).
+    assert styles == [("open", 1.0), ("tail", 0.5), ("open", 1.0)]
+    warm = plan[1][2]
     assert warm.seed_text == h.original and warm.tail == h.tail
     assert len({r.seed for _s, _n, r in plan}) == 3, "a seed each"
-    assert plan[1][2].tail == "" and plan[1][2].seed_text == ""
+    assert plan[0][2].tail == "" and plan[0][2].seed_text == ""
 
 
 def test_the_readout_is_realigned_to_the_cleaned_lines():
@@ -320,7 +326,7 @@ FIXED = CALC.replace("    total = a + c\n    return total\n",
 
 def _run(tmp_path, llm, **cfg):
     host = _host(tmp_path, llm)
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=3, pin_interfaces=False, review_after_build=False, **cfg))
     session.run("arithmetic helpers, with tests")
     return host, session
@@ -341,17 +347,18 @@ def test_a_repair_rewrites_the_hole_and_asks_for_no_whole_file(tmp_path):
     assert final["src/calc.py"].ok, final["src/calc.py"].stopped_because
     assert len(llm.prompts) == 3, "plan, calc, test — the repair was a hole"
     assert len(llm.requests) == 2
-    first = llm.requests[0]
+    first, warm = llm.requests
     assert first.head.endswith('"""The sum."""\n')
-    assert first.seed_text == "    total = a + c\n    return total\n"
-    assert first.noise == 0.5 and first.tail.startswith("\n\ndef mul")
+    assert first.tail == "" and first.seed_text == ""          # open
+    assert warm.seed_text == "    total = a + c\n    return total\n"
+    assert warm.noise == 0.5 and warm.tail.startswith("\n\ndef mul")
     text = "\n".join(m.content for m in first.messages)
     assert "# >>> REWRITE LINES 3-4" in text and "[THE HOLE" in text
     assert "name 'c' is not defined" in text, "the error is in the prompt"
     assert "Return the complete contents of the file" not in text
     kept = [d["canvas"] for d in _canvas_events(host)
             if "line_confidence" in d["canvas"]]
-    assert kept and kept[0]["first_line"] == 3 and kept[0]["style"] == "tail"
+    assert kept and kept[0]["first_line"] == 3 and kept[0]["style"] == "open"
     assert kept[0]["lines"] == ["    total = a + b", "    return total"]
     assert len(kept[0]["line_confidence"]) == 2, "aligned to the kept lines"
     journal = "\n".join(p.read_text() for p in
@@ -434,7 +441,7 @@ def test_a_pinned_file_is_written_body_by_body_signatures_held(tmp_path):
     llm = CanvasLLM([GEOM_PLAN, INTERFACES, "area: w*h. total: sum.",
                      "main: print the total."], _by_name)
     host = _host(tmp_path, llm)
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=2, review_after_build=False))
     session.run("boxes and a report")
     geom = (tmp_path / "src" / "geom.py").read_text()
@@ -634,9 +641,9 @@ def test_the_build_log_says_which_hole_why_every_canvas_and_how_sure(
     assert re.search(r"diffusion src/calc\.py — attempt 1: rewrite lines "
                      r"3-4 \(`add`\) as a hole — kept canvas 1 of 2", log), log
     assert "why this hole: its error is at line 3" in log
-    assert re.search(r"canvas 1: tail, noise 0\.5, seed 1, 6 step\(s\).*"
+    assert re.search(r"canvas 1: open, noise 1, seed 1, 6 step\(s\).*"
                      r"usable: 85% sure on average", log)
-    assert re.search(r"canvas 2: open, noise 1, .*REJECTED: ", log)
+    assert re.search(r"canvas 2: tail, noise 0\.5, .*REJECTED: ", log)
     cut = log.split("the lines cut out", 1)[1]
     assert "    total = a + c" in cut.splitlines()[1]
     kept = log.split("the hole as kept", 1)[1].splitlines()
@@ -660,9 +667,12 @@ def test_the_build_log_says_every_time_diffusion_steps_aside(tmp_path):
     assert ("rewrite lines 3-4 (`add`) as a hole — none of 2 canvas(es) "
             "usable — this attempt writes the whole file") in log
     assert log.count("REJECTED: does not fit") == 2
-    # the whole-file attempt that followed is an ordinary generation
+    # the whole-file attempt that followed is an ordinary generation — and
+    # the knobs line says what a canvas model is actually told (the seed;
+    # a temperature does not reach it)
     gen = log.rsplit("generate src/calc.py — attempt 1", 1)[-1]
-    assert gen.splitlines()[1].strip().startswith("temperature=")
+    assert gen.splitlines()[1].strip().startswith("seed=")
+    assert "does not reach a canvas model" in gen.splitlines()[1]
 
 
 def test_the_build_log_and_journal_name_a_repeated_hole(tmp_path):
@@ -685,7 +695,7 @@ def test_the_build_log_holds_the_notes_and_each_pinned_body(tmp_path):
     llm = CanvasLLM([GEOM_PLAN, INTERFACES, "area: w*h. total: sum.",
                      "main: print the total."], _by_name)
     host = _host(tmp_path, llm)
-    Session(host, config=SessionConfig(
+    Session(host, config=SessionConfig(adjudicate=False,
         attempts=2, review_after_build=False)).run("boxes and a report")
     log = _build_log(tmp_path)
     assert "implementation notes planned for 2 bodies before any was " \
@@ -766,7 +776,7 @@ def test_a_usable_canvas_that_was_not_chosen_is_not_called_rejected(
         tmp_path):
     def fills(request):
         return (_result("    total = a + b\n    return total\n", conf=0.95)
-                if request.noise == 0.5 else
+                if request.noise == 1.0 else
                 _result("    return a + b\n", conf=0.6))
     llm = CanvasLLM([PLAN, CALC_REPLY, TEST_REPLY], fills)
     _run(tmp_path, llm)
@@ -788,3 +798,159 @@ def test_the_config_line_survives_a_bad_candidate_count(tmp_path):
     _run(tmp_path / "b", llm, diffusion_candidates=9)
     assert (f"diffusion=on ({len(cv.REPAIR_SCHEDULE)} canvas(es) per "
             f"repair") in _build_log(tmp_path / "b")
+
+
+# --------------------------------------------------------------------------
+# what the 2026-10-16 Star Trek build taught the canvas path (docs/HYBRID.md)
+# --------------------------------------------------------------------------
+
+PHYSICS = '''from __future__ import annotations
+import math
+from .models import WorldState
+
+
+def normalize_angle(deg: float) -> float:
+    """Maps any angle to [0.0, 360.0)."""
+    raise NotImplementedError
+
+
+def shortest_angle_diff(current_deg: float, target_deg: float) -> float:
+    """Signed delta in (-180.0, 180.0]."""
+    raise NotImplementedError
+'''
+
+
+def test_marker_echoes_are_dropped_and_a_reopened_def_is_a_run_on():
+    """physics.py attempt 2: the kept `tail` canvas ended with the prompt's
+    `# <<< END OF THE LINES TO REWRITE` and a second `def normalize_angle`
+    whose held tail was `raise NotImplementedError` — a file that parsed
+    and shadowed the right body with the stub."""
+    err = Diagnostic(file="src/physics.py", line=3, severity="error",
+                     message="ImportError: attempted relative import",
+                     tool="python")
+    h = cv.repair_hole(PHYSICS, "python", "src/physics.py", [err], _same_file)
+    assert h is not None and h.kind == "window"
+    fill = ("from __future__ import annotations\n"
+            "import math\n"
+            "from src.models import WorldState\n"
+            "\n"
+            "\n"
+            "def normalize_angle(deg: float) -> float:\n"
+            '    """Maps any angle to [0.0, 360.0)."""\n'
+            "    return deg % 360.0\n"
+            "\n"
+            "# <<< END OF THE LINES TO REWRITE\n"
+            "def normalize_angle(deg: float) -> float:\n")
+    res = CanvasResult(text=fill, line_confidence=(1.0,) * 12,
+                       line_flips=(0,) * 12, steps=7, seed=1)
+    c = cv.judge(PHYSICS, h, "tail", 0.5, res, "python")
+    assert "<<<" not in (c.fill or "")
+    assert c.usable, c.problem
+    assert c.code.count("def normalize_angle") == 1, c.code
+    assert "return deg % 360.0" in c.code
+
+
+def test_a_fill_that_redefines_what_the_file_has_is_rejected():
+    h = _hole()
+    # a body that also re-emits `mul`, which the file defines below the hole
+    fill = ("    return a + b\n\n\ndef mul(a: int, b: int) -> int:\n"
+            "    return a - b\n")
+    # the dedent cut takes the run-on off when the prefix parses, so this
+    # one is caught there; make the duplicate INSIDE the region's level
+    code = CALC.replace("    total = a + c\n    return total\n",
+                        "    def mul(x):\n        return x\n    return a\n")
+    err = _err(3)
+    h2 = cv.repair_hole(code, "python", "src/calc.py", [err], _same_file)
+    assert h2 is not None
+    c = cv.judge(CALC, h, "open", 1.0, _result(fill), "python")
+    assert c.usable and c.code.count("def mul") == 1
+    assert cv.duplicate_definitions(
+        "def f():\n    pass\n\n\ndef f():\n    pass\n") .startswith("defines `f` twice")
+    assert cv.duplicate_definitions(
+        "class A:\n    @property\n    def x(self):\n        return 1\n"
+        "    @x.setter\n    def x(self, v):\n        pass\n") == ""
+
+
+def test_a_length_reply_is_salvaged_where_it_left_the_region():
+    """physics.py attempt 1, `normalize_angle`: both open canvases held
+    `    return deg % 360.0` and then the rest of the file, and both were
+    rejected unread for finishing with `length`."""
+    holes = cv.stub_holes(PHYSICS, "src/physics.py")
+    h = holes[0]
+    assert h.name == "normalize_angle"
+    text = ("    return deg % 360.0\n\n"
+            "def shortest_angle_diff(current_deg: float, target_deg: float)"
+            " -> float:\n"
+            '    """Signed delta."""\n'
+            "    diff = (target_deg - current_deg) % 360.0\n"
+            "    if diff > 180.0:\n")
+    res = CanvasResult(text=text, finish_reason="length",
+                       error="the hole ran past the end of its canvas",
+                       line_confidence=(0.9,) * 6, line_flips=(0,) * 6,
+                       steps=8, seed=3)
+    c = cv.judge(PHYSICS, h, "open", 1.0, res, "python")
+    assert c.usable, c.problem
+    assert c.salvaged and "salvaged" in c.describe()
+    assert c.fill == "    return deg % 360.0\n"
+    assert "def shortest_angle_diff" in c.code
+    assert c.code.count("def shortest_angle_diff") == 1
+
+
+def test_a_length_reply_with_no_exit_from_the_region_is_still_rejected():
+    holes = cv.stub_holes(PHYSICS, "src/physics.py")
+    h = holes[0]
+    res = CanvasResult(text="    x = deg % 360.0\n    y = x\n",
+                       finish_reason="length",
+                       error="the hole ran past the end of its canvas",
+                       line_confidence=(0.9, 0.9), line_flips=(0, 0),
+                       steps=8, seed=3)
+    c = cv.judge(PHYSICS, h, "open", 1.0, res, "python")
+    assert not c.usable and "ran past" in c.problem
+
+
+PARSER = '''def parse_command_line(ship_id: str, line: str) -> list:
+    """Split and parse."""
+    tokens = line.lower().split()
+    return [_parse_single_command(ship_id, tokens)]
+
+
+def _parse_single_command(ship_id: str, tokens: list) -> dict:
+    """One command."""
+    return {"target_id": tokens[1]}
+'''
+
+TEST_PARSER = '''import unittest
+from src.parser import parse_command_line
+
+
+class TestParser(unittest.TestCase):
+    def test_parse_command_line_scan_command(self):
+        result = parse_command_line("En", "scan Kl")
+        self.assertEqual(result[0]["target_id"], "Kl")
+'''
+
+
+def test_a_failure_in_the_test_is_located_through_what_the_test_calls():
+    """parser.py: `'kl' != 'Kl'` names no line of parser.py, and the
+    doubt-guided hole rewrote `_parse_single_command` twice while the
+    `lower()` sat in `parse_command_line`, which the test calls."""
+    diag = Diagnostic(
+        file="tests/test_parser.py", line=8, severity="exception",
+        message="AssertionError: 'kl' != 'Kl'",
+        code="in test_parse_command_line_scan_command",
+        source_excerpt=('      7 |         result = parse_command_line("En", '
+                        '"scan Kl")\n>>    8 |         self.assertEqual('
+                        'result[0]["target_id"], "Kl")\n'),
+        tool="python")
+    names = cv.test_named_functions(PARSER, [diag], TEST_PARSER)
+    assert names == ["parse_command_line"], names
+    h = cv.function_hole(PARSER, "src/parser.py", names[0], why="test")
+    assert h is not None and h.name == "parse_command_line"
+    # the asserting line's own call comes first when it names one
+    diag2 = Diagnostic(
+        file="tests/test_parser.py", line=8, severity="exception",
+        message="AssertionError: 1 != 2", code="in test_x",
+        source_excerpt='>>    8 |         self.assertEqual(_parse_single_command("En", ["a", "b"])["target_id"], "Kl")\n',
+        tool="python")
+    assert cv.test_named_functions(PARSER, [diag2], TEST_PARSER)[0] == \
+        "_parse_single_command"

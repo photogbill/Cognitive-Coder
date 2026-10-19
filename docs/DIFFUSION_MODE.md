@@ -171,13 +171,39 @@ positions, the warm start, the readout, a prompt cache).
   it costs. The prompt cache makes the 2nd+ candidate's prefill nearly
   free; the server log's `prompt eval time … N reused` line shows it.
 
-## Not built yet, on purpose
+## What the first real build taught (2026-10-16)
 
-* **Hybrid** (a normal coder writes, DiffusionGemma repairs). Cognitive
-  Coder repairs each file right after it fails, before the next is built on
-  it, so a hybrid on one 16 GB card swaps models at every failure. A
-  version that hands the build's *remaining* failures to DiffusionGemma in
-  one swap at the end fits the engine; it is the next step.
+The Star Trek spec, DiffusionGemma alone: 14.5 minutes, two files built,
+then a host crash. Most of it was the harness, not the model —
+docs/HYBRID.md has the whole account. What changed here:
+
+* every hole prompt now carries the FILE'S SLICE of the request
+  (`specslice.py`), not its first 2,000 characters — the formulas the
+  bodies were judged against sat past that cut;
+* the notes call sees the same slice (it saw no request at all);
+* `clean_fill` drops the prompt's own marker lines a canvas copies back,
+  and cuts at a definition repeated inside one fill; `judge` rejects a
+  fill that makes the file define a name twice (the second definition
+  silently wins), and SALVAGES a reply that finished with `length` where
+  the run-on cut finds the point it left the region — four of the five
+  canvases the build threw away held the right body in their first lines;
+* a failure that names no line of the file is located through the names
+  the FAILING TEST calls (the asserting line's own call first) before the
+  doubt-guided fallback;
+* `open` runs before `tail` in `REPAIR_SCHEDULE`: the one kept `tail`
+  canvas echoed the markers and re-opened the function;
+* the escalation ladder (`loop.Sampling`) reaches a canvas model as a new
+  seed and no warm start — never a temperature, which does not reach it;
+  the `generate` line says so instead of printing one.
+
+## Hybrid — built (docs/HYBRID.md)
+
+A chat model writes every file, ONE swap, DiffusionGemma rewrites only the
+hole each remaining failure is in, one swap back for whole-file repairs of
+what is left. `SessionConfig.hybrid` ("auto" / "off" / "ar-first" /
+"diffusion-first"); the host side is `ports.ModelRoster`.
+
+## Not built yet, on purpose
 * **Native tool calls for DiffusionGemma.** It uses the text-marker
   fallback (D10). Its chat template has tool calls (`<|tool_call>`); the
   server would need to return special tokens for ATK to parse them.

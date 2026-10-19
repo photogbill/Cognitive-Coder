@@ -62,6 +62,9 @@ class Lang:
     run_tools: tuple[str, ...] = ()
     build_cmd: list = field(default_factory=list)
     run_cmd: list = field(default_factory=list)
+    # How to run a file that sits INSIDE A PACKAGE (`{module}` is its dotted
+    # name, the cwd is the project root). Empty: `run_cmd` for every file.
+    module_run_cmd: list = field(default_factory=list)
     test_cmd: list = field(default_factory=list)
     # A SECOND test step, run only when `test_cmd` succeeds, for toolchains
     # whose test command merely BUILDS a harness. Rust's `rustc --test`
@@ -231,6 +234,14 @@ _add(Lang(
     id="python", label="Python", ext=".py", exts=(".py", ".pyw"),
     comment="#", run_tools=("python", "python3", "py"), prefer_self=True,
     run_cmd=["{run}", "{src}"],
+    # A file INSIDE A PACKAGE runs as a module, from the project root. Run
+    # as a script (`python src/physics.py`), `from .models import …` fails
+    # with "attempted relative import with no known parent package" — a
+    # non-error that cost two of four attempts on the 2026-10-16 Star Trek
+    # build, and whose "fix" (`from models import …`) broke the package for
+    # the test runner. `python -m src.physics` runs the same top-level code
+    # with the package intact; for an entry point it runs `main()` as before.
+    module_run_cmd=["{run}", "-m", "{module}"],
     test_cmd=["{run}", "-m", "unittest", "discover", "-s", "{dir}", "-p",
               "test_*.py", "-v"],
     # discover, narrowed to one file: it imports the file as a top-level
@@ -745,12 +756,28 @@ def find_test_files(fs: Any, lang: Lang) -> list[str]:
 def render(cmd: list, *, build: str = "", run: str = "", fmt: str = "",
            lint: str = "", src: str = "", out: str = "", dirpath: str = "",
            stem: str = "", test: str = "", testdir: str = "",
-           testname: str = "") -> list[str]:
+           testname: str = "", module: str = "") -> list[str]:
     """Fill a command template. Returns a real argv list, never a string."""
     subs = {"build": build, "run": run, "fmt": fmt, "lint": lint,
             "src": src, "out": out, "dir": dirpath, "stem": stem,
-            "test": test, "testdir": testdir, "testname": testname}
+            "test": test, "testdir": testdir, "testname": testname,
+            "module": module}
     return [str(part).format(**subs) for part in cmd]
+
+
+def module_name(path: str) -> str:
+    """`src/physics.py` → `src.physics`; `main.py` → `` (not in a package).
+
+    Only a file INSIDE a folder has a module name worth running by: a file
+    at the project root is a script, and `python main.py` is right for it.
+    """
+    rel = str(path or "").replace("\\", "/").strip("/")
+    if "/" not in rel or not rel.endswith(".py"):
+        return ""
+    parts = rel[:-3].split("/")
+    if any(not p.isidentifier() for p in parts):
+        return ""
+    return ".".join(parts)
 
 
 # ---------------------------------------------------------------------------

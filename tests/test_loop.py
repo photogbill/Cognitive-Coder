@@ -304,11 +304,15 @@ def test_a_repair_prompt_still_carries_the_request(tmp_path):
 
 
 def test_a_long_request_is_capped_in_the_repair_prompt_and_says_so():
-    long = "Requirement. " * 400
+    """The cap is a BACKSTOP now (the loop slices the request to the file
+    first, see `specslice`), and it sits at 8,000 characters: the old
+    2,000 cut off every formula of a 15,000-character spec."""
+    long = "Requirement. " * 1000
     text = personas.repair_task("m.py", "x", request=long)
     assert len(text) < len(long)
     assert "Requirement." in text
-    assert "…" in text and "2,000" in text
+    assert "…" in text and "8,000" in text
+    assert personas.REPAIR_REQUEST_CHARS == 8000
 
 
 def test_each_attempt_journals_the_hash_of_what_was_sent(tmp_path):
@@ -367,6 +371,10 @@ def test_only_the_last_attempts_diagnostics_are_fed_back(tmp_path):
 # M34 — stagnation and cycles
 # --------------------------------------------------------------------------
 
+#: The five stagnation tests below run with `escalate=False`: they test the
+#: DETECTION and its sentences. With the ladder on (the default since
+#: 2026-10-16) stagnation moves to the next rung instead of stopping while a
+#: rung is left — see `test_stagnation_climbs_the_ladder_instead_of_stopping`.
 def test_identical_code_twice_stops_immediately(tmp_path):
     """Hard stagnation: more attempts cannot help.
 
@@ -378,7 +386,7 @@ def test_identical_code_twice_stops_immediately(tmp_path):
     """
     same = "```python\nVALUE = undefined_name_xyz\n```"
     host = _host(tmp_path, [same, same, same, same])
-    loop = _loop(host, attempts=4)
+    loop = _loop(host, escalate=False, attempts=4)
     outcome = loop.run_task(Task(id="t1", path="m.py", purpose="x",
                                  lang="python"))
     assert not outcome.ok
@@ -407,7 +415,7 @@ def test_the_cycle_sentence_names_each_attempt_once(tmp_path):
     a = "```python\nVALUE = missing_alpha\n```"
     b = "```python\nVALUE = missing_beta\n```"
     host = _host(tmp_path, [a, b, a, b])
-    outcome = _loop(host, attempts=4).run_task(
+    outcome = _loop(host, escalate=False, attempts=4).run_task(
         Task(id="t1", path="m.py", purpose="x", lang="python"))
     assert "attempts 1 and 3 produced" in outcome.stopped_because, \
         outcome.stopped_because
@@ -423,7 +431,7 @@ def test_the_same_error_drifting_down_the_file_is_the_same_error(tmp_path):
              + "\n".join(f"pad{i} = {i}" for i in range(n))
              + "\nVALUE = undefined_q\n```" for n in range(1, 7)]
     host = _host(tmp_path, drift)
-    outcome = _loop(host, attempts=6).run_task(
+    outcome = _loop(host, escalate=False, attempts=6).run_task(
         Task(id="t1", path="m.py", purpose="x", lang="python"))
     lines = [a.diagnostics[0].line for a in outcome.attempts]
     assert lines[0] != lines[-1], "the fixture no longer drifts"
@@ -464,7 +472,7 @@ def test_reformatting_python_is_still_identical_code(tmp_path):
     one = "```python\nVALUE = missing_w\n```"
     two = "```python\n\n\nVALUE   =   missing_w   # retry\n\n```"
     host = _host(tmp_path, [one, two, one, two])
-    outcome = _loop(host, attempts=4).run_task(
+    outcome = _loop(host, escalate=False, attempts=4).run_task(
         Task(id="t1", path="m.py", purpose="x", lang="python"))
     assert len(outcome.attempts) == 2
     assert "identical code" in outcome.stopped_because
@@ -492,7 +500,7 @@ def test_a_tiny_edit_that_moves_no_error_is_reported_as_churn(tmp_path):
     first = f"```python\n{consts}\nVALUE = undefined_q\n```"
     second = first.replace("LIMIT_7 = 70", "LIMIT_7 = 71")
     host = _host(tmp_path, [first, second, first])
-    outcome = _loop(host, attempts=3).run_task(
+    outcome = _loop(host, escalate=False, attempts=3).run_task(
         Task(id="t1", path="m.py", purpose="x", lang="python"))
     assert len(outcome.attempts) == 2
     assert "under 2%" in outcome.stopped_because, outcome.stopped_because
@@ -880,3 +888,96 @@ def test_an_existing_file_too_big_to_show_is_refused_not_rewritten(
     assert not llm.prompts, "a model call was spent"
     assert not outcome.ok and "larger context" in outcome.stopped_because
     assert (tmp_path / "m.py").read_text() == big
+
+
+# --------------------------------------------------------------------------
+# the escalation ladder (docs/HYBRID.md, 2026-10-16)
+# --------------------------------------------------------------------------
+
+class _RecordingLLM(ScriptedLLM):
+    """A ScriptedLLM that also keeps the sampling each call was asked for."""
+
+    def __init__(self, replies, **kw):
+        super().__init__(replies, **kw)
+        self.sampling: list[tuple[float, object]] = []
+
+    def complete(self, messages, **kw):
+        self.sampling.append((kw.get("temperature"), kw.get("seed")))
+        return super().complete(messages, **kw)
+
+
+def test_stagnation_climbs_the_ladder_instead_of_stopping(tmp_path):
+    """Identical code twice used to end the file at attempt 2. Now the
+    third attempt is a fresh start at the next rung with a seed, the
+    fourth a whole-file repair at the last rung — and only then, if
+    nothing moved, the stagnation sentence ends it."""
+    same = "```python\nVALUE = undefined_name_xyz\n```"
+    llm = _RecordingLLM([same, same, same, same], supports_tools=False)
+    host = Host(llm=llm, fs=LocalFileSystem(str(tmp_path)),
+                storage=MemoryStorage(str(tmp_path / ".state")),
+                events=RecordingEvents(), approval=AutoApprove())
+    loop = _loop(host, attempts=4)
+    outcome = loop.run_task(Task(id="t1", path="m.py", purpose="x",
+                                 lang="python"))
+    assert not outcome.ok
+    assert len(outcome.attempts) == 4, outcome.stopped_because
+    temps = [t for t, _s in llm.sampling]
+    seeds = [s for _t, s in llm.sampling]
+    assert temps == [0.15, 0.15, 0.45, 0.70], temps
+    assert seeds[0] is None and seeds[1] is None
+    assert seeds[2] is not None and seeds[3] is not None \
+        and seeds[2] != seeds[3]
+    # the third attempt starts fresh: no broken file in its prompt
+    third = "\n".join(m.content for m in llm.prompts[2])
+    assert "[THE FILE AS IT STANDS]" not in third
+    assert "That version is NOT shown" in third
+    fourth = "\n".join(m.content for m in llm.prompts[3])
+    assert "[THE FILE AS IT STANDS]" in fourth
+    said = [m for k, m, _d in host.events.events if k == "status"
+            and "attempt 3 is a fresh start" in m]
+    assert said, [m for k, m, _d in host.events.events if k == "status"]
+    # the stagnation sentence still ends the file once the rungs run out
+    assert "identical code twice" in outcome.stopped_because
+
+
+def test_the_journal_records_the_sampling_each_attempt_used(tmp_path):
+    same = "```python\nVALUE = undefined_name_xyz\n```"
+    host = _host(tmp_path, [same, same, same])
+    from cognitive_coder.journal import Journal
+    journal = Journal(host.fs, "s1", events=host.events)
+    cm = CodeMap(host.fs, host.storage)
+    loop = Loop(host, codemap=cm, journal=journal,
+                patcher=Patcher(host.fs, host.storage, host.approval,
+                                host.events),
+                config=LoopConfig(attempts=3))
+    loop.run_task(Task(id="t1", path="m.py", purpose="x", lang="python"))
+    gens = [e for e in journal.events() if e.get("event") == "generate"]
+    assert [e.get("temperature") for e in gens] == [0.15, 0.15, 0.45]
+    assert gens[2].get("seed") is not None
+    assert gens[2]["data"].get("fresh") is True
+    assert gens[0]["data"].get("fresh") is False
+
+
+def test_the_ladder_can_be_switched_off(tmp_path):
+    same = "```python\nVALUE = undefined_name_xyz\n```"
+    llm = _RecordingLLM([same, same, same, same], supports_tools=False)
+    host = Host(llm=llm, fs=LocalFileSystem(str(tmp_path)),
+                storage=MemoryStorage(str(tmp_path / ".state")),
+                events=RecordingEvents(), approval=AutoApprove())
+    outcome = _loop(host, attempts=4, escalate=False).run_task(
+        Task(id="t1", path="m.py", purpose="x", lang="python"))
+    assert len(outcome.attempts) == 2
+    assert all(t == 0.15 for t, _s in llm.sampling)
+
+
+def test_a_canvas_model_is_not_told_a_temperature_it_ignores():
+    from cognitive_coder.loop import Loop as _Loop
+    from cognitive_coder.personas import ENGINEER
+    from cognitive_coder.types import ModelCapabilities
+    loop = _Loop(host=None, config=LoopConfig())
+    caps = ModelCapabilities(name="dg", family="gemma", context_tokens=8192,
+                             supports_canvas=True)
+    third = loop.sampling_for(3, ENGINEER, caps)
+    assert third.fresh and third.seed is not None
+    assert "does not reach a canvas model" in third.describe()
+    assert "a new seed" in third.reason and "temperature" not in third.reason

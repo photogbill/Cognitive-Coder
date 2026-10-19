@@ -441,8 +441,11 @@ def build_and_run(code: str, lang_id: str, *, fs: Any, ex: Any,
     if not runner_tool:
         return RunResult(False, lang_id, phases=tuple(phases),
                          blocked=lang.missing_note(ex))
-    argv = langs.render(lang.run_cmd, run=runner_tool, build=lang.which_build(ex),
-                        src=src, out=out_path, dirpath=root, stem=stem)
+    module = langs.module_name(src_rel) if lang.module_run_cmd else ""
+    argv = langs.render(lang.module_run_cmd if module else lang.run_cmd,
+                        run=runner_tool, build=lang.which_build(ex),
+                        src=src, out=out_path, dirpath=root, stem=stem,
+                        module=module)
     # SQL is the odd one: statements are piped in rather than passed as a file.
     piped = code if lang_id == "sql" else stdin
     patience = Timeouts.resolve(timeout, lang.run_timeout)
@@ -531,7 +534,8 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
               test_source: str = "", path: str = "",
               test_path: str = "",
               known_failing: Sequence[str] = (),
-              whole_suite: bool = False) -> RunResult:
+              whole_suite: bool = False,
+              check_elsewhere: bool = True) -> RunResult:
     """Run the language's test command, honestly.
 
     Two honesty obligations are discharged here:
@@ -687,7 +691,7 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
             caveats=tuple(caveats))
     if empty:
         caveats.append(empty)
-    if scoped and phase.ok:
+    if scoped and phase.ok and check_elsewhere:
         elsewhere = _failing_elsewhere(lang_id, lang, fs=fs, ex=ex,
                                        stem=stem, workdir=workdir,
                                        timeout=timeout, path=path,
@@ -1084,7 +1088,8 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
            test_source: str = "", skip_guard: bool = False,
            path: str = "", timeouts: Timeouts | None = None,
            test_path: str = "",
-           known_failing: Sequence[str] = ()) -> RunResult:
+           known_failing: Sequence[str] = (),
+           spec_test_path: str = "") -> RunResult:
     """The C4 definition of done: it builds AND the tests run (M4).
 
     This is the function the loop calls, and the one place where "done" is
@@ -1100,6 +1105,12 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     ``known_failing`` names the test modules that were already failing
     before the build began (the session's baseline); their failures are
     never charged to the file being verified.
+
+    ``spec_test_path`` is the file of SPEC VECTORS for this module
+    (`specvectors.py`): the request's own examples as tests. They run
+    FIRST, before the model's tests — the most trustworthy diagnostic a
+    repair can get — and a failing vector is this file's failure, with
+    the request's sentence as its message (tool `spec-vector`).
     """
     clocks = timeouts or Timeouts()
     built = build_and_run(code, lang_id, fs=fs, ex=ex, stem=stem,
@@ -1108,6 +1119,32 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                           timeout=clocks.run, build_timeout=clocks.build)
     if not built.ok:
         return built
+
+    if spec_test_path:
+        try:
+            have = fs.exists(spec_test_path)
+        except Exception:                                # noqa: BLE001
+            have = False
+        if have:
+            vectors = run_tests(lang_id, fs=fs, ex=ex, stem=stem,
+                                workdir=workdir, timeout=clocks.test,
+                                path=path, test_path=spec_test_path,
+                                known_failing=known_failing,
+                                check_elsewhere=False)
+            if not vectors.blocked and not vectors.ok:
+                failed = sum(1 for d in vectors.diagnostics if d.is_error)
+                diags = tuple(replace(d, tool="spec-vector")
+                              for d in vectors.diagnostics)
+                return RunResult(
+                    ok=False, lang=lang_id,
+                    phases=built.phases + tuple(
+                        replace(p, name="test") for p in vectors.phases),
+                    diagnostics=diags, warnings=built.warnings,
+                    caveats=built.caveats + (
+                        f"the request's own examples fail ({failed} "
+                        f"spec vector{'s' * (failed != 1)} in "
+                        f"{spec_test_path}) — these are the request's "
+                        f"words, not a model's test",))
 
     tested = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
                        test_source=test_source, timeout=clocks.test,

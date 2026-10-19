@@ -78,6 +78,30 @@ def count_tokens(self, text: str) -> int
    present, the session report states exactly what share of each prompt
    came from the cache instead of inferring it from timings.
 
+### ModelRoster — optional, beside LLMPort (2026-10-16)
+
+A host that can load more than one model implements, on the SAME object as
+its `LLMPort`:
+
+```python
+def roster(self) -> Sequence[ModelSlot]
+def load_model(self, name: str, *, cancel=None) -> str      # "" or a sentence
+```
+
+Hybrid mode (docs/HYBRID.md) asks which models the host COULD load and asks
+for one at a phase boundary — twice in a build, never per file. The core
+still loads nothing itself: it asks, the host decides, and a host that
+answers with a sentence gets the build carried on with whatever is loaded,
+said in the log. A host without these methods never sees a call.
+
+**A host must guarantee:** `roster()` never raises and names are stable and
+unique for the session; `ModelSlot.kind` is `"canvas"` only for a model that
+will answer `canvas_fill` once loaded, `"chat"` for one that will not, `""`
+when it cannot tell before loading; after `load_model` returns `""`,
+`capabilities()` describes the new model (the core re-reads it and treats
+the change as an epoch); after a sentence, `capabilities()` still describes
+something usable, or nothing loaded, honestly.
+
 ---
 
 ## FileSystemPort

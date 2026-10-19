@@ -52,7 +52,8 @@ from .errors import (
 from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
 from .patcher import Patcher
-from .planner import Planner, _looks_like_test, is_entry_point as _is_entry_point
+from .planner import Planner, _looks_like_test
+from .planner import is_entry_point as _is_entry_point
 from .ports import Cancel, Host
 from .providers import RemoteGate
 from .redact import Budget
@@ -145,6 +146,42 @@ class SessionConfig:
     mutation_check: bool = True
     mutation_max: int = 5                # mutants per file
     mutation_budget_s: float = 120.0     # for the whole check
+    #: SPEC VECTORS (specvectors.py): the examples the request states
+    #: outright (`` `"1-3"` -> `(1, 2, 3)` ``, `` `SUBTICKS_PER_TURN: int =
+    #: 10` ``) lifted by rule into a test file per module that the harness
+    #: owns and the runner runs before the module's own tests. A model's
+    #: test that contradicts one is wrong by definition.
+    spec_vectors: bool = True
+    #: THE JUDGE (adjudicate.py): when a model's test disagrees with the
+    #: module it tests, ask which one the request supports — and check the
+    #: quote the answer rests on — before blaming the module. Ten of the
+    #: sixteen failing tests of the 2026-10-16 build were the test's fault,
+    #: and the rule "the code must change" had no way to say so.
+    adjudicate: bool = True
+    #: HYBRID MODE (hybrid.py, docs/HYBRID.md): with a host that offers a
+    #: roster of models (`ports.ModelRoster`), one model writes, the other
+    #: repairs, the first finishes — three phases, two swaps. "auto": when
+    #: the roster has both a chat and a canvas model; "off": never;
+    #: "ar-first" / "diffusion-first": that order, whatever is loaded now.
+    hybrid: str = "auto"
+    #: Roster names to use for the roles; "" picks by kind.
+    hybrid_writer: str = ""
+    hybrid_repairer: str = ""
+    #: HOW MUCH OF THE REQUEST EACH FILE'S PROMPTS CARRY (specslice.py), in
+    #: characters. Whole when it fits; otherwise the file's own section of
+    #: the specification, its hard requirements and the lines naming it.
+    #: The old fixed cut (2,000 characters, every repair and every
+    #: diffusion prompt) dropped every formula of a 15,000-character spec.
+    request_chars_first: int = 16_000
+    request_chars_repair: int = 8_000
+    #: THE SPEED PROBE: one short generation after the model check, and
+    #: after every model swap, with its tokens per second and prefill time
+    #: written to the log. Devstral ran the whole 2026-10-16 build at 3–5
+    #: tok/s — spilled into system RAM — and nothing said so until the
+    #: journal was read two and a half hours later. None: on for a real
+    #: model port, never for the scripted test doubles (`ScriptedLLM`,
+    #: `NullLLM`), whose replies are counted. True/False: always/never.
+    speed_probe: bool | None = None
 
 
 class Session:
@@ -216,7 +253,10 @@ class Session:
                                   test=self.config.test_timeout),
                 canvas=self.config.diffusion,
                 canvas_candidates=self.config.diffusion_candidates,
-                canvas_notes=self.config.diffusion_notes))
+                canvas_notes=self.config.diffusion_notes,
+                adjudicate=self.config.adjudicate,
+                request_chars_first=self.config.request_chars_first,
+                request_chars_repair=self.config.request_chars_repair))
         #: The readable log is the Loop's too — it is where the verify
         #: phases happen, and their output is the whole point of the file.
         self.loop.log = self.log
@@ -227,6 +267,9 @@ class Session:
         #: (module task, test task, the test's failing diagnostics). One
         #: pass per module per session — a second would be a loop.
         self._repairs: list[tuple[Task, Task, tuple]] = []
+        #: Tests the judge ruled WRONG after a module repair came back
+        #: unchanged: (test task, module task, verdict, failing).
+        self._test_repairs: list[tuple[Task, Task, Any, tuple]] = []
         self._repaired: set[str] = set()
         #: What the session was doing, for the sentence a failure earns.
         self._where = ""
@@ -242,6 +285,17 @@ class Session:
         self._context: int = 0
         self._started = 0.0
         self._finished = False
+        #: The sentence a crash ended the session with, or "". A session
+        #: that stopped unexpectedly is never `ok`, whatever its files say:
+        #: the 2026-10-16 DiffusionGemma build crashed at 870 s and its
+        #: `session_end` read `ok: true` from the two files built before.
+        self._failed: str = ""
+        #: Hybrid mode's roles (hybrid.Roles) or None; the phase running.
+        self._roles: Any = None
+        self._phase: Any = None
+        #: {path: the diagnostics a re-opened task's first attempt repairs
+        #: against} — how a later phase hands a failed file its errors.
+        self._seeds: dict[str, tuple] = {}
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -284,6 +338,8 @@ class Session:
                         "max_files": self.config.max_files,
                         "lang": self.config.lang,
                         "diffusion": self._diffusion_state(caps)})
+        self._speed_probe(caps, after="the model check")
+        caps = self._plan_hybrid(caps)
         self._pin_constraints(request, source="the request")
         self._git_warning()
 
@@ -301,6 +357,10 @@ class Session:
             self.log.line(f"  {i}. {t.path}  — {t.purpose[:60]}")
         for c in self.plan.caveats:
             self.log.line(f"  CAVEAT: {c}")
+        # BEFORE the skeleton, which is now imported for real: a stub that
+        # imports pygame must find pygame, or the check reports an
+        # environment matter as a note instead of a fact about the design.
+        self._preinstall(request)
         if self.config.skeleton_first:
             #: ORDER FIRST, THEN STUBS. This line is the whole fix for a
             #: deadlock that made ordering a no-op on every project: the
@@ -343,9 +403,108 @@ class Session:
             # is the one thing skeleton-first exists to provide. A new plan
             # is an epoch boundary (G.7.2); this is that boundary.
             self.codemap.maybe_bump_epoch(replanned=True)
+        self._write_spec_vectors(request)
         self._emit_plan(revised=False)
-        self._preinstall(request)
         return self.plan
+
+    def _write_spec_vectors(self, request: str) -> None:
+        """The request's own examples, as tests the harness owns
+        (specvectors.py) — written once, after the skeleton, through the
+        patcher like any other write, and said in the log."""
+        self.loop.spec_tests = {}
+        if not self.config.spec_vectors or self.plan is None:
+            return
+        if (self.config.lang or "python") != "python":
+            return
+        from . import specvectors
+        paths = [t.path for t in self.plan.tasks]
+        try:
+            vectors = specvectors.extract(request, paths)
+        except Exception as exc:                          # noqa: BLE001
+            self.log.line(f"  spec vectors  none — the request could not "
+                          f"be read for them ({exc})")
+            return
+        if not vectors:
+            self.log.line("  spec vectors  none found (no `literal` -> "
+                          "`literal` example beside a named function, and "
+                          "no UPPER_CASE constant with a value)")
+            return
+        layout = self.planner.observe_layout()
+        test_dir = layout.get("test_dir") or self.planner.test_dir or "tests"
+        grouped = specvectors.by_module(vectors)
+        edits: list = []
+        files: dict[str, str] = {}
+        from .types import Edit
+        for module, items in grouped.items():
+            test_path = specvectors.test_path_for(module, test_dir)
+            files[module] = test_path
+            edits.append(Edit(path=test_path, kind="whole",
+                              new=specvectors.test_file(module, items),
+                              note="spec vectors — the request's own "
+                                   "examples as tests"))
+        init = f"{test_dir}/__init__.py"
+        try:
+            if not self.host.fs.exists(init):
+                edits.append(Edit(path=init, kind="create", new="",
+                                  note="make the test folder a package"))
+        except Exception:                                 # noqa: BLE001
+            pass
+        written = self._write_vector_files(edits)
+        if not written:
+            self.log.line("  spec vectors  not written — the change was not "
+                          "approved")
+            return
+        self.loop.spec_tests = {m: p for m, p in files.items() if p in written}
+        self.log.rule("SPEC VECTORS — examples the request states outright, "
+                      "as tests no model may change")
+        for module, items in grouped.items():
+            if files[module] not in written:
+                continue
+            self.log.line(f"  {files[module]}  ({len(items)} for {module})")
+            for v in items:
+                self.log.line(f"    - {v.call} == {v.expected}")
+        self.journal.log("constraints", vectors=len(vectors),
+                         vector_files=sorted(set(self.loop.spec_tests.values())),
+                         items=[v.describe() for v in vectors])
+        if self.codemap is not None:
+            for path in written:
+                try:
+                    self.codemap.reindex_after_write(path)
+                except Exception:                         # noqa: BLE001
+                    pass
+        self.host.emit("status",
+                       f"{len(vectors)} spec vector"
+                       f"{'' if len(vectors) == 1 else 's'} lifted from the "
+                       f"request into {len(self.loop.spec_tests)} test "
+                       f"file(s) the harness owns; they run before each "
+                       f"module's own tests",
+                       {"phase": "spec_vectors",
+                        "files": sorted(set(self.loop.spec_tests.values())),
+                        "count": len(vectors)})
+
+    def _write_vector_files(self, edits: list) -> list[str]:
+        """One transaction, one approval. Paths written, or []."""
+        if not edits:
+            return []
+        summary = (f"spec vectors: {len(edits)} test file"
+                   f"{'s' * (len(edits) != 1)} from the request's examples")
+        try:
+            preview = "\n".join(self.patcher.preview([e]) for e in edits)
+            approved = bool(self.patcher.approval.approve_diff(summary,
+                                                               preview))
+        except Exception:                                 # noqa: BLE001
+            approved = False
+        if not approved:
+            return []
+        tx = self.patcher.begin("spec-vectors", atomic=False)
+        try:
+            results = tx.apply(edits, approve=False, summary=summary)
+        except Exception:                                 # noqa: BLE001
+            tx.rollback("the spec vectors could not be written")
+            return []
+        tx.commit(verified=False)
+        return [r.path for r in results
+                if r.ok or "no change" in (r.reason or "")]
 
     def _log_skeleton(self, result: dict) -> None:
         """What the skeleton pinned, and the order the build will take.
@@ -372,6 +531,8 @@ class Session:
                            f"body was written: {', '.join(pinned)}")
         for path, why in fallback.items():
             self.log.line(f"  NOTE: {path} keeps a plain stub — {why}")
+        for note in getattr(self.planner, "import_notes", ()) or ():
+            self.log.line(f"  NOTE: {note}")
         first = self._tests_first()
         covered = self.planner._covered_modules(self.plan)
         late = [t.path for t in self.plan.tasks
@@ -539,6 +700,8 @@ class Session:
         if self.plan is None:
             raise RuntimeError("start() before step()")
         self._check_budget()
+        if self._test_repairs:
+            return self._repair_test_step()
         if self._repairs:
             return self._repair_step()
         task = self.plan.next_ready()
@@ -553,9 +716,11 @@ class Session:
         self.plan = self.plan.replace(task.with_status("active"))
         self._where = task.path
         covers = self._covered_module(task)
+        seed = self._seeds.pop(task.path, ())
         outcome = self.loop.run_task(task, request=self.plan.request,
                                      covers=covers.path if covers else "",
-                                     planned=self._planned_paths(task))
+                                     planned=self._planned_paths(task),
+                                     seed=seed)
         self.outcomes.append(outcome)
         self._credit_module(covers, outcome)
         self._credit_test_written_first(task, outcome)
@@ -697,6 +862,19 @@ class Session:
         self._record(fix, outcome, label="REPAIRED" if outcome.ok
                      else "NOT REPAIRED")
         if not outcome.ok:
+            # The repair came back unchanged and the judge, quoting the
+            # request, agreed the TEST is wrong: the test is repaired next.
+            wrong = self.loop.test_wrong.pop(test.path, None)
+            if wrong is not None and blamer_is_test:
+                _module_path, verdict, failing_diags = wrong
+                self._test_repairs.append((test, module, verdict,
+                                           tuple(failing_diags)))
+                self.host.emit(
+                    "status",
+                    f"{test.path} will be repaired against the request — "
+                    f"the judge ruled it wrong: {verdict.describe()}",
+                    {"task": test.path, "module": module.path,
+                     "because": "judge"})
             return outcome
         # The acceptance run IS the re-check, against the same files: a
         # caller's second run would cost a second full run timeout.
@@ -717,6 +895,53 @@ class Session:
         self.plan = self.plan.replace(test.with_status(
             "done" if again.ok else "failed"))
         return again
+
+    def _repair_test_step(self) -> TaskOutcome:
+        """Repair a TEST the judge ruled wrong, then credit the module.
+
+        The fix's first attempt is a repair against the judge's diagnostic
+        — the request's words and the assertion that contradicts them. A
+        test that then passes against the module verifies the module; the
+        module's earlier "NOT REPAIRED" was the model declining to break
+        correct code, and the record says so.
+        """
+        from . import adjudicate as adjudicate_mod
+        test, module, verdict, failing = self._test_repairs.pop(0)
+        self._where = f"the repair of {test.path} (the judge ruled it wrong)"
+        caps = self._capabilities(boundary=f"repair of {test.path}")
+        if not caps.loaded:
+            raise NoModelLoadedError(
+                "capabilities() reports no model at a task boundary")
+        judged = adjudicate_mod.diagnostic_for_test(verdict, test.path,
+                                                    failing)
+        fix = Task(id=f"{test.id}-fix", path=test.path, purpose=test.purpose,
+                   test_path="", persona="tester", lang=test.lang,
+                   atomic=False)
+        self.log.event(f"REPAIR {test.path}",
+                       f"against the request, not the module — the judge: "
+                       f"{verdict.describe()}")
+        outcome = self.loop.run_task(fix, request=self.plan.request,
+                                     covers=module.path, seed=(judged,),
+                                     planned=self._planned_paths(test))
+        self._record(fix, outcome, label="REPAIRED" if outcome.ok
+                     else "NOT REPAIRED")
+        if outcome.ok:
+            caveat = (f"verified by {test.path} after the judge ruled its "
+                      f"earlier assertion wrong, quoting the request")
+            self.outcomes.append(TaskOutcome(
+                task_id=module.id, path=module.path, ok=True,
+                result=outcome.result, verified=bool(outcome.verified),
+                caveats=(caveat,)))
+            if outcome.verified:
+                self.loop.unverified.discard(module.path)
+            self.host.emit("status",
+                           f"{module.path}: {caveat}",
+                           {"task": module.path, "verified": outcome.verified,
+                            "by": test.path})
+            self.plan = self.plan.replace(module.with_status("done"))
+        self.plan = self.plan.replace(test.with_status(
+            "done" if outcome.ok else "failed"))
+        return outcome
 
     def _task_at(self, path: str) -> Task | None:
         """The plan's task for a path, or None when the plan does not own
@@ -792,6 +1017,87 @@ class Session:
                            "files, as with any model",
                            {"phase": "model_check", "model": caps.name,
                             "diffusion": False})
+
+    #: Below this many tokens per second a chat model is almost certainly
+    #: running from system RAM, not the card: a 24B Q4 that fits in VRAM
+    #: decodes at 15–30 tok/s on a 16 GB card; Devstral offloaded ran at 3–5.
+    SLOW_TOK_S = 8.0
+
+    def _speed_probe(self, caps: ModelCapabilities, *, after: str) -> None:
+        """One short generation, timed, written down — and a warning when
+        the number says the model is spilling into system RAM.
+
+        The whole 2026-10-16 Devstral build ran at 3–5 tok/s: 89 % of its
+        two and a half hours was the model decoding, and the first line
+        that said so was in a journal read afterwards. One probe at the
+        start costs a few seconds and puts the number where the operator
+        reads it, when it can still change their mind.
+        """
+        if self.config.speed_probe is False or not caps.loaded:
+            return
+        if self.config.speed_probe is None:
+            from .ports import NullLLM, ScriptedLLM
+            if isinstance(self.host.llm, (NullLLM, ScriptedLLM)):
+                return                       # their replies are counted
+        from .types import Message
+        messages = [Message(role="system",
+                            content="You answer with one word."),
+                    Message(role="user",
+                            content="Reply with the single word READY and "
+                                    "nothing else.")]
+        self._where = f"the speed probe after {after}"
+        t0 = time.monotonic()
+        try:
+            completion = self.host.llm.complete(
+                messages, temperature=0.0, max_tokens=48,
+                cancel=self.cancel_token)
+        except Cancelled:
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            self.log.line(f"  speed     not measured ({_plain_cause(exc)})")
+            return
+        if completion.finish_reason == "cancelled":
+            raise Cancelled("the speed probe")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        decode_ms = int(getattr(completion, "decode_ms", 0) or 0)
+        prompt_ms = int(completion.prompt_ms or 0)
+        tokens_out = int(completion.tokens_out or 0)
+        if not tokens_out and completion.text:
+            tokens_out = max(1, len(completion.text) // 4)
+        if decode_ms <= 0:
+            # the port does not separate prefill from decode: the whole
+            # call, less prefill where it is known — a ceiling on the rate
+            decode_ms = max(1, elapsed_ms - prompt_ms)
+        tok_s = tokens_out / (decode_ms / 1000.0) if tokens_out else 0.0
+        canvas = bool(getattr(caps, "supports_canvas", False))
+        self.journal.log("model_check", model=caps.name, probe=True,
+                         after=after, tokens_out=tokens_out,
+                         prompt_ms=prompt_ms, decode_ms=decode_ms,
+                         elapsed_ms=elapsed_ms, tok_s=round(tok_s, 1),
+                         finish_reason=completion.finish_reason,
+                         canvas=canvas)
+        if canvas:
+            # a diffusion model writes a whole canvas at once: tokens per
+            # second is not the measure, the time to a canvas is
+            self.log.line(f"  speed     one reply ({tokens_out} tokens) in "
+                          f"{elapsed_ms / 1000:.1f}s — prefill "
+                          f"{prompt_ms} ms, denoising {decode_ms} ms "
+                          f"({caps.name}, a canvas model)")
+            return
+        self.log.line(f"  speed     {tok_s:.1f} tok/s decode, prefill "
+                      f"{prompt_ms} ms, {tokens_out} tokens in "
+                      f"{elapsed_ms / 1000:.1f}s ({caps.name})")
+        if tokens_out and tok_s < self.SLOW_TOK_S:
+            note = (f"{caps.name} is generating at {tok_s:.1f} tokens per "
+                    f"second, far below what a model that fits in VRAM "
+                    f"does; it is probably spilling into system RAM. A "
+                    f"smaller quantization, a shorter context, or a "
+                    f"quantized KV cache would be several times faster. "
+                    f"The build goes on at this speed.")
+            self.log.line(f"  WARNING   {note}")
+            self.host.emit("warning", note,
+                           {"phase": "model_check", "model": caps.name,
+                            "tok_s": round(tok_s, 1), "slow": True})
 
     def _diffusion_state(self, caps: Any) -> str:
         """For the build log's config line: whether this build can cut
@@ -1083,6 +1389,9 @@ class Session:
         found = constraints_mod.extract(text or "")
         self.constraints = found
         self.prompts.constraints = found.block()
+        # The same sentences reach the skeleton: the ones naming a pinned
+        # file go into its docstring (interfaces.with_conventions).
+        self.planner.conventions = list(found.items)
         self.journal.log("constraints", source=source, items=found.items,
                          more=found.more)
         if not found.items:
@@ -1282,30 +1591,32 @@ class Session:
             while True:
                 outcome = self.step()
                 if outcome is None:
-                    #: NOTHING READY IS NOT THE SAME AS NOTHING LEFT.
-                    #:
-                    #: A task whose dependency failed can never become ready,
-                    #: so the loop ends and the file is simply never
-                    #: mentioned. On a real build that showed as "[build 6/6]"
-                    #: against a seven-file plan, with src/main.py absent from
-                    #: the log entirely — it was waiting on src/render.py,
-                    #: which had failed three attempts earlier.
-                    #:
-                    #: Not building it is correct. Not saying so is the same
-                    #: mistake the installer made: an absence nobody can see.
-                    for task, blockers in (self.plan.blocked()
-                                           if self.plan else []):
-                        self.host.emit(
-                            "warning",
-                            f"{task.path} was never attempted — it needs "
-                            f"{', '.join(blockers)}, which did not build",
-                            {"task": task.path, "blocked_by": blockers})
-                        self.journal.log("blocked", task=task.path,
-                                         blocked_by=blockers)
-                        self.log.event(f"SKIPPED {task.path}",
-                                       f"needs {', '.join(blockers)}, "
-                                       f"which did not build")
                     break
+            # Hybrid mode's later phases re-open what failed (and attempt
+            # what was blocked on it) with the other model loaded.
+            self._hybrid_phases()
+            #: NOTHING READY IS NOT THE SAME AS NOTHING LEFT.
+            #:
+            #: A task whose dependency failed can never become ready, so
+            #: the loop ends and the file is simply never mentioned. On a
+            #: real build that showed as "[build 6/6]" against a seven-file
+            #: plan, with src/main.py absent from the log entirely — it was
+            #: waiting on src/render.py, which had failed three attempts
+            #: earlier.
+            #:
+            #: Not building it is correct. Not saying so is the same
+            #: mistake the installer made: an absence nobody can see.
+            for task, blockers in (self.plan.blocked() if self.plan else []):
+                self.host.emit(
+                    "warning",
+                    f"{task.path} was never attempted — it needs "
+                    f"{', '.join(blockers)}, which did not build",
+                    {"task": task.path, "blocked_by": blockers})
+                self.journal.log("blocked", task=task.path,
+                                 blocked_by=blockers)
+                self.log.event(f"SKIPPED {task.path}",
+                               f"needs {', '.join(blockers)}, "
+                               f"which did not build")
         except Cancelled as exc:
             self.journal.log("cancel", sentence=str(exc))
             self.host.emit("status", str(exc))
@@ -1332,6 +1643,200 @@ class Session:
                 except Cancelled:
                     self.journal.log("cancel", where="review")
 
+    # ------------------------------------------------------------------
+    # hybrid mode (hybrid.py, docs/HYBRID.md)
+    # ------------------------------------------------------------------
+    def _roster(self) -> list:
+        """The host's roster, or [] — never raises."""
+        port = self.host.llm
+        fn = getattr(port, "roster", None)
+        if not callable(fn):
+            return []
+        try:
+            return [s for s in (fn() or ()) if getattr(s, "name", "")]
+        except Exception as exc:                          # noqa: BLE001
+            self.log.line(f"  hybrid    the roster could not be read "
+                          f"({exc}); one model")
+            return []
+
+    def _plan_hybrid(self, caps: ModelCapabilities) -> ModelCapabilities:
+        """Decide the roles, say so, and load the first phase's model if
+        it is not the loaded one. Returns the capabilities to go on with."""
+        from . import hybrid
+        self._roles = None
+        mode = str(self.config.hybrid or "auto")
+        roster = self._roster()
+        if mode.strip().lower() == "off" and not roster:
+            return caps
+        loaded_kind = ("canvas" if getattr(caps, "supports_canvas", False)
+                       else "chat") if caps.loaded else ""
+        roles, reason = hybrid.plan_roles(
+            mode, roster, caps.name, loaded_kind=loaded_kind,
+            writer=self.config.hybrid_writer,
+            repairer=self.config.hybrid_repairer)
+        if roles is None:
+            if roster or mode.strip().lower() != "auto":
+                # said only when there was something to decide: a host
+                # with no roster gets no line and no journal event
+                self.log.line(f"  hybrid    {reason}")
+                self.journal.log("phase", hybrid=False, reason=reason,
+                                 roster=[s.name for s in roster])
+            return caps
+        self._roles = roles
+        self.log.line(f"  hybrid    {roles.describe()}")
+        for ph in roles.phases():
+            self.log.line(f"            phase {ph.number} ({ph.name}): "
+                          f"{ph.model} — {ph.what}")
+        self.journal.log("phase", hybrid=True, order=roles.order,
+                         first=roles.first, second=roles.second,
+                         roster=[s.name for s in roster], why=roles.why)
+        self.host.emit("status", roles.describe(),
+                       {"phase": "hybrid", "order": roles.order,
+                        "first": roles.first, "second": roles.second})
+        first = roles.phases()[0]
+        self._phase = first
+        if first.model != caps.name:
+            if self._swap_to(first.model, why=f"phase 1 ({first.name}) "
+                                               f"is {first.model}'s"):
+                caps = self._capabilities(boundary="phase 1")
+        return caps
+
+    def _swap_to(self, name: str, *, why: str) -> bool:
+        """Ask the host to load ``name``. True when it did. Said in the
+        log with its duration either way; the core loads nothing itself."""
+        load = getattr(self.host.llm, "load_model", None)
+        if not callable(load):
+            self.log.event("SWAP", "the host cannot load models on request; "
+                                   "staying on what is loaded")
+            return False
+        self._where = f"loading {name}"
+        self.log.event("SWAP", f"loading {name} — {why}; the prompt cache "
+                               f"starts cold")
+        self.host.emit("status", f"loading {name} — {why}",
+                       {"phase": "swap", "model": name})
+        t0 = time.monotonic()
+        try:
+            problem = load(name, cancel=self.cancel_token)
+        except Exception as exc:                          # noqa: BLE001
+            problem = f"the host raised while loading it ({exc})"
+        seconds = round(time.monotonic() - t0, 1)
+        if self.cancel_token.is_set():
+            raise Cancelled(f"loading {name}")
+        if problem:
+            self.log.event("SWAP", f"{name} was not loaded after {seconds}s "
+                                   f"— {problem}; the build goes on with "
+                                   f"whatever is loaded")
+            self.host.emit("warning",
+                           f"could not load {name}: {problem} — the build "
+                           f"goes on with the loaded model",
+                           {"phase": "swap", "model": name, "ok": False})
+            self.journal.log("swap", model=name, ok=False, seconds=seconds,
+                             why=why, problem=str(problem)[:300])
+            return False
+        caps = self._capabilities(boundary=f"swap to {name}")
+        self.journal.log("swap", model=name, ok=True, seconds=seconds,
+                         why=why, now=caps.name)
+        self.log.event("SWAP", f"{caps.name or name} loaded in {seconds}s")
+        try:
+            self._check_model(caps)
+        except NotACodingModelError as exc:
+            self.log.line(f"  WARNING   {exc}")
+        self._speed_probe(caps, after=f"the swap to {name}")
+        self.host.emit("status", f"now running {caps.name or name}",
+                       {"phase": "swap", "model": caps.name or name,
+                        "ok": True, "seconds": seconds})
+        return True
+
+    def _unfinished(self) -> list[Task]:
+        """The plan's tasks that failed, and those never attempted because
+        a dependency failed — in plan (dependency) order."""
+        if self.plan is None:
+            return []
+        final = {o.path: o for o in self.outcomes}
+        out: list[Task] = []
+        for task in self.plan.tasks:
+            if task.status == "failed":
+                out.append(task)
+            elif task.status == "pending":
+                out.append(task)               # blocked: never attempted
+            elif task.status == "done" and task.path in final \
+                    and not final[task.path].ok:
+                out.append(task)
+        return out
+
+    def _hybrid_phases(self) -> None:
+        """Phases 2 and 3: swap, re-open what failed, run the step loop
+        again. Each phase works in dependency order and ends when nothing
+        it can act on is left; a phase with nothing left is skipped."""
+        if self._roles is None or self.plan is None:
+            return
+        phases = self._roles.phases()[1:]
+        for phase in phases:
+            left = self._unfinished()
+            if not left:
+                self.log.event(f"PHASE {phase.number} ({phase.name})",
+                               "nothing left to do — skipped")
+                self.journal.log("phase", number=phase.number,
+                                 name=phase.name, model=phase.model,
+                                 skipped=True)
+                break
+            self._phase = phase
+            self.log.rule(f"PHASE {phase.number} — {phase.name}: "
+                          f"{phase.model}")
+            self.log.line(f"  {phase.what}")
+            self.log.line(f"  left from the phase before: "
+                          f"{', '.join(t.path for t in left)}")
+            self.journal.log("phase", number=phase.number, name=phase.name,
+                             model=phase.model,
+                             left=[t.path for t in left])
+            self.host.emit("phase", f"phase {phase.number} ({phase.name}): "
+                                    f"{len(left)} file(s) left — "
+                                    f"{phase.what}",
+                           {"phase": "hybrid", "number": phase.number,
+                            "name": phase.name, "model": phase.model,
+                            "left": [t.path for t in left]})
+            caps = self._capabilities(boundary=f"phase {phase.number}")
+            if phase.model != caps.name:
+                self._swap_to(phase.model,
+                              why=f"phase {phase.number} ({phase.name}) is "
+                                  f"{phase.model}'s")
+            self._reopen(left)
+            fixed_before = sum(1 for o in self._final_outcomes() if o.ok)
+            while True:
+                if self.step() is None:
+                    break
+            final = self._final_outcomes()
+            fixed = sum(1 for o in final if o.ok) - fixed_before
+            still = [t.path for t in self._unfinished()]
+            self.log.event(f"PHASE {phase.number} ({phase.name}) ended",
+                           f"{max(0, fixed)} more file(s) ok; "
+                           + (f"still failing: {', '.join(still)}" if still
+                              else "nothing left failing"))
+            self.journal.log("phase", number=phase.number, name=phase.name,
+                             model=phase.model, ended=True, fixed=fixed,
+                             still=still)
+
+    def _reopen(self, tasks: list) -> None:
+        """Put failed tasks back to pending with their last errors as the
+        seed of their first attempt; a blocked task simply becomes ready
+        once its dependency is done."""
+        final = {o.path: o for o in self.outcomes}
+        for task in tasks:
+            if task.status == "pending":
+                continue
+            last = final.get(task.path)
+            diags: tuple = ()
+            if last is not None and last.attempts:
+                diags = tuple(last.attempts[-1].diagnostics)
+            if diags:
+                self._seeds[task.path] = diags
+            self._repaired.discard(task.path)
+            self.plan = self.plan.replace(task.with_status("pending",
+                                                           attempts=0))
+        # the loop's per-task memory of what it tried is per run_task;
+        # the session's one-repair-per-file rule starts over per phase
+        self.loop.blamed.clear()
+
     def _unexpected_sentence(self, exc: BaseException) -> str:
         """What happened, where, and where the details are — no type names."""
         where = f" while working on {self._where}" if self._where else ""
@@ -1346,9 +1851,19 @@ class Session:
         Never raises: this runs on the way out of a failure, and a second
         failure here would replace the sentence with a traceback.
         """
+        self._failed = exc.sentence
         try:
             self.journal.error(exc.sentence, exc.detail,
                                journal=self.journal.path, where=self._where)
+        except Exception:                                 # noqa: BLE001
+            pass
+        # BUILD_LOG.txt is the file an operator reads, and it never said. The
+        # DiffusionGemma build's log ends mid-attempt as if the operator had
+        # walked away; the crash was in the JSONL only.
+        try:
+            self.log.event("STOPPED UNEXPECTEDLY", exc.sentence)
+            if exc.detail:
+                self.log.block("traceback", exc.detail)
         except Exception:                                 # noqa: BLE001
             pass
         self.host.emit("error", exc.sentence,
@@ -1478,8 +1993,11 @@ class Session:
         self.journal.log(
             "session_end",
             #: "ok" means VERIFIED. A file whose test file exists and ran
-            #: nothing is not, however green its build was.
-            ok=bool(final) and all(o.ok for o in final) and not unverified,
+            #: nothing is not, however green its build was — and a session
+            #: that crashed is not, however green the files before the
+            #: crash were.
+            ok=(bool(final) and all(o.ok for o in final) and not unverified
+                and not self._failed),
             files=[o.path for o in final if o.ok],
             failed=[o.path for o in final if not o.ok],
             unverified=unverified,
@@ -1489,7 +2007,8 @@ class Session:
             remote=self.gate.active,
             bytes_out=self.gate.bytes_out,
             redactions=self.gate.redactions,
-            budget=self.budget.as_dict() if self.gate.active else {})
+            budget=self.budget.as_dict() if self.gate.active else {},
+            **({"error": self._failed} if self._failed else {}))
         if self.gate.active:
             self.host.emit(
                 "remote",
@@ -1499,6 +2018,17 @@ class Session:
                 {"enabled": False, "bytes_out": self.gate.bytes_out,
                  "redactions": self.gate.redactions})
         self.host.emit("status", self.journal.summary())
+        # The build log's SUMMARY. It closed only Debug & Repair sessions;
+        # a build's log just stopped, and a reader could not tell a finished
+        # build from one still running.
+        if getattr(self.log, "_opened", False):
+            try:
+                tail = self.journal.summary()
+                if self._failed:
+                    tail = f"STOPPED UNEXPECTEDLY — {self._failed}\n{tail}"
+                self.log.close(tail)
+            except Exception:                            # noqa: BLE001
+                pass
         return self.report()
 
     def _unverified(self, final: list[TaskOutcome]) -> list[str]:

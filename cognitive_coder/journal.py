@@ -379,17 +379,19 @@ class SessionLog:
     def generation(self, task: str, attempt: int, *, temperature: float,
                    seed: Any, tokens_in: int, tokens_out: int,
                    prompt_ms: int, decode_ms: int, text: str = "",
-                   via: str = "") -> None:
+                   via: str = "", knobs: str = "") -> None:
         """One attempt's code. ``via`` names a path that did not sample at
         ``temperature`` (diffusion canvases): printing a temperature and a
         seed that were never used would send a reader after the wrong knob.
+        ``knobs`` is the loop's own account of the sampling it USED
+        (`Sampling.describe`), which outranks the two numbers when given.
         """
         with self._batch():
             rate = (round(tokens_out / (decode_ms / 1000), 1)
                     if decode_ms > 0 and tokens_out else 0)
             self.line()
             self.event(f"generate {task}", f"attempt {attempt}")
-            knobs = (f"via {via}:" if via else
+            knobs = (f"via {via}:" if via else knobs or
                      f"temperature={temperature} seed={seed}")
             self.line(f"  {knobs} "
                       f"in={tokens_in} out={tokens_out} "

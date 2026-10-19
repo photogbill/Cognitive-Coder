@@ -47,6 +47,10 @@ CALC_REQUEST = ("Build src/calc.py with add(a, b). Tests: tests/test_calc.py "
                 "must cover add.")
 
 
+# The judge (adjudicate.py, 2026-10-16) is OFF here: these tests script
+# the replies of the flow where a disagreeing test blames its module
+# outright, and a judge's question would consume a scripted reply.
+
 def _host(tmp_path, replies):
     return Host(llm=ScriptedLLM(replies, supports_tools=False),
                 fs=LocalFileSystem(str(tmp_path)), exec=SubprocessExec(),
@@ -56,7 +60,7 @@ def _host(tmp_path, replies):
 
 def _session(host, **config):
     config.setdefault("review_after_build", False)
-    return Session(host, config=SessionConfig(**config))
+    return Session(host, config=SessionConfig(adjudicate=False, **config))
 
 
 def _session_end(session):

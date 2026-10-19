@@ -34,6 +34,10 @@ from cognitive_coder import (
     SubprocessExec,
 )
 
+# The judge (adjudicate.py, 2026-10-16) is OFF here: these tests script
+# the replies of the flow where a disagreeing test blames its module
+# outright, and a judge's question would consume a scripted reply.
+
 PLAN = ("src/track.py — the track data model\n"
         "src/render.py — draws the visible segments\n"
         "src/main.py — the entry point: builds the track and draws it\n")
@@ -122,7 +126,7 @@ def _host(tmp_path, replies):
 
 def _session(tmp_path, replies):
     host = _host(tmp_path, replies)
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=3, pin_interfaces=False, review_after_build=False))
     return host, session
 
@@ -213,7 +217,7 @@ if __name__ == "__main__":
     unittest.main()
 ```'''
     host = _host(tmp_path, [plan, calc, test, calc])
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=3, pin_interfaces=False, review_after_build=False))
     session.run("add two numbers, with a test")
     fix = [o for o in session.outcomes if o.path == "src/calc.py"][-1]

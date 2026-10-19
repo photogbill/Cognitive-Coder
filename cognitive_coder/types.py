@@ -64,7 +64,7 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "budget", "cancel", "epoch", "error", "skills",
                   "blocked", "audit", "model_check", "baseline",
                   "interfaces", "canvas", "debug", "constraints",
-                  "mutation")
+                  "mutation", "adjudicate", "phase", "swap")
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +222,22 @@ class ModelCapabilities:
         than by raising, so the core can say so plainly instead of catching.
         """
         return bool(self.name)
+
+
+@dataclass(frozen=True)
+class ModelSlot:
+    """One model a host could load (`ports.ModelRoster`).
+
+    ``kind`` is "canvas" for a model that fills a laid-out canvas
+    (DiffusionGemma), "chat" for an ordinary one, "" when the host cannot
+    tell before loading it. ``loaded`` marks the one in memory now. The
+    core picks roles by ``kind`` (hybrid.py) and never by name.
+    """
+    name: str
+    path: str = ""
+    kind: str = ""
+    loaded: bool = False
+    note: str = ""
 
 
 @dataclass(frozen=True)

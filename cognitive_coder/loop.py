@@ -56,6 +56,7 @@ operator exactly what is wrong, and it is usually a two-second fix by hand.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import dataclasses
 from dataclasses import dataclass, field
 import difflib
 import hashlib
@@ -63,9 +64,18 @@ import re
 import time
 from typing import Any
 
+from . import (
+    adjudicate,
+    enrich,
+    guard,
+    langs,
+    personas,
+    runner,
+    specslice,
+    textio,
+)
 from . import canvas as cv
 from . import diagnostics as dx
-from . import enrich, guard, langs, personas, runner, textio
 from .context import CHARS_PER_TOKEN, Piece, build_context
 from .errors import Cancelled
 from .interfaces import broken_contract as _broken_contract
@@ -97,6 +107,8 @@ from .types import (
 
 DEFAULT_ATTEMPTS = 4
 MAX_CONTINUATIONS = 3
+#: "no seed was passed" — distinct from None, which is a seed of none.
+_UNSET = object()
 # Consecutive attempts differing by under this fraction of characters are the
 # model rearranging whitespace, not making a change (M34, cosmetic churn).
 COSMETIC_THRESHOLD = 0.02
@@ -140,6 +152,56 @@ class LoopConfig:
     #: first; the notes are the thinking, written down where every body in
     #: the file can read it.
     canvas_notes: bool = True
+    #: THE JUDGE (adjudicate.py): ask which side the request supports
+    #: before blaming a module for a test that disagrees with it.
+    adjudicate: bool = True
+    #: Questions the judge is asked per test file, at most.
+    adjudicate_max: int = 3
+    #: THE ESCALATION LADDER (docs/HYBRID.md). Attempt 1 is the model's
+    #: best shot at the persona's temperature; attempt 2 a repair with the
+    #: enriched diagnostics at the same temperature; attempt 3 a FRESH
+    #: START — the broken file is not shown — at the next rung with a seed;
+    #: attempt 4 and later whole-file repairs at the last rung, a new seed
+    #: each. Stagnation ("identical code twice", "the same errors twice")
+    #: moves to the next rung instead of stopping the file while a rung is
+    #: left. On the 2026-10-16 Devstral build every attempt sampled at
+    #: 0.15 with no seed, returned the same file, and stopped. Off: every
+    #: attempt at the persona's temperature, and stagnation stops it.
+    escalate: bool = True
+    #: The rungs: attempt 1–2 at the first (the persona's own temperature
+    #: when it is lower), 3 at the second, 4+ at the third.
+    temperatures: tuple[float, ...] = (0.15, 0.45, 0.70)
+    #: HOW MUCH OF THE REQUEST A FILE'S PROMPTS CARRY (specslice.py), in
+    #: characters: whole when it fits, else the file's own section of the
+    #: specification first. A repair prompt also carries the file, the test
+    #: and the errors, so its budget is the smaller one.
+    request_chars_first: int = specslice.FIRST_CHARS
+    request_chars_repair: int = specslice.REPAIR_CHARS
+
+
+@dataclass(frozen=True)
+class Sampling:
+    """What one attempt samples at — the record the logs print.
+
+    `temperature` and `seed` are what reach `complete()`. `fresh` is the
+    third attempt's rule: the broken file is not shown. `canvas` says the
+    temperature is a formality (a diffusion model keeps its own), so the
+    build log prints the seed and says so.
+    """
+    attempt: int
+    temperature: float
+    seed: int | None
+    rung: int = 0
+    fresh: bool = False
+    canvas: bool = False
+    reason: str = ""
+
+    def describe(self) -> str:
+        """The `generate` line's knobs, honestly."""
+        if self.canvas:
+            return (f"seed={self.seed} (temperature does not reach a canvas "
+                    f"model; it anneals its own)")
+        return f"temperature={self.temperature} seed={self.seed}"
 
 
 @dataclass
@@ -211,6 +273,212 @@ class Loop:
     #: log's `generate` line says "via diffusion canvases" instead of a
     #: temperature that attempt never sampled at.
     _via_canvas: dict = field(default_factory=dict, repr=False)
+    #: {(path, "first" | "repair"): the request sliced to that file}
+    #: (`specslice`) — cut once per task and logged once when it is a cut.
+    _slices: dict = field(default_factory=dict, repr=False)
+    #: {test path: (module path, Verdict, the failing diagnostics)} — a
+    #: module repair returned its file unchanged and the judge agreed the
+    #: TEST is wrong. The session repairs that test next.
+    test_wrong: dict = field(default_factory=dict)
+    #: {(test path, failure signature): Verdict} — one question each.
+    _judged: dict = field(default_factory=dict, repr=False)
+    #: {module path: its spec-vector test file} (`specvectors.py`), set by
+    #: the session; the runner runs it before the module's own tests.
+    spec_tests: dict = field(default_factory=dict)
+    #: {module path: did its spec vectors pass at the last verification}
+    #: — what the judge is told when a model's test disagrees with it.
+    vectors_ok: dict = field(default_factory=dict)
+    #: {path: Sampling} — what the current attempt actually samples at, so
+    #: the journal and BUILD_LOG.txt print the temperature and seed that
+    #: were USED, never the config's (set per attempt by `_generate`).
+    _sampling: dict = field(default_factory=dict, repr=False)
+
+    # ------------------------------------------------------------------
+    # the escalation ladder
+    # ------------------------------------------------------------------
+    def sampling_for(self, attempt: int, persona: Persona,
+                     caps: ModelCapabilities | None = None) -> Sampling:
+        """What attempt ``attempt`` samples at, and whether it starts fresh.
+
+        A chat model climbs the temperature rungs with a derived seed from
+        the third attempt. A CANVAS model is told nothing about
+        temperature — DiffusionGemma's sampler anneals its own, compiled
+        into the server — so for it a rung means a new seed and no warm
+        start; the record says so rather than printing a temperature that
+        did nothing.
+        """
+        rungs = tuple(self.config.temperatures) or (persona.temperature,)
+        base = min(persona.temperature, rungs[0])
+        canvas = bool(caps is not None
+                      and getattr(caps, "supports_canvas", False))
+        if not self.config.escalate or attempt <= 2:
+            return Sampling(attempt=attempt,
+                            temperature=persona.temperature if attempt <= 2
+                            else base,
+                            seed=self.config.seed, rung=0, fresh=False,
+                            canvas=canvas,
+                            reason="the first attempt" if attempt == 1 else
+                            "a repair with the errors and the real "
+                            "definitions they name")
+        rung = min(attempt - 2, len(rungs) - 1)
+        seed_base = self.config.seed if self.config.seed is not None else 0
+        seed = seed_base + 7919 * attempt
+        fresh = attempt == 3
+        temperature = rungs[rung]
+        if fresh:
+            reason = (f"a fresh start — the broken file is not shown; "
+                      f"{'a new seed' if canvas else f'temperature {temperature:.2f}, seed {seed}'}")
+        else:
+            reason = (f"a whole-file repair at "
+                      f"{'a new seed' if canvas else f'temperature {temperature:.2f}, seed {seed}'}")
+        return Sampling(attempt=attempt, temperature=temperature, seed=seed,
+                        rung=rung, fresh=fresh, canvas=canvas, reason=reason)
+
+    # ------------------------------------------------------------------
+    # the judge (adjudicate.py)
+    # ------------------------------------------------------------------
+    def _adjudicate(self, test: Task, module: str,
+                    diags: Sequence[Diagnostic], request: str,
+                    attempt: int, *, again: bool = False
+                    ) -> tuple[Any, bool]:
+        """(verdict or None, asked now?) for a test that fails against the
+        module it tests. One question per (test, failure signature), at
+        most `adjudicate_max` per test; a repeat of a settled signature
+        returns the earlier verdict with ``asked=False``, so the caller
+        falls back to the old rule rather than looping on a test the judge
+        already overruled once."""
+        if not self.config.adjudicate or not module:
+            return None, False
+        key = (test.path, _diag_identity(diags))
+        if key in self._judged:
+            earlier = self._judged[key]
+            # NEW EVIDENCE: a module repair returned its file unchanged —
+            # "I am certain the test is wrong" — after an `unclear`. Worth
+            # one more question; a settled verdict is not asked again.
+            if not (again and earlier.verdict == "unclear"):
+                return earlier, False
+        asked_before = sum(1 for k in self._judged if k[0] == test.path)
+        if asked_before >= max(1, int(self.config.adjudicate_max or 1)):
+            return None, False
+        module_code = self._read(module)
+        test_code = self._read(test.path)
+        if not module_code.strip() or not test_code.strip():
+            return None, False
+        self._check_cancel(f"the judge on {test.path}")
+        self._emit("phase", f"{test.path}: asking which side the request "
+                            f"supports",
+                   {"phase": "adjudicate", "task": test.path,
+                    "module": module, "attempt": attempt})
+        slice_for_test = self._request_for(test, request, repair=True)
+        count = len(self._vector_count(module))
+        note = adjudicate.vectors_note(module, self.vectors_ok.get(module),
+                                       count)
+        body = adjudicate.task_text(
+            module_path=module, module_code=module_code,
+            test_path=test.path, test_code=test_code,
+            failure=adjudicate.failure_text(diags),
+            request=slice_for_test, vectors=note)
+        prompt = self.prompts.build(
+            PERSONAS["judge"], body,
+            architecture=(self.codemap.prefix_block(module)
+                          if self.codemap is not None else ""),
+            epoch=(self.codemap.store.epoch if self.codemap else 0),
+            contract=adjudicate.CONTRACT)
+        verdict = adjudicate.ask(self.host.llm, prompt.messages(), request,
+                                 cancel=self.cancel)
+        self._judged[key] = verdict
+        self._log_line("")
+        self._log_line(f"  judge {test.path} vs {module}: "
+                       f"{verdict.describe()}")
+        if verdict.raw:
+            log = getattr(self, "log", None)
+            if log is not None:
+                try:
+                    log.block("the judge's reply", verdict.raw, limit=1500)
+                except Exception:                        # noqa: BLE001
+                    pass
+        if self.journal is not None:
+            try:
+                self.journal.log("adjudicate", task=test.path, module=module,
+                                 attempt=attempt, verdict=verdict.verdict,
+                                 claimed=verdict.claimed,
+                                 checked=verdict.checked,
+                                 quote=verdict.quote[:400], why=verdict.why[:400],
+                                 vectors=self.vectors_ok.get(module))
+            except Exception:                            # noqa: BLE001
+                pass
+        self._emit("status", f"{test.path}: the judge says "
+                             f"{verdict.describe()}",
+                   {"task": test.path, "module": module,
+                    "verdict": verdict.verdict, "checked": verdict.checked,
+                    "quote": verdict.quote[:400]})
+        return verdict, True
+
+    def _vector_count(self, module: str) -> list[str]:
+        """The names of the spec vectors a module has, for the judge's note."""
+        path = self.spec_tests.get(module, "")
+        if not path:
+            return []
+        text = self._read(path)
+        return re.findall(r"^\s+def (test_\d+_\w+)\(", text, re.M)
+
+    def _next_rung_changes(self, attempt: int, persona: Persona,
+                           caps: ModelCapabilities | None) -> str:
+        """Why attempt ``attempt + 1`` is a different try, or "" when it
+        would be the same sampling again (so stagnation should stop)."""
+        if not self.config.escalate:
+            return ""
+        nxt = self.sampling_for(attempt + 1, persona, caps)
+        now = self.sampling_for(attempt, persona, caps)
+        if nxt.fresh or nxt.seed != now.seed or \
+                nxt.temperature != now.temperature:
+            return nxt.reason
+        return ""
+
+    # ------------------------------------------------------------------
+    # the request, as this file's prompts carry it (specslice.py)
+    # ------------------------------------------------------------------
+    def _request_for(self, task: Task, request: str, *, repair: bool) -> str:
+        """The request sliced to ``task``: whole when it fits the budget,
+        else its own section, the hard requirements and the manifest lines
+        naming it — said in BUILD_LOG.txt the first time it is a cut."""
+        if not request:
+            return ""
+        key = (task.path, "repair" if repair else "first")
+        cached = self._slices.get(key)
+        if cached is not None:
+            return cached
+        related = [p for p in (self._covers, task.test_path, self._caller)
+                   if p and p != task.path]
+        try:
+            from .interfaces import declared_names
+            names = declared_names(self._contract) if self._contract else []
+        except Exception:                                # noqa: BLE001
+            names = []
+        budget = (self.config.request_chars_repair if repair
+                  else self.config.request_chars_first)
+        cut = specslice.slice_for(request, task.path, budget=budget,
+                                  related=related, names=names)
+        self._slices[key] = cut.text
+        if not cut.whole:
+            log = getattr(self, "log", None)
+            if log is not None:
+                try:
+                    log.line(f"  request for {task.path} "
+                             f"({'repairs' if repair else 'the first attempt'})"
+                             f": {cut.describe()}")
+                except Exception:                        # noqa: BLE001
+                    pass
+            if self.journal is not None:
+                try:
+                    self.journal.log("constraints", task=task.path,
+                                     slice="repair" if repair else "first",
+                                     chars=cut.chars, kept=list(cut.kept),
+                                     condensed=list(cut.condensed),
+                                     left_out=list(cut.left_out))
+                except Exception:                        # noqa: BLE001
+                    pass
+        return cut.text
 
     # ------------------------------------------------------------------
     def run_task(self, task: Task, *, request: str = "", covers: str = "",
@@ -272,6 +540,7 @@ class Loop:
         self._contract = contract.strip()
         baseline_id = (_code_identity(baseline, lang)[0]
                        if baseline is not None and baseline.strip() else "")
+        caps = self._capabilities()
         attempts: list[AttemptRecord] = []
         seen: set[tuple[str, str]] = set()
         history: list[_Signature] = []
@@ -393,6 +662,27 @@ class Loop:
                         self._caller or (accept.path if accept else "")
                         or task.test_path,
                         by_caller=bool(self._caller or accept))
+                    # "I am certain the test is wrong" — the one thing an
+                    # unchanged file can mean. Ask the judge; if it agrees
+                    # with a quote from the request, the session repairs
+                    # the TEST next instead of giving up here.
+                    if seed and task.test_path and not self._caller \
+                            and accept is None:
+                        verdict, _asked = self._adjudicate(
+                            Task(id=task.id, path=task.test_path,
+                                 purpose="", persona="tester",
+                                 lang=lang), task.path, tuple(seed),
+                            request, n, again=True)
+                        if verdict is not None and verdict.test_is_wrong:
+                            self.test_wrong[task.test_path] = (
+                                task.path, verdict, tuple(seed))
+                            stopped = (f"the model returned the file "
+                                       f"unchanged, and the judge agrees "
+                                       f"the test is wrong — "
+                                       f"{verdict.describe()}. "
+                                       f"{task.test_path} is repaired next")
+                        elif verdict is not None:
+                            stopped += f". The judge: {verdict.describe()}"
                     self._emit("warning", f"{task.path}: {stopped}",
                                {"task": task.path, "unchanged": True})
                     break
@@ -512,13 +802,36 @@ class Loop:
                     break
 
                 # -- a test that disagrees with the code is not bent (C4) --
+                # … unless the JUDGE, quoting the request, says the test is
+                # the one that is wrong (adjudicate.py, docs/HYBRID.md).
                 if is_test and _test_disagrees_with_code(task.path, diags):
-                    stopped = _disagreement_sentence(task.path, covers,
-                                                     diags)
-                    self.blamed[task.path] = (covers, diags)
-                    self._emit("warning", f"{task.path}: {stopped}",
-                               {"task": task.path, "covers": covers})
-                    break
+                    verdict, asked = self._adjudicate(task, covers, diags,
+                                                      request, n)
+                    if verdict is not None and verdict.test_is_wrong and asked:
+                        judged = adjudicate.diagnostic_for_test(
+                            verdict, task.path, diags)
+                        diags = (judged,) + diags
+                        attempts[-1] = dataclasses.replace(
+                            attempts[-1], diagnostics=diags,
+                            note=f"{attempts[-1].note} — the judge: the test "
+                                 f"is wrong")
+                        self._emit("status",
+                                   f"{task.path}: the judge ruled the TEST "
+                                   f"wrong, quoting the request — the test "
+                                   f"is repaired next, not {covers}",
+                                   {"task": task.path, "covers": covers,
+                                    "verdict": "test"})
+                        # the ladder below treats this as an ordinary failed
+                        # attempt: the next one repairs the test
+                    else:
+                        stopped = _disagreement_sentence(task.path, covers,
+                                                         diags)
+                        if verdict is not None:
+                            stopped += f". The judge: {verdict.describe()}"
+                        self.blamed[task.path] = (covers, diags)
+                        self._emit("warning", f"{task.path}: {stopped}",
+                                   {"task": task.path, "covers": covers})
+                        break
 
                 # -- the error is in ANOTHER file of this project ----------
                 # Oct 1, 2026: `main.py` ran and died at `render.py:61`
@@ -547,7 +860,25 @@ class Loop:
                 history.append(sig)
                 error_counts.append(sum(1 for d in diags if d.is_error))
                 if stopped:
-                    break
+                    # THE LADDER, NOT THE EXIT. Stagnation means the same
+                    # input gave the same output; while a rung is left,
+                    # the next attempt is a different input — a fresh
+                    # start, a higher temperature, a new seed — and the
+                    # reason is said. Only when nothing would change does
+                    # the stagnation sentence end the file.
+                    change = (self._next_rung_changes(n, persona, caps)
+                              if n < max(1, self.config.attempts) else "")
+                    if change:
+                        self._emit("status",
+                                   f"{task.path}: {stopped} — attempt "
+                                   f"{n + 1} is {change}",
+                                   {"task": task.path, "attempt": n + 1,
+                                    "escalate": True})
+                        self._log_line(f"  escalation: {stopped} — attempt "
+                                       f"{n + 1} is {change}")
+                        stopped = ""
+                    else:
+                        break
 
                 if (self.config.wall_clock_s
                         and time.monotonic() - started
@@ -813,6 +1144,13 @@ class Loop:
         if repair is None:
             repair = attempt > 1
         caps = self.host.llm.capabilities()
+        # THE LADDER: what this attempt samples at, and whether it is a
+        # fresh start. Recorded per task so the journal and the build log
+        # print what was used (the 2026-10-16 Devstral log printed the
+        # config's 0.15 on every attempt while the host varied it unseen).
+        sampling = self.sampling_for(attempt, persona, caps)
+        self._sampling[task.path] = sampling
+        fresh = bool(repair and sampling.fresh)
         arch = ""
         tail_extra: list[str] = []
         #: The same tail blocks as (label, text), so they can be put back
@@ -842,6 +1180,12 @@ class Loop:
         pinned = self._contract
         if current and _is_our_stub(current):
             current = ""
+        # THE REQUEST, SLICED TO THIS FILE (specslice.py). The whole thing
+        # when it fits; otherwise the file's own section, the hard
+        # requirements and the lines naming it — never the first N
+        # characters, which is how every formula of the Star Trek spec
+        # fell out of every prompt that was not a first attempt.
+        request = self._request_for(task, request, repair=repair)
         if not repair and current.strip():
             # THE FILE ALREADY EXISTS AND IS REAL. The first attempt used to
             # say "Write the complete contents of `x`" and never show `x`,
@@ -886,14 +1230,24 @@ class Loop:
             # immediately before the output contract, where recency helps
             # most (D7). Repeating them in the task body would spend
             # context restating the same errors twice.
-            body = personas.repair_task(task.path, task.purpose,
-                                        autofixes=autofixes,
-                                        request=request)
-            persona = PERSONAS["repairer"]
-            existing = self._read(task.path)
+            body = (personas.fresh_start_task(task.path, task.purpose,
+                                              request=request, lang=lang)
+                    if fresh else
+                    personas.repair_task(task.path, task.purpose,
+                                         autofixes=autofixes,
+                                         request=request))
+            persona = PERSONAS["engineer" if fresh else "repairer"]
+            existing = "" if fresh else self._read(task.path)
             if existing:
                 tail_extra.append(f"[THE FILE AS IT STANDS]\n{existing}")
                 tail_pieces.append(("THE FILE AS IT STANDS", existing))
+            if fresh:
+                self._emit("status",
+                           f"{task.path}: attempt {attempt} starts fresh — "
+                           f"the broken file is not shown; the interface, "
+                           f"the test and the errors are",
+                           {"task": task.path, "attempt": attempt,
+                            "fresh": True})
             if pinned:
                 # Still the contract: a repair that fixes one error by
                 # renaming a pinned type has moved the error, not fixed it.
@@ -1047,7 +1401,8 @@ class Loop:
             self.codemap.reset_lookups()
 
         completion = self._complete(messages, tools=tools,
-                                    temperature=persona.temperature)
+                                    temperature=sampling.temperature,
+                                    seed=sampling.seed)
 
         # -- tool round-trips are ordinary complete() cycles (§6.9) -----
         rounds = 0
@@ -1063,7 +1418,8 @@ class Loop:
                 messages.append(Message(role="tool", content=answer,
                                         tool_call_id=call.id))
             completion = self._complete(messages, tools=tools,
-                                        temperature=persona.temperature)
+                                        temperature=sampling.temperature,
+                                        seed=sampling.seed)
 
         text = strip_think(completion.text)       # D13, M37 — before ANY use
 
@@ -1076,7 +1432,8 @@ class Loop:
                     Message(role="assistant", content=text),
                     Message(role="user", content=answer)]
                 completion = self._complete(messages,
-                                            temperature=persona.temperature)
+                                            temperature=sampling.temperature,
+                                            seed=sampling.seed)
                 text = strip_think(completion.text)
 
         # -- truncation: CONTINUE, do not regenerate (D1, M32) ----------
@@ -1183,12 +1540,30 @@ class Loop:
             hole = cv.repair_hole(code, lang, task.path, located,
                                   same_file=_same_file, count_tokens=count)
             err = cv.located_error(located, task.path, _same_file)
-            # DOUBT only for a failure that names no line here. A located
-            # error whose hole did not fit is a whole-file repair — not a
-            # rewrite of some other function the model happened to doubt.
-            doubted = ""
+            # A FAILURE THAT NAMES NO LINE HERE — an assertion raised in
+            # the test — is located through THE TEST: the functions of
+            # this file the failing test calls, the asserting line's own
+            # first. Only then DOUBT, the body the model was least sure
+            # of. A located error whose hole did not fit is a whole-file
+            # repair — not a rewrite of some other function.
+            doubted = named = ""
+            if hole is None and err is None and lang == "python":
+                tried = self._doubt_tried.setdefault(task.path, set())
+                test_source = self._read(task.test_path) \
+                    if task.test_path else ""
+                for candidate in cv.test_named_functions(code, located,
+                                                         test_source):
+                    if candidate in tried:
+                        continue
+                    tried.add(candidate)
+                    named = candidate
+                    hole = cv.function_hole(code, task.path, candidate,
+                                            why="test")
+                    if hole is not None and not cv._fits(hole, count):
+                        hole = None
+                    break
             if (hole is None and err is None and lang == "python"
-                    and self.doubt.get(task.path)):
+                    and not named and self.doubt.get(task.path)):
                 tried = self._doubt_tried.setdefault(task.path, set())
                 name = cv.least_sure(self.doubt[task.path], code, tried)
                 if name:
@@ -1202,6 +1577,11 @@ class Loop:
                     why = (f"the error at line {err.line} could not be cut "
                            f"out as a hole that fits one canvas and the "
                            f"model's context")
+                elif named:
+                    why = (f"the failure names no line of this file; the "
+                           f"failing test calls `{named}`, which could not "
+                           f"be cut out as a hole that fits one canvas — "
+                           f"the next attempt tries the next name")
                 elif doubted:
                     why = (f"the failure names no line of this file, and "
                            f"the body the model was least sure of "
@@ -1257,11 +1637,18 @@ class Loop:
         def for_style(style: str) -> list[Message]:
             return messages(task_text, blocks, cv.contract(hole, style),
                             who=PERSONAS["repairer"])
+        # THE LADDER FOR A CANVAS MODEL: from the third attempt, a derived
+        # seed and no warm start — every candidate from noise. The old
+        # lines are what the model copied back twice already.
+        used = self._sampling.get(task.path)
+        fresh = bool(used is not None and used.rung > 0)
         plan = cv.requests_for(hole, for_style,
                                max(1, int(self.config.canvas_candidates or 1)),
-                               seed=self.config.seed, attempt=attempt,
+                               seed=(used.seed if fresh and used is not None
+                                     else self.config.seed),
+                               attempt=attempt,
                                count_tokens=self.host.llm.count_tokens,
-                               lang=lang)
+                               lang=lang, fresh=fresh)
         if not plan or not fits(plan[0][2].messages, 1):
             self._canvas_skip(
                 task, attempt,
@@ -1270,6 +1657,8 @@ class Loop:
                      f"canvas in the model's context")
             return None
         why = ("its error is there" if hole.why == "located" else
+               "the failure names no line of this file, and the failing "
+               "test calls this function" if hole.why == "test" else
                "the failure names no line of this file, and the model was "
                "least sure of this body when it wrote it")
         self._emit("status",
@@ -1336,7 +1725,8 @@ class Loop:
             return None
         notes = ""
         if self.config.canvas_notes:
-            notes = self._canvas_notes(task, names, messages, attempt)
+            notes = self._canvas_notes(task, names, messages, attempt,
+                                       request=request)
         notes_block = ([f"[IMPLEMENTATION NOTES — planned before any body "
                         f"was written]\n{notes}"] if notes else [])
         self._emit("status",
@@ -1433,9 +1823,12 @@ class Loop:
                                               text=final), False, sent
 
     def _canvas_notes(self, task: Task, names: Sequence[str],
-                      messages: Any, attempt: int = 0) -> str:
-        """One ordinary call: plain notes on how each body works."""
-        msgs = messages(cv.notes_text(task.path, names), [],
+                      messages: Any, attempt: int = 0,
+                      request: str = "") -> str:
+        """One ordinary call: plain notes on how each body works — with the
+        file's slice of the request in view, so a formula the request
+        states reaches the notes word for word."""
+        msgs = messages(cv.notes_text(task.path, names, request), [],
                         cv.NOTES_CONTRACT, who=personas.ENGINEER, diags="")
         try:
             completion = self._complete(msgs,
@@ -1516,6 +1909,10 @@ class Loop:
         elif hole.why == "doubt":
             why = ("the failure names no line of this file, and the model "
                    "was least sure of this body when it wrote it")
+        elif hole.why == "test":
+            why = ("the failure names no line of this file, and the failing "
+                   "test calls this function (the asserting line's own "
+                   "call first)")
         else:
             why = f"its error is at line {hole.line}"
         details = [f"why this hole: {why}",
@@ -1684,10 +2081,12 @@ class Loop:
         return messages
 
     def _complete(self, messages: Sequence[Message], *, tools=(),
-                  temperature: float = 0.15) -> Completion:
+                  temperature: float = 0.15,
+                  seed: int | None | object = _UNSET) -> Completion:
         return self.host.llm.complete(
             messages, tools=tools, temperature=temperature,
-            max_tokens=self.config.max_tokens, seed=self.config.seed,
+            max_tokens=self.config.max_tokens,
+            seed=self.config.seed if seed is _UNSET else seed,
             cancel=self.cancel)
 
     # ------------------------------------------------------------------
@@ -1870,13 +2269,24 @@ class Loop:
         test_source = ""
         if task.test_path:
             test_source = self._read(task.test_path)
-        return runner.verify(
+        spec_test = self.spec_tests.get(task.path, "")
+        result = runner.verify(
             self._read(task.path) or "", lang, fs=self.host.fs,
             ex=self.host.exec, stem=_stem(task.path), path=task.path,
             project_mode=self.config.project_mode, test_source=test_source,
             timeouts=self.config.timeouts, test_path=task.test_path,
             known_failing=self.config.known_failing,
+            spec_test_path=spec_test,
             skip_guard=True)      # already screened above; don't pay twice
+        if spec_test:
+            # True: the vectors ran and passed; False: one failed; None:
+            # they never ran (the build failed before them)
+            name = spec_test.replace("\\", "/").rsplit("/", 1)[-1]
+            ran = any(p.name == "test" and any(name in str(a) for a in p.argv)
+                      for p in result.phases)
+            failed = any(d.tool == "spec-vector" for d in result.diagnostics)
+            self.vectors_ok[task.path] = (not failed) if ran else None
+        return result
 
     def _write(self, tx: Any, task: Task, code: str) -> bool:
         if tx is None:
@@ -1902,6 +2312,22 @@ class Loop:
             return self.host.fs.read(path)
         except Exception:                                # noqa: BLE001
             return ""
+
+    def _capabilities(self) -> ModelCapabilities | None:
+        try:
+            return self.host.llm.capabilities()
+        except Exception:                                # noqa: BLE001
+            return None
+
+    def _log_line(self, text: str) -> None:
+        """One line in BUILD_LOG.txt. Never fails a build."""
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        try:
+            log.line(text)
+        except Exception:                                # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     def _check_cancel(self, where: str) -> None:
@@ -1944,13 +2370,18 @@ class Loop:
         #: every version, but reading a build means following the attempts
         #: in order, and that is a different job from restoring one.
         canvas = self._via_canvas.get(task.path) == n
+        used = self._sampling.get(task.path)
+        temperature = (used.temperature if used is not None
+                       else self.config.temperature)
+        seed = used.seed if used is not None else self.config.seed
         log = getattr(self, "log", None)
         if log is not None:
             try:
                 log.generation(
                     task.path, n,
-                    temperature=self.config.temperature,
-                    seed=self.config.seed,
+                    temperature=temperature,
+                    seed=seed,
+                    knobs=(used.describe() if used is not None else ""),
                     tokens_in=completion.tokens_in,
                     tokens_out=completion.tokens_out,
                     prompt_ms=completion.prompt_ms,
@@ -1964,8 +2395,10 @@ class Loop:
             task=task.path, attempt=n,
             provider=getattr(self.host.llm, "name", "host"),
             completion=completion, prompt=list(sent) or task.purpose,
-            temperature=self.config.temperature, seed=self.config.seed,
+            temperature=temperature, seed=seed,
             verify=verify, remote=remote,
+            **({"rung": used.rung, "fresh": used.fresh,
+                "escalation": used.reason} if used is not None else {}),
             **({"via": "canvas"} if canvas else {}))
 
     def _emit(self, kind: str, message: str, data: dict | None = None) -> None:
@@ -2399,7 +2832,7 @@ def _pinned_piece(path: str, pinned: str) -> tuple[str, str]:
 def _unchanged_sentence(path: str, blamer: str, *, by_caller: bool) -> str:
     """Why a repair that returned the file unchanged is NOT a repair."""
     whose = (f"{blamer}'s failure" if blamer else "the failure it was "
-             f"repaired against")
+             "repaired against")
     who = "caller" if by_caller else "test"
     return (f"the model returned the same code — {path} is unchanged "
             f"(identical after normalising), so {whose} cannot have gone "

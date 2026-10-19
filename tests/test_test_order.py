@@ -41,6 +41,10 @@ TEST_FIRST_SENTENCE = ("The engine must implement tests before writing the "
                        "module bodies, adhering to the following rules:")
 
 
+# The judge (adjudicate.py, 2026-10-16) is OFF here: these tests script
+# the replies of the flow where a disagreeing test blames its module
+# outright, and a judge's question would consume a scripted reply.
+
 def _host(tmp_path, replies):
     return Host(llm=ScriptedLLM(replies, supports_tools=False,
                                 name="Qwen3-Coder-30B-A3B-Instruct",
@@ -89,7 +93,7 @@ PLAN = ("src/alpha.py — the first part\n"
 
 def test_each_test_is_planned_right_after_its_module(tmp_path):
     host = _host(tmp_path, [PLAN])
-    session = Session(host, config=SessionConfig(pin_interfaces=False))
+    session = Session(host, config=SessionConfig(adjudicate=False, pin_interfaces=False))
     session.start("two parts and a main, with tests")
     order = [t.path for t in session.plan.tasks]
     assert order == ["src/alpha.py", "tests/test_alpha.py", "src/beta.py",
@@ -120,7 +124,7 @@ def test_a_modules_test_runs_before_the_next_module_is_built(tmp_path):
     main = _fence("from src.beta import quadruple\n\nprint(quadruple(1))\n")
     host = _host(tmp_path, [PLAN, alpha_wrong, test_alpha, alpha_fixed, beta,
                             test_beta, main])
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=2, pin_interfaces=False, review_after_build=False))
     session.run("two parts and a main, with tests")
     final = {o.path: o for o in session._final_outcomes()}
@@ -168,7 +172,7 @@ def test_tests_first_when_the_request_says_so(tmp_path):
     request = f"Arithmetic helpers. {TEST_FIRST_SENTENCE} tests/test_calc.py"
     host = _host(tmp_path, [CALC_PLAN, CALC_SKELETON, TEST_CALC_WRONG_NAME,
                             TEST_CALC, CALC])
-    session = Session(host, config=SessionConfig(attempts=3,
+    session = Session(host, config=SessionConfig(adjudicate=False, attempts=3,
                                                  review_after_build=False))
     session.run(request)
 
@@ -212,7 +216,7 @@ def test_tests_first_when_the_request_says_so(tmp_path):
 def test_tests_first_needs_a_pinned_interface(tmp_path):
     request = f"Arithmetic helpers. {TEST_FIRST_SENTENCE}"
     host = _host(tmp_path, [CALC_PLAN, CALC, TEST_CALC])
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=1, pin_interfaces=False, review_after_build=False))
     session.run(request)
     order = [t.path for t in session.plan.tasks]
@@ -226,7 +230,7 @@ def test_tests_first_needs_a_pinned_interface(tmp_path):
 def test_test_first_can_be_turned_off(tmp_path):
     request = f"Arithmetic helpers. {TEST_FIRST_SENTENCE}"
     host = _host(tmp_path, [CALC_PLAN, CALC_SKELETON, CALC, TEST_CALC])
-    session = Session(host, config=SessionConfig(
+    session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=1, test_first=False, review_after_build=False))
     session.start(request)
     assert [t.path for t in session.plan.tasks] == \

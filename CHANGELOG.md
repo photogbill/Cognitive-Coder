@@ -10,6 +10,92 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — hybrid mode, the judge, spec vectors, the ladder; what two real builds taught (2026-10-16)
+
+The first two builds of a real specification (the Star Trek spec: 15,070
+characters, seven source files, three test files) — one on DiffusionGemma,
+one on Devstral-24B — both failed, and the journals put most of the damage
+on the harness. `docs/HYBRID.md` is the account; this is the change list.
+
+**Hybrid mode** (`hybrid.py`, `Session._hybrid_phases`, `ports.ModelRoster`,
+`types.ModelSlot`; `SessionConfig.hybrid` = auto / off / ar-first /
+diffusion-first, `hybrid_writer`, `hybrid_repairer`). With a host that
+offers a roster of models, a chat model writes every file, ONE swap and the
+canvas model rewrites only the hole each remaining failure is in, one swap
+back and the chat model repairs what holes could not fix with fresh-start
+prompts. Three phases, two swaps per build — never one per attempt. Roles
+by capability, never by name; each phase in dependency order; a phase with
+nothing left is skipped; a swap the host refuses is said and the build goes
+on. M10 amended: the core asks the host to load a model at a phase boundary
+and still loads nothing itself. BUILD_LOG.txt gets a header per phase, each
+swap with its duration, and a summary of what each phase fixed.
+
+**The judge** (`adjudicate.py`, `SessionConfig.adjudicate`, on). When a
+model's test disagrees with the module it tests, one short question is
+asked — which does the REQUEST support — and the answer's quote is checked
+against the request. `code` → the module is repaired, as before; `test`
+(with a real quote) → the TEST is repaired, with the quote as its
+diagnostic; `unclear` → the old conservative rule, said to be unclear. A
+module repair that returns its file unchanged ("I am certain the test is
+wrong") now asks the same question instead of giving up. Ten of the Star
+Trek build's sixteen failing tests were the test's fault.
+
+**Spec vectors** (`specvectors.py`, `SessionConfig.spec_vectors`, on). The
+examples a request states outright — `` `"1-3"` -> `(1, 2, 3)` `` beside a
+named function, `` `SUBTICKS_PER_TURN: int = 10` `` — lifted by rule into a
+test file per module that the harness owns
+(`tests/test_spec_vectors_<stem>.py`), run by the runner BEFORE the
+module's own tests; a failing vector is the module's failure, with the
+request's sentence as the message. Seven for the Star Trek spec: the seven
+that cannot be wrong.
+
+**The escalation ladder** (`loop.Sampling`, `LoopConfig.escalate`,
+`temperatures`). Attempt 1 at the persona's temperature; 2 a repair with
+the enriched diagnostics; 3 a FRESH START (the broken file is not shown;
+`personas.fresh_start_task`) at 0.45 with a seed; 4+ whole-file repairs at
+0.70 with new seeds. Stagnation moves to the next rung instead of stopping
+the file while a rung is left. The `generate` line and the journal record
+the temperature and seed USED; a canvas model is told a seed and the line
+says a temperature does not reach it. ATK's host no longer varies sampling
+on its own when the engine has this.
+
+**The request, sliced per file** (`specslice.py`; `SessionConfig.
+request_chars_first` 16,000 / `request_chars_repair` 8,000). Every
+diffusion prompt and every whole-file repair repeated the request's first
+2,000 characters — past which every formula of the Star Trek spec sat.
+Now: the file's own section, the hard requirements, the manifest lines
+naming it, the opening; what is left out is named in the prompt and in the
+log. The notes call sees it too (it saw no request at all).
+
+**Honest logs.** A crash reaches BUILD_LOG.txt as `STOPPED UNEXPECTEDLY`
+with the traceback, and `session_end` is never `ok` after one (it said
+`ok: true` from the two files built before the crash). Every build log now
+closes with a SUMMARY (only Debug & Repair's did). A **speed probe** after
+the model check and after every swap writes the model's tok/s and prefill
+to the log and warns under 8 tok/s that the model is spilling into system
+RAM (Devstral ran the whole build at 3–5 tok/s unnoticed;
+`SessionConfig.speed_probe`, never for the scripted test doubles).
+
+**Smaller, each from one failure.** `constraints.py` strips emphasis only
+at word boundaries (`test_physics.py` was pinned as `testphysics.py`). The
+skeleton is IMPORTED, not only parsed (`Planner._import_skeleton`); a
+dataclass with defaulted fields before required ones is made valid with
+`field(default=…, kw_only=True)`, order and names kept
+(`interfaces.fix_dataclass_order`); hard-requirement sentences naming a
+pinned module or a name it declares go into its docstring word for word
+(`interfaces.with_conventions`); the architect is asked to put the
+request's conventions in docstrings. `[run]` executes `python -m
+src.physics` from the project root for a module inside a package
+(`langs.module_run_cmd`, `langs.module_name`). Canvas: marker echoes
+dropped, a definition repeated inside a fill is a run-on cut, a fill that
+makes the file define a name twice is rejected, a `length` reply is
+salvaged where the run-on cut finds the exit from the region, holes are
+located through the names the failing test calls before the doubt-guided
+fallback (`canvas.test_named_functions`), `open` before `tail`.
+
+Public: `ModelSlot`, `ModelRoster`. Journal events: `adjudicate`, `phase`,
+`swap`. New persona: `judge`.
+
 ### Added — Debug & Repair, the mutation check, the pinned requirements (2026-10-10, night)
 
 **Debug & Repair** (`debugrepair.py`, `Session.debug`). Bill: *"if I can

@@ -47,6 +47,7 @@ from .types import (
     Completion,
     Message,
     ModelCapabilities,
+    ModelSlot,
     ProcResult,
     ToolSpec,
 )
@@ -222,6 +223,44 @@ class CanvasLLM(Protocol):
            the free region. ``text`` is the free region only.
         3. Generation-wise the request is a non-thinking reply: the free
            region starts at the very first position of the reply.
+        """
+        ...
+
+
+@runtime_checkable
+class ModelRoster(Protocol):
+    """OPTIONAL, beside `LLMPort`: a host that can load more than one model.
+
+    Hybrid mode (docs/HYBRID.md, `hybrid.py`) asks the host which models
+    it COULD load and asks it to load one at a phase boundary — twice in a
+    build, never per file. The core still contains no loading code: it
+    asks, the host decides, and a host that answers with a sentence gets
+    the build carried on with whatever is loaded, said in the log. A host
+    without this port never sees a call, exactly like `CanvasLLM`.
+    """
+
+    def roster(self) -> Sequence[ModelSlot]:
+        """What could be loaded, the loaded one marked.
+
+        *A host must guarantee*: names are stable for the session and
+        unique; ``kind`` is "canvas" only for a model that will answer
+        `canvas_fill` once loaded, "chat" for one that will not, "" when
+        it cannot tell before loading. Never raises; an empty roster is a
+        normal answer.
+        """
+        ...
+
+    def load_model(self, name: str, *,
+                   cancel: CancelToken | None = None) -> str:
+        """Load the named model, unloading the current one. "" on success,
+        else one operator-facing sentence saying why not.
+
+        *A host must guarantee*: this never raises; after "" is returned
+        `capabilities()` describes the new model (the core re-reads it and
+        treats the change as an epoch, as for any swap); after a sentence,
+        `capabilities()` still describes SOMETHING the core can use, or
+        reports nothing loaded, honestly. Honour `cancel` if a load can be
+        interrupted; otherwise finish it.
         """
         ...
 

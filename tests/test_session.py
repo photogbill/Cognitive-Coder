@@ -239,16 +239,33 @@ def test_a_model_change_is_treated_as_an_epoch_boundary(tmp_path):
 
 
 def test_the_core_contains_no_model_swap_logic():
-    """M10 — the core asks what is loaded; it never changes it."""
+    """M10, amended 2026-10-16 (docs/HYBRID.md) — the core asks what is
+    loaded and never loads anything ITSELF. Hybrid mode asks the HOST to
+    load a model at a phase boundary through `ports.ModelRoster`: the
+    Protocol declares `load_model` (a stub, no body), and the one call
+    site is `Session._swap_to`. Nothing in the core implements loading,
+    unloading or swapping."""
     core = Path(__file__).resolve().parent.parent / "cognitive_coder"
     banned = ("load_model", "unload_model", "switch_model", "swap_model")
     offenders = []
     for path in core.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         for name in banned:
-            if f"def {name}" in text or f".{name}(" in text:
-                offenders.append(f"{path.name}: {name}")
+            if f"def {name}" in text and path.name != "ports.py":
+                offenders.append(f"{path.name}: defines {name}")
+            if f".{name}(" in text and path.name != "session.py":
+                offenders.append(f"{path.name}: calls {name}")
     assert not offenders, offenders
+    import ast
+    tree = ast.parse((core / "ports.py").read_text(encoding="utf-8"))
+    stubs = [node for node in ast.walk(tree)
+             if isinstance(node, ast.FunctionDef) and node.name == "load_model"]
+    assert stubs, "ports.py declares load_model on the ModelRoster port"
+    for node in stubs:
+        real = [st for st in node.body
+                if not (isinstance(st, ast.Expr)
+                        and isinstance(st.value, ast.Constant))]
+        assert not real, "the port's load_model is a stub (docstring, ...)"
 
 
 # --------------------------------------------------------------------------

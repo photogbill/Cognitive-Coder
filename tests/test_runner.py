@@ -680,3 +680,40 @@ def test_every_available_language_scaffold_builds_and_runs(lang_id, tmp_path):
     result = runner.build_and_run(code, lang_id, fs=fs, ex=ex, stem=stem)
     assert result.ok, f"{lang.label}: {result.summary()}\n{result.output}"
     assert "hello from" in result.phases[-1].proc.stdout.lower()
+
+
+# --------------------------------------------------------------------------
+# a module inside a package runs AS a module (2026-10-16)
+# --------------------------------------------------------------------------
+
+def test_a_module_inside_a_package_is_run_as_a_module(workspace):
+    """`python src/physics.py` cannot import `.models`; `python -m
+    src.physics` can. On the Star Trek build the relative import's
+    "no known parent package" cost two of four attempts, for a file that
+    was right."""
+    fs, ex = workspace
+    fs.write("src/__init__.py", "")
+    fs.write("src/models.py", "VALUE = 3\n")
+    code = "from .models import VALUE\n\nDOUBLE = VALUE * 2\n"
+    result = runner.build_and_run(code, "python", fs=fs, ex=ex,
+                                  stem="physics", path="src/physics.py")
+    run = result.phase("run")
+    assert run is not None and run.ok, result.output
+    assert run.argv[-2:] == ("-m", "src.physics"), run.argv
+
+
+def test_a_root_level_script_still_runs_as_a_script(workspace):
+    fs, ex = workspace
+    result = runner.build_and_run("print('hi')\n", "python", fs=fs, ex=ex,
+                                  stem="main", path="main.py")
+    run = result.phase("run")
+    assert run is not None and run.ok
+    assert "-m" not in run.argv and run.argv[-1].endswith("main.py")
+
+
+def test_module_name_is_derived_by_rule():
+    assert langs.module_name("src/physics.py") == "src.physics"
+    assert langs.module_name("src\\game\\ai.py") == "src.game.ai"
+    assert langs.module_name("main.py") == ""
+    assert langs.module_name("src/my-mod.py") == ""      # not importable
+    assert langs.module_name("src/data.json") == ""

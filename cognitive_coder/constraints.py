@@ -39,6 +39,41 @@ _WEAK = re.compile(r"\b(must(\s+not)?|never|do\s+not|don['’]t|may\s+not|"
                    r"(is|are)\s+not\s+allowed|mustn['’]t)\b", re.I)
 _BULLET = re.compile(r"^\s*(?:[-*•+]|\d+[.)]|[a-z][.)])\s+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+#: Markdown emphasis — `*word*`, `**bold**`, `_word_`, `` `code` `` — whose
+#: delimiters sit at WORD BOUNDARIES. The first version matched any run of
+#: `*`, `_` or backtick, so an identifier's underscores were "emphasis":
+#: `tests/test_physics.py, tests/test_parser.py` was pinned in every prompt
+#: as `tests/testphysics.py, tests/testparser.py`, and `SUBTICKS_PER_TURN`
+#: as `SUBTICKSPERTURN` (2026-10-16, the Star Trek build). An underscore
+#: inside a word is part of the word; emphasis opens after a non-word
+#: character and closes before one.
+_EMPHASIS = re.compile(r"(?<![\w\\])([*_]{1,3})(?!\s)(.+?)(?<!\s)\1(?![\w])")
+_CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def _unemphasise(line: str) -> str:
+    """Markdown emphasis removed, identifiers left exactly as written.
+
+    Code spans first, and their contents are kept verbatim: `` `__init__` ``
+    is the name `__init__`, not bold "init". Emphasis is then removed from
+    the prose between them, where `_word_` can only be emphasis.
+    """
+    out: list[str] = []
+    last = 0
+    for m in _CODE_SPAN.finditer(line):
+        out.append(_strip_emphasis(line[last:m.start()]))
+        out.append(m.group(1))
+        last = m.end()
+    out.append(_strip_emphasis(line[last:]))
+    return "".join(out)
+
+
+def _strip_emphasis(text: str) -> str:
+    previous = None
+    while previous != text:
+        previous = text
+        text = _EMPHASIS.sub(r"\2", text)
+    return text
 
 
 @dataclass
@@ -66,7 +101,7 @@ def _sentences(text: str) -> list[str]:
         if fenced or not raw.strip():
             continue
         line = _BULLET.sub("", raw).strip().lstrip("#> ").strip()
-        line = re.sub(r"[*_`]{1,3}([^*_`]+)[*_`]{1,3}", r"\1", line)
+        line = _unemphasise(line)
         out.extend(s.strip() for s in _SENTENCE.split(line) if s.strip())
     return out
 

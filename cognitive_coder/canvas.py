@@ -86,8 +86,12 @@ UNSURE = 0.5
 #: half of them scrambled — the conservative fix; 1.0 is from noise — a
 #: rewrite. Which of these works best on real builds is not known yet; the
 #: journal's `canvas` events record which one was kept, so it will be.
+#: `open` first since 2026-10-16: on the Star Trek build the one kept
+#: `tail` canvas echoed the prompt's markers and re-opened the function,
+#: while its `open` sibling was right; a reply that ends where the model
+#: ends it has nothing to pad and nothing held to copy.
 REPAIR_SCHEDULE: tuple[tuple[str, float], ...] = (
-    ("tail", 0.5), ("open", 1.0), ("tail", 1.0), ("open", 1.0))
+    ("open", 1.0), ("tail", 0.5), ("open", 1.0), ("tail", 1.0))
 
 
 @dataclass(frozen=True)
@@ -294,6 +298,80 @@ def function_hole(code: str, path: str, name: str,
     return None
 
 
+_CALL_NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*\(")
+_IN_TEST = re.compile(r"\bin\s+(test\w*)\b")
+
+
+def test_named_functions(code: str, diagnostics: Sequence[Diagnostic],
+                         test_source: str = "") -> list[str]:
+    """The functions of THIS file that the failing test calls, most
+    specific first — where a failure that names no line of the file is.
+
+    `AssertionError: 'kl' != 'Kl'` is raised in the test, so `repair_hole`
+    finds no line of parser.py to cut, and the doubt-guided fallback
+    rewrote `_parse_single_command` twice while the fault (`cmd.lower()`)
+    sat one function up (2026-10-16). The test knows where it looked:
+
+      1. the calls on the ASSERTING LINE (the `>>` line of the diagnostic's
+         excerpt): `self.assertEqual(bearing_between(0, 0, 1, 1), 45.0)`
+         names `bearing_between`;
+      2. then every call in the failing test function's body, in order —
+         the function's name is in the traceback frame (`in test_x`), and
+         its body in the test file.
+
+    Only names this file defines (functions, or methods by bare name) are
+    returned, each once.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    defined: dict[str, str] = {}           # bare name → qualified
+    for qual, _node in _functions(tree):
+        bare = qual.rsplit(".", 1)[-1]
+        defined.setdefault(bare, qual)
+    if not defined:
+        return []
+    out: list[str] = []
+
+    def take(names: Sequence[str]) -> None:
+        for n in names:
+            if n in defined and defined[n] not in out:
+                out.append(defined[n])
+
+    test_fn = ""
+    for d in diagnostics:
+        if not d.is_error:
+            continue
+        m = _IN_TEST.search(d.code or "") or _IN_TEST.search(d.message or "")
+        if m and not test_fn:
+            test_fn = m.group(1)
+        for line in (d.source_excerpt or "").splitlines():
+            if line.startswith(">>"):
+                take(_CALL_NAME.findall(line.split("|", 1)[-1]))
+    if test_fn and test_source:
+        try:
+            ttree = ast.parse(test_source)
+        except SyntaxError:
+            ttree = None
+        if ttree is not None:
+            for qual, node in _functions(ttree):
+                if qual.rsplit(".", 1)[-1] != test_fn:
+                    continue
+                calls: list[str] = []
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        f = sub.func
+                        name = (f.id if isinstance(f, ast.Name)
+                                else f.attr if isinstance(f, ast.Attribute)
+                                else "")
+                        if name:
+                            calls.append(name)
+                take(calls)
+                break
+    return out
+
+
 def _is_stub_body(node: ast.AST) -> ast.stmt | None:
     """The `raise NotImplementedError` that is the whole body, or None."""
     body = list(getattr(node, "body", []) or [])
@@ -374,8 +452,18 @@ def marked_view(code: str, hole: Hole, comment: str = "#") -> str:
     return before + middle + after
 
 
+#: Backstops on the request text a hole prompt repeats. The loop passes the
+#: request already sliced to the file (`specslice`); these caps only catch
+#: a caller that did not. They were 2,000 characters, and on the 2026-10-16
+#: Star Trek build that cut landed in the spec's hard requirement 10 — every
+#: formula the bodies were judged against was past it.
+REQUEST_CHARS_REPAIR = 8000
+REQUEST_CHARS_STUB = 16000
+
+
 def repair_text(path: str, purpose: str, request: str = "",
-                autofixes: Sequence[str] = (), limit: int = 2000) -> str:
+                autofixes: Sequence[str] = (),
+                limit: int = REQUEST_CHARS_REPAIR) -> str:
     """The [TASK] for a hole repair. Constant for a file, so a prompt cache
     keeps everything before the parts that change."""
     lines = [f"The file `{path}` does not work yet. Its purpose: {purpose}"]
@@ -399,7 +487,7 @@ def repair_text(path: str, purpose: str, request: str = "",
 
 
 def stub_text(path: str, purpose: str, request: str = "",
-              limit: int = 2000) -> str:
+              limit: int = REQUEST_CHARS_STUB) -> str:
     """The [TASK] for writing a pinned file's bodies, one hole at a time.
     The same for every body in the file, for the same reason as above."""
     lines = [f"`{path}` is being written one function body at a time. Its "
@@ -418,14 +506,30 @@ def stub_text(path: str, purpose: str, request: str = "",
     return "\n".join(lines)
 
 
-def notes_text(path: str, names: Sequence[str]) -> str:
-    """The [TASK] for the planning call made before a file's bodies."""
+def notes_text(path: str, names: Sequence[str], request: str = "",
+               limit: int = REQUEST_CHARS_STUB) -> str:
+    """The [TASK] for the planning call made before a file's bodies.
+
+    ``request`` is the file's slice of the request. The notes used to be
+    planned without it — "plan the bodies" with no spec in view — so for
+    the Star Trek build they were planned from the function names alone,
+    and every body was then written to notes that had never seen a
+    formula.
+    """
     listed = ", ".join(f"`{n}`" for n in names)
-    return (f"Before the bodies of `{path}` are written, plan them. For each "
-            f"of {listed}: its name, then one to three plain sentences on "
-            f"how it works — the steps, the edge cases, which other names it "
-            f"calls. Plain notes for the person who will write the code; no "
-            f"code.")
+    lines = [f"Before the bodies of `{path}` are written, plan them. For each "
+             f"of {listed}: its name, then one to three plain sentences on "
+             f"how it works — the steps, the edge cases, which other names it "
+             f"calls. Where the request below states a formula, a constant, "
+             f"a convention or an exact example, repeat it in the note word "
+             f"for word: the bodies are written to these notes. Plain notes "
+             f"for the person who will write the code; no code."]
+    if request.strip():
+        text = request.strip()
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "… (the request continues)"
+        lines += ["", f"The request, as far as it concerns this file: {text}"]
+    return "\n".join(lines)
 
 
 NOTES_CONTRACT = ("OUTPUT CONTRACT\nPlain notes, one short paragraph per "
@@ -468,18 +572,23 @@ def contract(hole: Hole, style: str) -> str:
 def requests_for(hole: Hole, messages_for: Callable[[str], Sequence[Message]],
                  n: int, *, seed: int | None = None, attempt: int = 1,
                  count_tokens: Callable[[str], int] | None = None,
-                 lang: str = "python"
+                 lang: str = "python", fresh: bool = False
                  ) -> list[tuple[str, float, CanvasRequest]]:
     """The candidate canvases for one repair attempt: (style, noise, req).
 
     Outside Python every candidate holds the far side ("tail"): an open
     hole's run-on can only be recognised and cut safely where a parser can
-    check the cut, and the engine parses only Python before the build."""
+    check the cut, and the engine parses only Python before the build.
+
+    ``fresh`` is the loop's escalation ladder reaching a canvas model: no
+    warm start — every candidate from noise (1.0), since the old lines are
+    what came back unchanged already."""
     out = []
     region_tokens = (count_tokens(hole.original) if count_tokens
                      else int(len(hole.original) / 3.5))
     slack = 12 + region_tokens // 3
-    for i, (style, noise) in enumerate(REPAIR_SCHEDULE[:max(1, n)]):
+    schedule = [(s, 1.0 if fresh else nz) for s, nz in REPAIR_SCHEDULE]
+    for i, (style, noise) in enumerate(schedule[:max(1, n)]):
         if lang != "python" and hole.tail.strip():
             style = "tail"
         if style == "tail" and not hole.tail.strip():
@@ -502,10 +611,27 @@ def requests_for(hole: Hole, messages_for: Callable[[str], Sequence[Message]],
 # what comes back
 # --------------------------------------------------------------------------
 
+#: A comment line that copies one of the prompt's region markers.
+_MARKER_ECHO = re.compile(r"^\s*(?:#|//|--|;|/\*)\s*(?:>>>|<<<)")
+#: A `def` / `class` line, as the run-on cut compares them.
+_DEF_LINE = re.compile(r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b")
+
+
+def _def_signature(line: str) -> str:
+    m = _DEF_LINE.match(line)
+    return m.group(1) if m else ""
+
+
 def clean_fill(text: str, hole: Hole, style: str,
-               verify: Callable[[list[str]], bool] | None = None
-               ) -> str | None:
+               verify: Callable[[list[str]], bool] | None = None,
+               report: dict | None = None) -> str | None:
     """The filled region, cleaned for splicing — or None if there is none.
+
+    ``report``, when given, is filled with what was done: ``cut`` (a run-on
+    was cut) and ``at`` (its line). `judge` uses it to salvage a reply that
+    ended with `length`: cut where the model left the region, such a reply
+    is a complete hole, and four of the five canvases the 2026-10-16 build
+    threw away for running on held the right body in their first lines.
 
     What goes: blank padding at the end (a held tail made the region a fixed
     size); a copy of the held tail's first lines that the model wrote
@@ -527,8 +653,16 @@ def clean_fill(text: str, hole: Hole, style: str,
     there is no run-on cut at all; such holes always hold their far side.
     """
     raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = raw.split("\n")
+    # THE MODEL'S COPY OF THE MARKERS. The prompt shows the region between
+    # `# >>> REWRITE …` and `# <<< END OF THE LINES TO REWRITE`, and a
+    # canvas sometimes writes them back (2026-10-16, physics.py attempt 2:
+    # the kept fill ended `# <<< END OF THE LINES TO REWRITE` and then a
+    # second `def normalize_angle` that shadowed the one above it). They
+    # are the prompt's, never the file's: dropped wherever they appear.
+    lines = [ln for ln in raw.split("\n") if not _MARKER_ECHO.match(ln)]
     key = [ln.rstrip() for ln in lines]
+    if report is not None:
+        report.clear()
 
     if verify is not None:
         cuts: list[int] = []
@@ -538,6 +672,18 @@ def clean_fill(text: str, hole: Hole, style: str,
                 if (bare and not bare.startswith("#")
                         and _indent(ln) < hole.indent):
                     cuts.append(i)
+        # A DEFINITION REPEATED inside one fill is the model starting the
+        # region over: everything from the repeat on is a run-on. (A
+        # definition the FILE already has outside the region is caught
+        # after the splice, by `judge`, which sees the whole file.)
+        seen_defs: set[str] = set()
+        for i, ln in enumerate(lines):
+            sig = _def_signature(ln)
+            if not sig:
+                continue
+            if sig in seen_defs:
+                cuts.append(i)
+            seen_defs.add(sig)
         if style != "tail" and hole.after:
             need = list(hole.after[:2])
             nonblank = [i for i, k in enumerate(key) if k.strip()]
@@ -551,6 +697,9 @@ def clean_fill(text: str, hole: Hole, style: str,
                     cuts.append(i)
         for i in sorted(set(cuts)):
             if verify(lines[:i]):
+                if report is not None:
+                    report["cut"] = True
+                    report["at"] = i
                 lines, key = lines[:i], key[:i]
                 break
 
@@ -665,6 +814,9 @@ class Candidate:
     #: per line of `fill`: how sure the model was, and how contested
     confidence: tuple[float, ...] = ()
     flips: tuple[int, ...] = ()
+    #: the reply ran past the region (`length`) and was cut where it left
+    #: it — usable, and said to be a salvage in the log
+    salvaged: bool = False
 
     @property
     def usable(self) -> bool:
@@ -707,14 +859,27 @@ class Candidate:
                 f"{r.decode_ms} ms")
         if self.usable:
             return (f"{head} — usable: {self.mean:.0%} sure on average, "
-                    f"least sure line {self.least:.0%}")
+                    f"least sure line {self.least:.0%}"
+                    + (" (salvaged: the reply ran past the region and was "
+                       "cut where it left it)" if self.salvaged else ""))
         return f"{head} — REJECTED: {self.problem}"
 
 
 def judge(code: str, hole: Hole, style: str, noise: float,
           result: CanvasResult, lang: str) -> Candidate:
-    """Clean, splice and screen one filled canvas."""
-    if not result.ok:
+    """Clean, splice and screen one filled canvas.
+
+    A reply that ended with `length` is not thrown away unread: when the
+    run-on cut finds where the model left the region and the prefix
+    parses, that prefix IS the hole — the model wrote the body and kept
+    going. Four of the five canvases the 2026-10-16 build rejected for
+    running on had the right body in their first lines. A `length` reply
+    with no such cut is still rejected: a body cut off mid-way may parse
+    and is not complete.
+    """
+    ran_on = (result.finish_reason == "length"
+              and bool((result.text or "").strip()))
+    if not result.ok and not ran_on:
         return Candidate(style, noise, result, None, "",
                          result.error or f"the canvas ended "
                          f"({result.finish_reason})")
@@ -725,7 +890,13 @@ def judge(code: str, hole: Hole, style: str, noise: float,
                 return False
             text = "\n".join(prefix).rstrip("\n") + "\n"
             return prescreen(splice(code, hole, text), lang) == ""
-    fill = clean_fill(result.text, hole, style, verify)
+    report: dict = {}
+    fill = clean_fill(result.text, hole, style, verify, report=report)
+    if ran_on and not report.get("cut"):
+        return Candidate(style, noise, result, fill, "",
+                         result.error or "the hole ran past the end of its "
+                         "canvas, and no point where it left the region "
+                         "could be found")
     if fill is None:
         return Candidate(style, noise, result, None, "", "the hole came "
                          "back empty")
@@ -735,8 +906,73 @@ def judge(code: str, hole: Hole, style: str, noise: float,
     new = splice(code, hole, fill)
     conf, flips = align(result.text, fill, result.line_confidence,
                         result.line_flips)
-    return Candidate(style, noise, result, fill, new, prescreen(new, lang),
-                     conf, flips)
+    problem = prescreen(new, lang)
+    if not problem and lang == "python":
+        problem = duplicate_definitions(new, code)
+    return Candidate(style, noise, result, fill, new, problem, conf, flips,
+                     salvaged=bool(ran_on))
+
+
+def duplicate_definitions(new: str, old: str = "") -> str:
+    """'' or why not: a name the spliced file now defines TWICE at the same
+    level, when the file did not before.
+
+    The second definition wins in Python, silently. A fill that repeats
+    `def normalize_angle` under the one it just wrote replaces a correct
+    body with `raise NotImplementedError` and the file still parses —
+    which is how a 100 %-sure canvas was chosen over a 98 %-sure one that
+    was right (2026-10-16). A file that already had the duplicate is left
+    to the tests, as before: the hole did not cause it.
+    """
+    try:
+        tree = ast.parse(new)
+    except SyntaxError:
+        return ""
+    before: set[tuple[str, str]] = set()
+    if old:
+        try:
+            before = _twice(ast.parse(old))
+        except SyntaxError:
+            before = set()
+    doubled = _twice(tree) - before
+    if not doubled:
+        return ""
+    names = ", ".join(f"`{n}`" + (f" in {scope}" if scope else "")
+                      for scope, n in sorted(doubled)[:3])
+    return (f"defines {names} twice — the second definition would silently "
+            f"replace the first")
+
+
+def _twice(tree: ast.AST) -> set[tuple[str, str]]:
+    """(scope, name) of every function or class defined twice in one body."""
+    out: set[tuple[str, str]] = set()
+
+    def visit(body: list, scope: str) -> None:
+        seen: dict[str, int] = {}
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+                if _redefines_on_purpose(st):
+                    continue
+                seen[st.name] = seen.get(st.name, 0) + 1
+                if seen[st.name] > 1:
+                    out.add((scope, st.name))
+                if isinstance(st, ast.ClassDef):
+                    visit(st.body, st.name)
+    visit(list(getattr(tree, "body", []) or []), "")
+    return out
+
+
+def _redefines_on_purpose(st: ast.AST) -> bool:
+    """`@x.setter`, `@overload`, `@f.register`: the same name twice is the
+    idiom, not a mistake."""
+    for deco in getattr(st, "decorator_list", []) or []:
+        target = deco.func if isinstance(deco, ast.Call) else deco
+        name = (target.attr if isinstance(target, ast.Attribute)
+                else target.id if isinstance(target, ast.Name) else "")
+        if name in ("setter", "getter", "deleter", "overload", "register"):
+            return True
+    return False
 
 
 def choose(cands: Sequence[Candidate]) -> int | None:

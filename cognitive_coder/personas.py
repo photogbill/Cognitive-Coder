@@ -356,8 +356,25 @@ ARCHITECT = Persona(
                "and the body `raise NotImplementedError`. No real code."),
     temperature=0.15)
 
+#: Rules a test-vs-module disagreement by the request's words
+#: (adjudicate.py). Greedy: a verdict wants the likeliest answer, and the
+#: quote it rests on is checked against the request afterwards.
+JUDGE = Persona(
+    id="judge", label="Judge",
+    self_model=("You settle a disagreement between a test and the module "
+                "it tests by reading the request — the specification the "
+                "operator wrote — and nothing else. A convention the "
+                "request states (which way is north, whether ids count "
+                "from 1, a formula written out) outranks what is usual. "
+                "You never guess: a verdict you cannot support with the "
+                "request's own sentence is 'unclear'."),
+    directive=("Say which side the request supports, quote the sentence "
+               "that decides it exactly as the request has it, and give "
+               "one sentence of reasoning. JSON only."),
+    temperature=0.0)
+
 PERSONAS = {p.id: p for p in (ENGINEER, TESTER, PLANNER, REVIEWER, REPAIRER,
-                              ARCHITECT)}
+                              ARCHITECT, JUDGE)}
 
 
 # --------------------------------------------------------------------------
@@ -530,10 +547,14 @@ class PromptBuilder:
 # the repair prompt (D11, M33)
 # --------------------------------------------------------------------------
 
-#: How much of the request a repair prompt repeats. Enough for any typed
-#: request and the constraints section of most specifications; a whole
-#: design document would crowd out the diagnostics, which are the point.
-REPAIR_REQUEST_CHARS = 2000
+#: How much of the request a repair prompt repeats — a BACKSTOP only. The
+#: loop hands this function the request already sliced to the file by
+#: `specslice.slice_for` (the file's own section of a specification, its
+#: hard requirements, the lines of a manifest that name it), so the cap
+#: below rarely bites. It was 2,000: on the 2026-10-16 Star Trek build the
+#: formulas the repair was judged against sat past character 7,000, and
+#: every repair of every file was blind to them.
+REPAIR_REQUEST_CHARS = 8000
 
 
 def repair_task(path: str, purpose: str, diagnostics: str = "",
@@ -579,6 +600,39 @@ def repair_task(path: str, purpose: str, diagnostics: str = "",
                   "These were already fixed for you automatically, so do not "
                   "undo them:"]
         lines += [f"  - {f}" for f in autofixes]
+    return "\n".join(lines)
+
+
+def fresh_start_task(path: str, purpose: str, request: str = "",
+                     lang: str = "") -> str:
+    """The task text for a FRESH START — the ladder's third rung.
+
+    Two repairs have returned the same file, or the same errors (M34).
+    D11 says why: shown its own broken code, a small model pattern-matches
+    it and writes it again. So this attempt is not shown the file. It gets
+    the request, the pinned interface, the test and the errors — and the
+    one instruction that a first attempt did not have: the errors below
+    came from a version of this file that is not shown, and must not
+    recur. The temperature is up and a seed is set by the loop; this text
+    is what makes the INPUT different, which is the lever that works.
+    """
+    lines = [f"`{path}` was written before and did not work. That version "
+             f"is NOT shown: write the file again from the request and "
+             f"the interface, so that the errors reported below cannot "
+             f"recur. Its purpose: {purpose}"]
+    if request.strip():
+        text = request.strip()
+        if len(text) > REPAIR_REQUEST_CHARS:
+            text = (text[:REPAIR_REQUEST_CHARS].rstrip()
+                    + "… (the request continues)")
+        lines += ["", f"It is part of this request: {text}"]
+    if lang:
+        lines += ["", f"Language: {lang}"]
+    lines += ["",
+              "Keep every name the interface and the other files use. "
+              "Where an error below names a value a test expected, make "
+              "the code produce that value by the request's own rule, "
+              "not by special-casing the test."]
     return "\n".join(lines)
 
 

@@ -105,6 +105,15 @@ def task_text(request: str, modules: Sequence[tuple[str, str]],
         "types (a dataclass's fields, or `self.speed: float = 0.0` lines "
         "in `__init__`).",
         "- Module-level constants other files need, with their values.",
+        "- Where the request states a convention — a coordinate system, "
+        "which way is north or up, whether ids count from 0 or 1, units, "
+        "the order of fields or sectors — put it in the docstring of the "
+        "type or function it governs, in the request's own words. The "
+        "people writing the bodies and the tests see these docstrings; a "
+        "convention that lives only in the request is one they will each "
+        "guess differently.",
+        "- A @dataclass lists fields WITHOUT defaults before fields with "
+        "defaults (Python refuses the other order).",
         "- Imports of this project's modules use the paths above "
         "(`src/track.py` is `src.track`). Nothing runs at import: no "
         "window and no main loop at the top level. The entry point "
@@ -324,6 +333,199 @@ def sanitise(code: str, purpose: str = "", *,
         # NameError in a file that does nothing yet. Deferred, neither is.
         body = _after_docstring(body)
     return f"# {PINNED_TEXT}\n{body}\n", dropped
+
+
+# ---------------------------------------------------------------------------
+# a dataclass that cannot be: defaulted fields before required ones
+# ---------------------------------------------------------------------------
+
+_DATACLASS_IMPORT = re.compile(
+    r"^(?P<lead>from\s+dataclasses\s+import\s+)(?P<names>[^\n#]+)", re.M)
+
+
+def _is_dataclass(cls: ast.ClassDef) -> bool:
+    for deco in cls.decorator_list:
+        target = deco.func if isinstance(deco, ast.Call) else deco
+        name = target.id if isinstance(target, ast.Name) else (
+            target.attr if isinstance(target, ast.Attribute) else "")
+        if name == "dataclass":
+            return True
+    return False
+
+
+def _kw_only_already(value: ast.AST | None) -> bool:
+    return (isinstance(value, ast.Call) and any(
+        k.arg == "kw_only" for k in value.keywords))
+
+
+def fix_dataclass_order(text: str) -> tuple[str, list[str]]:
+    """Make every dataclass importable without moving a field.
+
+    THE STAR TREK SPEC, 2026-10-16: `Ship` listed `warp_heat: float = 0.0`
+    and three more defaulted fields, then `subsystems: dict[str, float]`
+    with no default. `WorldState` did the same. Python refuses that order
+    ("non-default argument 'subsystems' follows default argument"), the
+    skeleton check only PARSED the stub, and the error surfaced at
+    models.py's first run — two attempts and twenty minutes later, with
+    the model asked to fix a file the spec had written.
+
+    Reordering the fields would break the spec's "exact field order".
+    `field(default=…, kw_only=True)` keeps the order and the names: a
+    keyword-only field may sit anywhere, and callers pass it by name —
+    which is how a defaulted field is passed anyway. Applied only to the
+    defaulted fields that precede a required one; everything else is
+    left as written, and each change is returned so the log can say it.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, []
+    lines = text.split("\n")
+    changes: list[str] = []
+    edits: list[tuple[int, str]] = []        # (1-based line, new line)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or not _is_dataclass(node):
+            continue
+        fields = [st for st in node.body if isinstance(st, ast.AnnAssign)
+                  and isinstance(st.target, ast.Name)]
+        # the defaulted fields BEFORE the last required one
+        last_required = max((i for i, st in enumerate(fields)
+                             if st.value is None), default=-1)
+        for st in fields[:last_required + 1]:
+            if st.value is None or _kw_only_already(st.value):
+                continue
+            if st.lineno != st.end_lineno:
+                continue                      # a multi-line default: leave it
+            line = lines[st.lineno - 1]
+            head, _, default = line.partition("=")
+            default = default.strip()
+            if not default:
+                continue
+            if (isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Name)
+                    and st.value.func.id == "field"):
+                new = f"{head.rstrip()} = {default[:-1].rstrip()}, kw_only=True)"
+            else:
+                new = f"{head.rstrip()} = field(default={default}, kw_only=True)"
+            edits.append((st.lineno, new))
+            changes.append(f"{node.name}.{st.target.id} made keyword-only "
+                           f"(a defaulted field before a required one is "
+                           f"not a valid dataclass; its order and name are "
+                           f"kept)")
+    if not edits:
+        return text, []
+    for lineno, new in edits:
+        lines[lineno - 1] = new
+    out = "\n".join(lines)
+    m = _DATACLASS_IMPORT.search(out)
+    if m is not None:
+        names = [n.strip() for n in m.group("names").split(",") if n.strip()]
+        if "field" not in names:
+            names.append("field")
+            out = (out[:m.start("names")] + ", ".join(names)
+                   + out[m.end("names"):])
+    elif not re.search(r"^import\s+dataclasses\b", out, re.M):
+        out = _after_future(out, "from dataclasses import field")
+    try:
+        ast.parse(out)
+    except SyntaxError:
+        return text, []
+    return out, changes
+
+
+def _after_future(body: str, line: str) -> str:
+    """`body` with `line` inserted after the future import, or after the
+    module docstring, or at the top."""
+    lines = body.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.startswith("from __future__ import"):
+            return "\n".join(lines[:i + 1] + [line] + lines[i + 1:])
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return line + "\n" + body
+    if tree.body and _is_docstring(tree.body[0]):
+        end = tree.body[0].end_lineno
+        return "\n".join(lines[:end] + [line] + lines[end:])
+    return line + "\n" + body
+
+
+# ---------------------------------------------------------------------------
+# the request's conventions, in the stub's own docstring
+# ---------------------------------------------------------------------------
+
+CONVENTIONS_TITLE = "Conventions from the request (word for word):"
+
+
+def with_conventions(stub: str, path: str, sentences: Sequence[str]) -> str:
+    """The pinned stub with the request's sentences that concern it in its
+    module docstring — the ones that name its path or a name it declares.
+
+    Ten of the sixteen test failures on the 2026-10-16 Star Trek build were
+    tests written y-up against a spec that says north is (0, -1). The
+    sentence was in the request; it was not where the body's author or the
+    test's author looked, which is the file in front of them. Word for
+    word, by rule (C5), so it is the operator's sentence and not a model's
+    reading of it.
+    """
+    chosen = relevant_sentences(stub, path, sentences)
+    if not chosen or CONVENTIONS_TITLE in stub:
+        return stub
+    block = "\n".join([CONVENTIONS_TITLE, *(f"- {s}" for s in chosen)])
+    try:
+        tree = ast.parse(stub)
+    except SyntaxError:
+        return stub
+    lines = stub.split("\n")
+    if tree.body and _is_docstring(tree.body[0]):
+        node = tree.body[0]
+        doc = node.value.value
+        quoted = lines[node.lineno - 1:node.end_lineno]
+        text = "\n".join(quoted)
+        if '"""' in text:
+            new_doc = f'"""{doc.rstrip()}\n\n{block}\n"""'
+            lines[node.lineno - 1:node.end_lineno] = new_doc.split("\n")
+            out = "\n".join(lines)
+        else:
+            return stub
+    else:
+        # no module docstring: one after the pinned comment line
+        at = 1 if lines and lines[0].lstrip().startswith("#") else 0
+        new_doc = f'"""{block}\n"""'
+        lines[at:at] = new_doc.split("\n")
+        out = "\n".join(lines)
+    try:
+        ast.parse(out)
+    except SyntaxError:
+        return stub
+    return out
+
+
+def relevant_sentences(stub: str, path: str,
+                       sentences: Sequence[str]) -> list[str]:
+    """The sentences that name this file or one of its declared names."""
+    rel = str(path or "").replace("\\", "/").strip("/")
+    base = rel.rsplit("/", 1)[-1]
+    dotted = (rel[:-3] if rel.endswith(".py") else rel).replace("/", ".")
+    patterns = [re.compile(re.escape(rel)),
+                re.compile(re.escape(rel.replace("/", "\\")))]
+    if base != rel:
+        patterns.append(re.compile(r"(?<![\w/])" + re.escape(base) + r"(?!\w)"))
+    if "." in dotted:
+        patterns.append(re.compile(r"(?<![\w.])" + re.escape(dotted)
+                                   + r"(?![\w])"))
+    for name in declared_names(stub):
+        if len(name) >= 4:
+            patterns.append(re.compile(r"(?<![\w])" + re.escape(name)
+                                       + r"(?![\w])"))
+    out: list[str] = []
+    for s in sentences:
+        text = str(s or "").strip()
+        if not text or text in out:
+            continue
+        if any(p.search(text) for p in patterns):
+            out.append(text.replace('"""', "'''"))
+    return out
 
 
 class _Unsliceable(Exception):
