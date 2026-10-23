@@ -277,9 +277,7 @@ def sanitise(code: str, purpose: str = "", *,
                 stub_function(st)
             elif isinstance(st, ast.ClassDef):
                 visit_class(st)
-            elif _is_docstring(st) or isinstance(st, ast.Pass):
-                continue
-            elif isinstance(st, (ast.Assign, ast.AnnAssign)) and \
+            elif _is_docstring(st) or isinstance(st, ast.Pass) or isinstance(st, (ast.Assign, ast.AnnAssign)) and \
                     _safe_value(getattr(st, "value", None)):
                 continue
             else:
@@ -307,9 +305,7 @@ def sanitise(code: str, purpose: str = "", *,
             elif isinstance(st, ast.ClassDef):
                 visit_class(st)
             elif isinstance(st, (ast.Assign, ast.AnnAssign)) and \
-                    _safe_value(getattr(st, "value", None)):
-                continue
-            elif type(st).__name__ == "TypeAlias":
+                    _safe_value(getattr(st, "value", None)) or type(st).__name__ == "TypeAlias":
                 continue
             else:
                 cuts.append((st.lineno, st.end_lineno, []))

@@ -1086,6 +1086,27 @@ def _add_bench_parser(sub, common) -> Handler:
     return bench_cmd
 
 
+def postmortem(args: argparse.Namespace) -> int:
+    """What the journals say went wrong, ranked by the minutes it cost."""
+    root = _project_root(args)
+    if root is None:
+        return 2
+    from . import postmortem as pm
+    report = pm.analyse(LocalFileSystem(root))
+    if not report.sessions:
+        print("No journals under this project (.cc_journal/ is empty).")
+        return 0
+    print(pm.render(report))
+    return 0
+
+
+def _add_postmortem_parser(sub, common) -> Handler:
+    sub.add_parser("postmortem", parents=[common],
+                   help="read the project's journals: what cost minutes, "
+                        "and the harness fix for each")
+    return postmortem
+
+
 #: The subcommands, in `--help` order. A new one is a function above and a
 #: row here; `main()` itself does not change.
 SUBCOMMANDS: tuple[tuple[str, Callable[..., Handler | None]], ...] = (
@@ -1093,6 +1114,7 @@ SUBCOMMANDS: tuple[tuple[str, Callable[..., Handler | None]], ...] = (
     ("build", _add_build_parser),
     ("resume", _add_resume_parser),
     ("history", _add_history_parser),
+    ("postmortem", _add_postmortem_parser),
     ("skills", _add_skills_parser),
     ("audit", _add_audit_parser),
     ("bench", _add_bench_parser),

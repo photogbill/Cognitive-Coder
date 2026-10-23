@@ -59,22 +59,22 @@ and shown — the locate step.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import dataclasses
+from dataclasses import dataclass, field
 import difflib
 import json
 import os
 import re
 import shlex
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, field
 from typing import Any
 
 from . import diagnostics as diag_mod
-from . import langs, runner
+from . import langs, nonerror, runner
 from .errors import BudgetExceeded, Cancelled
 from .providers.base import find_json_object
-from .types import Diagnostic, Message, Task
+from .types import Diagnostic, Task
 
 DEBUG_DIR = ".cc_state/debug"
 HISTORY = f"{DEBUG_DIR}/history.jsonl"
@@ -787,6 +787,26 @@ def run(session: Any, report: DebugReport) -> DebugResult:
                                f"before the repair, {base.said(timeout)}")
         else:
             unconfirmed = "no command was given, so nothing ran it"
+
+        # -- not the code's fault (nonerror.py, 2026-10-22) ---------------
+        # A relative-import / not-on-path / missing-package traceback is
+        # answered with a sentence and a command, before any model call.
+        # Four of 26 sessions on one project were these, and every one
+        # tried to repair correct imports.
+        verdict = nonerror.classify(seen, session.host.fs)
+        if verdict is not None and not report.files:
+            result.state = "nothing-to-repair"
+            result.verdict = verdict.sentence
+            result.last_output = seen
+            _emit(session, "status", f"not a code error: {verdict.kind}",
+                  nonerror=verdict.kind, command=verdict.command)
+            _log(session, "event", "DEBUG not a code error",
+                 f"{verdict.kind}: {verdict.command or verdict.package}")
+            _journal(session, nonerror=verdict.kind,
+                     command=verdict.command, package=verdict.package)
+            _finish(session, report, result, originals)
+            return result
+
         rounds = max(1, int(report.rounds or 1))
         for n in range(1, rounds + 1):
             if hasattr(session, "_check_budget"):

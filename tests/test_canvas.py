@@ -326,6 +326,11 @@ FIXED = CALC.replace("    total = a + c\n    return total\n",
 
 def _run(tmp_path, llm, **cfg):
     host = _host(tmp_path, llm)
+    # These fixtures PLANT a latent NameError in calc.py so that the test
+    # file finds it and the canvas repairs it. The lint gate (2026-10-22)
+    # would find it first, from ruff, and never reach the canvas — which is
+    # right for an operator and wrong for a test of the canvas. Off here.
+    cfg.setdefault("lint_gate", ())
     session = Session(host, config=SessionConfig(adjudicate=False,
         attempts=3, pin_interfaces=False, review_after_build=False, **cfg))
     session.run("arithmetic helpers, with tests")

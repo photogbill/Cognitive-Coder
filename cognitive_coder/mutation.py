@@ -33,10 +33,10 @@ says "may not check", not "does not".
 from __future__ import annotations
 
 import ast
-import copy
-import time
 from collections.abc import Sequence
+import copy
 from dataclasses import dataclass, field
+import time
 from typing import Any
 
 MUTANT_DIR = ".cc_state/mutants"
@@ -177,9 +177,7 @@ def mutants(code: str, limit: int = 5) -> list[Mutant]:
         kind = how[0]
         if kind == "compare":
             twin.ops[how[2]] = how[3]()
-        elif kind == "binop":
-            twin.op = how[2]()
-        elif kind == "boolop":
+        elif kind == "binop" or kind == "boolop":
             twin.op = how[2]()
         elif kind == "const":
             twin.value = how[2]

@@ -53,6 +53,8 @@ from . import (
 )
 from .audit import AuditConfig, AuditFinding, AuditReport, audit_project
 from .codemap import CodeMap
+from .debugrepair import DebugReport, DebugResult, DebugRound
+from .debugrepair import history as debug_history
 
 # -- errors (C6: every one of these carries an operator-facing sentence) ----
 from .errors import (
@@ -84,7 +86,6 @@ from .ports import (
                Cancel,
                CancelToken,
                CanvasLLM,
-               ModelRoster,
                DenyAll,
                EventPort,
                ExecPort,
@@ -94,6 +95,7 @@ from .ports import (
                LocalFileSystem,
                MemoryFileSystem,
                MemoryStorage,
+               ModelRoster,
                NeverCancelled,
                NullLLM,
                RecordingEvents,
@@ -105,8 +107,6 @@ from .ports import (
 from .providers import RemoteGate, available_providers, make_provider
 from .redact import Budget, RedactionReport
 from .session import Session, SessionConfig
-from .debugrepair import DebugReport, DebugResult, DebugRound
-from .debugrepair import history as debug_history
 from .skills import SKILLS_DIR, STARTER_SKILLS, Skill, SkillLoad, load_skills
 
 # -- the contract (§5) -----------------------------------------------------

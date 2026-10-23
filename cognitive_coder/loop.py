@@ -66,10 +66,12 @@ from typing import Any
 
 from . import (
     adjudicate,
+    autoimport,
     enrich,
     guard,
     keep,
     langs,
+    libref,
     personas,
     runner,
     specslice,
@@ -129,6 +131,23 @@ class LoopConfig:
     test_first: bool = True          # F2
     use_tools: bool = True           # native tool calling where available
     autofix: bool = True             # F1
+    #: THE DETERMINISTIC FLOOR (2026-10-22). `format_code` and `lint_code`
+    #: existed, were tested, were exported to ATK — and were called by
+    #: nothing: the loop ran only `ruff check --fix`, which does not
+    #: reindent, and threw ruff's non-fixable findings away. The operator's
+    #: two complaints from the 10-20 runs — indentation, mismatched names —
+    #: were both detected and discarded. Now: the reply is FORMATTED before
+    #: it is written (when a formatter is installed), and a finding whose
+    #: code is a certain bug (undefined name F821, redefinition F811, a
+    #: local used before assignment F823, a syntax error E999) is a located
+    #: error that fails the attempt before anything runs — a NameError the
+    #: tests happen not to reach is still a NameError.
+    format_before_write: bool = True
+    #: Missing imports a rule can add (autoimport.py) are added before the
+    #: file is written. Off only for an experiment that wants to count them.
+    autoimport: bool = True
+    lint_gate: tuple[str, ...] = ("F821", "F822", "F823", "F811", "F631",
+                                  "F632", "F702", "F706", "E999")
     narrow_on_stagnation: bool = True   # F5
     wall_clock_s: float = 0.0        # 0 ⇒ no ceiling (F11 lives in Session)
     #: Clocks on the generated PROGRAM's build/run/test. Nothing here bounds
@@ -192,7 +211,13 @@ class LoopConfig:
     #: whole file does not fit the model's context; "always": every repair
     #: and change of an existing Python file; "off": the whole file, always.
     narrow: str = "auto"
-    narrow_min_lines: int = 150
+    #: 150 → 40 on 2026-10-22, from the journals: shown its whole file plus
+    #: the error, Devstral returned the file BYTE-IDENTICAL on attempt 2
+    #: in every phase of the 10-18 build (2,696→2,696, 2,482→2,482,
+    #: 2,460→2,460 tokens; ai.py at 880 tokens too) — ten minutes per
+    #: file-task at 3–5 tok/s for no information. A whole-file second
+    #: attempt only earns its tokens on a file too small to narrow.
+    narrow_min_lines: int = 40
     #: Where the errors are, marked: each located error's line with the
     #: def/class lines around it (diagnostics.where_block), for repairs.
     mark_errors: bool = True
@@ -665,6 +690,20 @@ class Loop:
                     # same answer — this is what makes the prompt different.
                     facts = enrich.facts_for(carried, codemap=self.codemap,
                                              fs=self.host.fs, lang=lang)
+                    # … and when the symbol is a LIBRARY's (pygame, numpy,
+                    # the standard library), what the installed version
+                    # really exports, read from the project's own
+                    # interpreter (libref.py). The small model's signature
+                    # failure is an API that sounds right; the list is
+                    # what lets it pick instead of guess.
+                    try:
+                        libfacts = libref.facts_for(
+                            carried, ex=self.host.exec, fs=self.host.fs,
+                            lang=lang, root=self.host.fs.root())
+                    except Exception:                        # noqa: BLE001
+                        libfacts = ""
+                    if libfacts:
+                        facts = f"{facts}\n\n{libfacts}" if facts else libfacts
                     recalled = self._recall(task, carried, n)
                     if recalled:
                         diag_text = f"{diag_text}\n\n{recalled}"
@@ -875,6 +914,30 @@ class Loop:
                            {"phase": "verify", "task": task.path,
                             "attempt": n})
                 result = self._verify(task, lang)
+                gated = self._lint_gate(code, lang, task)
+                if gated:
+                    # 2026-10-22: the linter's certain bugs join the verdict.
+                    # A verify that passed with an undefined name in the
+                    # file passed because the tests never reached it; it is
+                    # not verified. A verify that failed gets the linter's
+                    # exact line beside the traceback's.
+                    # The traceback's own errors stay first (the prompt and
+                    # the canvas take the first one); the linter's lines
+                    # follow, and are the ONLY errors when the run passed.
+                    result = dataclasses.replace(
+                        result, ok=False,
+                        diagnostics=tuple(result.diagnostics) + tuple(gated),
+                        caveats=tuple(result.caveats) + (
+                            f"the linter found {len(gated)} certain "
+                            f"error(s) ({', '.join(sorted({d.code for d in gated}))})",))
+                    self._emit("warning",
+                               f"{task.path}: attempt {n}: the linter found "
+                               f"{len(gated)} certain error(s) — "
+                               + "; ".join(f"line {d.line} {d.code}: "
+                                           f"{d.message.split(' (found')[0]}"
+                                           for d in gated[:3]),
+                               {"task": task.path, "attempt": n,
+                                "lint_gate": [d.code for d in gated]})
                 self._log_verify(task, n, result)
                 if contract:
                     result = self._keep_contract(task, contract, code,
@@ -2800,6 +2863,38 @@ class Loop:
         fixed, done = runner.autofix(code, lang, fs=self.host.fs,
                                      ex=self.host.exec,
                                      stem=_stem(task.path))
+        # 2026-10-22: a name the file uses and never imports, when a rule
+        # knows where it comes from (the standard library's own modules
+        # and well-known names; a symbol exactly one other project file
+        # defines), gets its import here — before the lint gate turns it
+        # into an attempt-failing F821 and a model call is spent on a
+        # fix that was never in doubt. Anything the rule is not sure of
+        # is left for the gate to report, located.
+        if self.config.autoimport:
+            fixed, added = autoimport.fix(fixed, task.path, lang=lang,
+                                          codemap=self.codemap)
+            if added:
+                done += [f"added `{a}`" for a in added]
+                self._emit("status",
+                           f"{task.path}: added {len(added)} missing "
+                           f"import(s) by rule — {', '.join(added)}",
+                           {"task": task.path, "autoimport": added})
+        # 2026-10-22: the formatter, at last. Code in, code out, on a copy;
+        # a formatter that is not installed is a note, not a failure, and a
+        # reply that does not parse comes back untouched (the syntax check
+        # reports it, located).
+        if self.config.format_before_write:
+            formatted, note = runner.format_code(
+                fixed, lang, fs=self.host.fs, ex=self.host.exec,
+                stem=_stem(task.path))
+            if formatted and formatted != fixed:
+                fixed = formatted
+                done.append("formatted the file")
+            elif note and "no formatter" in note and \
+                    not getattr(self, "_said_no_formatter", False):
+                self._said_no_formatter = True
+                self._emit("warning", f"{task.path}: {note}",
+                           {"task": task.path, "formatter": False})
         if self.codemap is not None:
             missing = self.codemap.unresolved_in(fixed, lang)
             if missing:
@@ -2819,6 +2914,35 @@ class Loop:
         if done and self.journal is not None:
             self.journal.log("autofix", task=task.path, fixes=done)
         return fixed, done
+
+    def _lint_gate(self, code: str, lang: str,
+                   task: Task) -> list[Diagnostic]:
+        """Lint findings that are certain bugs, located in the reply.
+
+        Runs on a scratch copy of the reply, beside the verify. Only
+        the codes in `lint_gate` count: an unused import is a warning the
+        verify phase can mention; an undefined name is a bug the tests
+        may never reach. No linter installed → nothing (and the note is
+        said once by lint_code's own message elsewhere)."""
+        gate = tuple(self.config.lint_gate or ())
+        if not gate:
+            return []
+        try:
+            found, _note = runner.lint_code(code, lang, fs=self.host.fs,
+                                            ex=self.host.exec,
+                                            stem=_stem(task.path))
+        except Exception:                                    # noqa: BLE001
+            return []
+        out = []
+        for d in found:
+            if d.code in gate:
+                out.append(Diagnostic(
+                    file=task.path, line=d.line, col=d.col,
+                    severity="error", code=d.code, tool="lint",
+                    message=f"{d.message} (found by the linter in the "
+                            f"file as written: a certain error at runtime, "
+                            f"whether or not a test reaches it)"))
+        return out
 
     # ------------------------------------------------------------------
     # whose fault is it

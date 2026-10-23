@@ -333,3 +333,50 @@ def test_the_plan_reaches_the_host_as_data(tmp_path):
     assert data["tasks"][0]["purpose"] == "the first thing"
     assert data["tasks"][1]["persona"] == "tester"
     assert data["revised"] is False
+
+
+# --------------------------------------------------------------------------
+# 2026-10-22: the lying green
+# --------------------------------------------------------------------------
+
+def test_a_build_whose_only_tests_were_all_baselined_away_is_not_ok(tmp_path):
+    """Two re-runs over one folder on 2026-10-20 ended `ok: true` with every
+    file untested: the folder's own tests were all already failing, got
+    baselined out, and nothing checked what was built. The baseline must
+    say so, the session must not end ok, and the report's first line must
+    say UNTESTED."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "__init__.py").write_text("")
+    (tmp_path / "tests" / "test_gamma.py").write_text(STALE_TEST)
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA],
+                 name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1,
+                                                 review_after_build=False))
+    outcomes = session.run("two small modules")
+    assert [o.ok for o in outcomes] == [True, True]      # the files built
+    base = [e for e in session.journal.events() if e["event"] == "baseline"]
+    assert base and base[-1]["data"]["all_excluded"] is True
+    warnings = [m for _k, m, _d in host.events.of("warning")]
+    assert any("every test module in the folder was already failing" in m
+               for m in warnings), warnings
+    end = [e for e in session.journal.events()
+           if e["event"] == "session_end"][-1]["data"]
+    assert end["ok"] is False
+    assert end["all_untested"] is True
+    assert "no tests ran" in end["why_not_ok"]
+    assert session.report().splitlines()[0].startswith("[UNTESTED]")
+
+
+def test_a_project_that_never_had_tests_is_still_untested_but_ok(tmp_path):
+    """The 2026-10-19 decision stands: no tests in the folder and none in
+    the plan is a weaker claim, counted — not a failure."""
+    host = _host(tmp_path, [PLAN, SKELETON, ALPHA, BETA],
+                 name="Devstral-Small-2-24B")
+    session = Session(host, config=SessionConfig(attempts=1,
+                                                 review_after_build=False))
+    session.run("two small modules")
+    end = [e for e in session.journal.events()
+           if e["event"] == "session_end"][-1]["data"]
+    assert end["ok"] is True
+    assert end["all_untested"] is True
+    assert end["why_not_ok"] == ""

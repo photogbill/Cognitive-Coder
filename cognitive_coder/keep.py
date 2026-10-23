@@ -37,6 +37,20 @@ THE RULES, BY RULE (C5):
     refusal into a warning — the operator may mean it. Placeholders are
     still refused.
 
+  * **A planted placeholder is never protected, and never accepted**
+    (2026-10-22, from the journals). A debug session on main.py was handed
+    `def run_headless_demo_fixed(): pass` beside the real
+    `run_headless_demo`, plus the model's own narration as comments ("I
+    will provide the clean, corrected version"). The next two sessions
+    were then REFUSED for dropping `run_headless_demo_fixed` — the guard
+    defending a stub the model had planted. So: a new function whose body
+    is only `pass` / `...` / a docstring is refused on arrival; a new name
+    that is an existing name plus `_fixed` / `_new` / `_v2` / `_2` /
+    `_corrected` / `_updated` / `_old` is a copy, refused; a definition
+    the FILE already holds with a placeholder body is not a loss when a
+    reply drops it (nothing real went); and a comment line that is the
+    model talking about its own reply is a placeholder.
+
 The check runs BEFORE the reply is written (the loop's guard position), so
 the operator's file is still on disk, whole, for the next attempt to see.
 
@@ -93,6 +107,30 @@ _PLACEHOLDER = re.compile(
     r"|(?:code|methods?|functions?|implementation) (?:omitted|elided|"
     r"not shown)(?: for (?:brevity|space|clarity))?" + _END +
     r")", re.I)
+
+#: A comment line that is the model narrating its reply rather than
+#: commenting the code: first-person intent, talk of "the user" / "the
+#: provided snippet" / "the prompt", or "re-defining" something. Matched on a
+#: WHOLE comment line. A real comment that says "we" about the program
+#: ("# we retry twice") does not match: the openers below are the ones that
+#: only a reply-writer uses.
+_NARRATION = re.compile(
+    rf"^\s*{_COMMENT}+\s*(?:"
+    r"I(?:'ll| will| am going to| have| am| re-| note)\b"
+    r"|(?:Note|NOTE):?\s+(?:the user|the prompt|the provided|the given|"
+    r"the original snippet|the snippet)\b"
+    r"|(?:The|the) (?:user|prompt|provided snippet|given snippet|original "
+    r"snippet|snippet) (?:provided|used|had|has|asked|wants|said|gave)\b"
+    r"|(?:Re-?defin|Redefin)\w*\b"
+    r"|(?:This is a safety check|Helper to fix|Here is the|Below is the)\b"
+    r")", re.I)
+
+#: A name that is another definition's name with a "this one is the fixed
+#: copy" suffix. The model fixing `f` by adding `f_fixed` beside it is not
+#: a fix; it is the bug with a longer name.
+_COPY_SUFFIX = re.compile(
+    r"^(?P<base>.+?)(?:_|)(?:fixed|new|v2|v3|2|3|corrected|updated|old|"
+    r"orig|original|backup|copy|alt|revised|patched)$", re.I)
 
 #: In ONE sentence with a definition's name, these say the operator means
 #: it to go, move, or change shape — so its absence is a warning, not a
@@ -161,12 +199,17 @@ class Finding:
     still_used: tuple = ()       # (old, new, where) renames still in use
     placeholders: tuple = ()     # (1-based line, the line) in the reply
     stubbed: tuple = ()          # names whose body became a placeholder
+    #: NEW functions the reply adds with a placeholder body (2026-10-22)
+    planted: tuple = ()
+    #: (new name, the existing name it is a suffixed copy of)
+    duplicated: tuple = ()
     approximate: bool = False    # names came from a pattern-matched parser
     warn_only: bool = False      # the request asks for a rewrite
 
     @property
     def refused(self) -> bool:
-        return bool(self.placeholders or self.stubbed
+        return bool(self.placeholders or self.stubbed or self.planted
+                    or self.duplicated
                     or ((self.dropped or self.still_used)
                         and not self.warn_only))
 
@@ -186,6 +229,13 @@ class Finding:
         if self.stubbed:
             bits.append("turns the body of " + _names(self.stubbed)
                         + " into a placeholder")
+        if self.planted:
+            bits.append("adds " + _names(self.planted)
+                        + " with an empty body")
+        if self.duplicated:
+            bits.append("adds " + ", ".join(
+                f"`{n}` as a copy of `{o}`" for n, o in self.duplicated[:3])
+                + " instead of fixing the original")
         if self.placeholders:
             line, text = self.placeholders[0]
             more = len(self.placeholders) - 1
@@ -211,11 +261,20 @@ class Finding:
         if self.stubbed:
             parts.append(f"It replaces the body of {_names(self.stubbed)} "
                          f"with a placeholder where real code was.")
+        if self.planted:
+            parts.append(f"It adds {_names(self.planted)} with an empty "
+                         f"body; a new function must be complete or not "
+                         f"added at all.")
+        if self.duplicated:
+            n, o = self.duplicated[0]
+            parts.append(f"It adds `{n}` beside `{o}` instead of fixing "
+                         f"`{o}` in place; there must be one `{o}`.")
         if self.placeholders:
             ln, text = self.placeholders[0]
-            parts.append(f"Line {ln} of your reply is a placeholder "
-                         f"(`{text.strip()}`) where code belongs — nothing "
-                         f"fills it in for you.")
+            parts.append(f"Line {ln} of your reply is a placeholder or "
+                         f"commentary (`{text.strip()}`) where code "
+                         f"belongs — nothing fills it in for you, and the "
+                         f"file is not the place to explain the reply.")
         parts.append("Return the complete file: every function, class and "
                      "method the request does not mention stays exactly as "
                      "it was, written out in full.")
@@ -322,8 +381,60 @@ def placeholders(before: str, after: str,
             continue
         if lang == "python" and not line.lstrip().startswith("#"):
             continue
-        if _PLACEHOLDER.match(line):
+        if _PLACEHOLDER.match(line) or _NARRATION.match(line):
             out.append((no, line))
+    return out
+
+
+def _copy_of(name: str, old: dict) -> str:
+    """The existing definition ``name`` is a suffixed copy of, or ""."""
+    leaf = name.rsplit(".", 1)[-1]
+    prefix = name[:len(name) - len(leaf)]
+    m = _COPY_SUFFIX.match(leaf)
+    if not m:
+        return ""
+    base = m.group("base").rstrip("_")
+    if not base or base == leaf:
+        return ""
+    candidate = prefix + base
+    return candidate if candidate in old else ""
+
+
+def _planted(before: str, after: str, old: dict, new: dict) -> list[str]:
+    """New functions / methods in the reply whose body is a placeholder.
+
+    A class with a `pass` body is a legitimate idiom (`class E(Exception):
+    pass`), so only functions and methods count."""
+    try:
+        new_tree = ast.parse(symedit._norm(after))
+    except SyntaxError:
+        return []
+    out = []
+    for name, span in new.items():
+        if span is None or name in old:
+            continue
+        if span.kind not in ("function", "method"):
+            continue
+        node = symedit._node_at(new_tree, span.start)
+        if node is not None and symedit.body_is_stub(node):
+            out.append(name)
+    return out
+
+
+def _hollow(before: str, old: dict) -> set[str]:
+    """Definitions the FILE holds with a placeholder body — dropping one
+    loses nothing real, so it is never a refusal."""
+    try:
+        tree = ast.parse(symedit._norm(before))
+    except SyntaxError:
+        return set()
+    out = set()
+    for name, span in old.items():
+        if span is None or span.kind not in ("function", "method"):
+            continue
+        node = symedit._node_at(tree, span.start)
+        if node is not None and symedit.body_is_stub(node):
+            out.add(name)
     return out
 
 
@@ -381,7 +492,11 @@ def check(before: str, after: str, lang: str, *, path: str,
         if old is None or new is None:
             # a reply that does not parse is the syntax check's to report
             return Finding(path=path, placeholders=found_placeholders)
-        missing = [n for n in old if n not in new]
+        hollow = _hollow(before, old)
+        missing = [n for n in old if n not in new and n not in hollow]
+        planted = tuple(_planted(before, after, old, new))
+        duplicated = tuple((n, _copy_of(n, old)) for n in new
+                           if n not in old and _copy_of(n, old))
         # COUNTED: of a getter and two overloads, a reply that keeps one of
         # each name has still lost definitions
         before_n, after_n = _def_counts(before), _def_counts(after)
@@ -407,6 +522,7 @@ def check(before: str, after: str, lang: str, *, path: str,
                        moved=tuple(moved),
                        renamed=tuple(renamed), still_used=tuple(still_used),
                        placeholders=found_placeholders, stubbed=stubbed,
+                       planted=planted, duplicated=duplicated,
                        warn_only=warn_only)
     old_names = other_defined(before, lang, path)
     new_names = other_defined(after, lang, path)

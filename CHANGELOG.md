@@ -10,6 +10,149 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — the four tabs built, and a grammar-backed structured ask (2026-10-22)
+
+Bill asked to finish the tabs ("the most bang for buck per reinstall") and
+then to make the tool "the best coding tool for small models possible"
+(24B–40B), chat-first because "being able to chat with the model for
+brainstorming helps — each tab brings a tool to the table."
+
+**Four engine modules, each chat-first where a conversation helps, each
+constraining the edit shape and nothing else:**
+
+- `scope.py` — one definition of a working set: the whole project, one
+  file, one folder, or an explicit list. Skips `.venv`, `.cc_*`; source is
+  `*.py`. Every tab's file/folder picker resolves through it.
+- `bughunt.py` — the Evaluate & Bug Hunt engine. Ruff, format check,
+  codemap unresolved, `keep` scan and pyright/mypy run first; the model's
+  pass runs LAST and every bug it names is a real line or it is set aside
+  (`could_not_locate`). `votes>1` asks the model repeatedly and keeps only
+  what two passes place within ±2 lines of each other; the rest are listed
+  `unconfirmed`, never counted. `to_debug_reports` hands located errors to
+  Debug & Repair.
+- `improve.py` — converse (consultant / expert / mad-scientist / structurer
+  personas) → `structure` the agreed conversation into a checked change
+  list → `apply` each checked item through the repair loop, one at a time,
+  with an `IMPROVEMENTS.md` ledger each later item is shown.
+- `redteam.py` — scan (guard + whatever scanners are installed) →
+  `threat_model` → `attack`: one reproducer per threat, a unittest under
+  `tests/redteam/` that FAILS against the code as it is (and is itself
+  guard-checked, so an attack that leaves the sandbox is refused, not run).
+  A finding without a reproducer that fails now is a guess and marked one.
+  `converse` lets the attacker withdraw by id (`WITHDRAW t1: why`);
+  `to_repairs` carries the reproducer's command so Debug & Repair confirms
+  the fix by the reproducer going green. `to_json`/`from_json` so a UI can
+  hold the state between turns.
+- `blueprint.py` — a system of modules. `converse` (systems-architect
+  persona) plans it FIRST — Bill's point that the back-and-forth belongs
+  before the design, not after. `decompose` turns the agreed plan + spec
+  into modules with public contracts; `validate` refuses a blueprint whose
+  contracts lack a single owner, whose files are double-owned, or whose
+  dependencies cycle. `order` is dependencies-first; `write_stubs` gives a
+  module the contract stubs of dependencies not built yet; `run_module`
+  builds one module through its own session with a `BLUEPRINT.md` ledger.
+
+**`structured.py` — one way to ask a model for a JSON object, and get one.**
+Every tab (and Debug & Repair's locate) asks through it: a GBNF grammar
+when the host enforces one (`supports_grammar`), and ONE retry that quotes
+the parse problem back with the first 300 characters the model sent. A
+24B–40B model returns usable JSON nine times in ten; this makes the tenth a
+second ask instead of a silent `{}`. `improve.structure`,
+`blueprint.decompose`, `redteam.threat_model` and `redteam.attack` and the
+bug-hunt model pass were moved onto it.
+
+Journal events added: `structured`, `bughunt`, `improve`,
+`improve_structure`, `improve_apply`, `redteam_threats`, `redteam_attack`,
+`blueprint`, `blueprint_plan`, `blueprint_module`. Six personas added to
+`personas.py`: consultant, expert, mad_scientist, structurer, attacker,
+systems_architect. 20 new tests in `tests/test_tabs_engine.py`; full suite 1498
+green on Python 3.13.
+
+
+### Added — the harness fixes from five failed builds; `ccoder postmortem`; the next tabs designed (2026-10-22)
+
+Five journals (10-18 ×2, 10-20 ×3) and 26 Debug & Repair sessions were read
+from `.cc_journal/*.jsonl`; the findings and their fixes are the new last
+section of `docs/HYBRID.md`. Most of the minutes went to the harness, not
+the models. Every fix below is pinned by a test that reproduces the
+journal's own shape.
+
+**The second attempt** (`narrow_min_lines` 150 → 40, `loop.py`,
+`session.py`). Shown its whole file plus the error, Devstral returned the
+file byte-identical on attempt 2 in every phase of the 10-18 build — ten
+minutes per file-task at 3–5 tok/s for nothing. A repair of any file over 40
+lines is a narrowed edit from attempt 2; whole-file stays for the first
+attempt of a new file, and for files too small to narrow.
+
+**The deterministic floor** (`LoopConfig.format_before_write`,
+`LoopConfig.lint_gate`; `tests/test_deterministic_floor.py`). `format_code`
+and `lint_code` were defined, tested, exported to ATK — and called by
+nothing. Now the reply is formatted before it is written (ruff/black when
+installed; one warning per session when neither is), and a lint finding
+that is a certain bug — F821 undefined name, F811 redefinition, F823,
+F631/F632, F702/F706, E999 — joins the verify verdict: a run that passed
+with an undefined name the tests never reached is not verified, and a run
+that failed gets the linter's exact line beside the traceback's. Both are
+`SessionConfig` fields; `lint_gate=()` turns the gate off (the canvas tests
+do, because their fixtures plant the very error the gate would catch first).
+
+**`keep.py`: a planted placeholder is never protected and never accepted.**
+A debug session planted `def run_headless_demo_fixed(): pass` beside the
+real function plus the model's own narration as comments; the next two
+sessions were refused for dropping the stub. Now a NEW function with an
+empty body is refused on arrival (`Finding.planted`); a new name that is an
+existing name plus `_fixed`/`_new`/`_v2`/`_2`/`_corrected`/`_updated`/`_old`
+is a copy, refused (`Finding.duplicated`); a definition the file already
+holds with a placeholder body is not a loss when dropped; a comment that is
+the model narrating its reply ("I will provide the clean, corrected
+version", "Note: the user …", "Re-defining …") is a placeholder.
+
+**`nonerror.py`: tracebacks that are not the code's fault.** Four of 26
+debug sessions were `attempted relative import with no known parent
+package` / `No module named 'src'` — the program run from inside `src\`.
+Debug & Repair now answers these, and a missing third-party package, with a
+sentence and the command (`python -m src.main`) before any model call; a
+report that NAMES a file still repairs.
+
+**`speclint.py`: what a spec says that a build will faithfully get wrong.**
+`Reserve_energy` (capital R) was pinned as written, then half-corrected by a
+model. Before the plan, the request is linted for a capitalised or camelCase
+field in a snake_case spec, one name in two spellings, and one constant
+with two values; each is a warning with the line and the probable spelling,
+journaled as `speclint`, never applied.
+
+**The lying green.** Two re-runs over one folder ended `ok: true` with
+every file untested: the folder's own tests were all already failing, got
+baselined away, and nothing checked what was built. The baseline now says
+when EVERY test module is excluded (`baseline.all_excluded`, a warning), a
+session with tests present and none run ends `ok: false` with
+`session_end.why_not_ok`, and the report's first line is `[UNTESTED]`. A
+project that never had tests and whose plan wrote none is still "untested,
+ok" — the 10-19 decision stands.
+
+**`ccoder postmortem`** (`postmortem.py`). The journals read back and ranked
+by the minutes they cost — same-size second attempts, canvas skips with
+their reasons, located-not-repaired, not-a-code-error, no-tests-ran, a
+model under 8 tok/s — each with its harness fix named. Run on the 10-18 and
+10-20 journals it reproduces every finding of the hand reading and adds one
+(16 of 23 canvas repairs skipped in the 10-20 build).
+
+**`docs/NEXT_TABS.md`** — the design of record for Blueprint (a system of
+modules of files: contracts between modules, one session per module in
+dependency order, a cross-module ledger, stubs from contracts), Improve (a
+conversation that ends in a checkboxed change list applied by narrowed
+edits, with a persona picker and an evolutionary mode), Red Team (an
+attacker that must prove every finding with a reproducer, scanners first,
+threat model shown before any attack, findings become Repair tasks with
+the reproducer as the acceptance test), Evaluate & Bug Hunt (the floor made
+visible, a type-checker lane, test adjudication shown, properties from the
+spec), and the per-file right-click. Engine operations before tabs.
+
+**Two stale needles** in `test_repair_acceptance` and
+`test_interfaces_pinned` expected `Tuple[...]` where the enricher now
+renders `tuple[...]`; widened to accept the shape in either spelling.
+
+
 ### Added — narrowed edits, the dropped-code guard, a ranked repo map, the regression suite; what Aider, OpenHands and Devika had worth taking (2026-10-19)
 
 Bill asked which features of Aider, OpenHands and Devika would improve this

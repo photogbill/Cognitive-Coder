@@ -46,9 +46,9 @@ pure so that every rule above is a unit test.
 from __future__ import annotations
 
 import ast
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+import re
 
 from .types import CanvasRequest, CanvasResult, Diagnostic, Message
 

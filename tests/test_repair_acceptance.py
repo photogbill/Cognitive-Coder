@@ -181,7 +181,11 @@ def test_a_repair_is_accepted_only_when_the_callers_failure_is_gone(
     second = host.llm.prompts[-1]
     text = "\n".join(m.content for m in second if isinstance(m.content, str))
     assert "'tuple' object has no attribute 'z'" in text
-    assert "TrackSegment = Tuple[float, float, int]" in text
+    # the enricher renders the alias in builtin-generic form (`tuple[...]`),
+    # whatever the source spelled; the FACT is what matters (pre-existing
+    # red on 2026-10-22: the needle said `Tuple`)
+    assert ("TrackSegment = Tuple[float, float, int]" in text
+            or "TrackSegment = tuple[float, float, int]" in text)
     assert "plain tuple" in text
 
     log = _log(tmp_path)

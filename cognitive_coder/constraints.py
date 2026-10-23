@@ -25,8 +25,8 @@ the rest are counted, not dropped silently.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
+import re
 
 MAX_CONSTRAINTS = 15
 MAX_CHARS = 240

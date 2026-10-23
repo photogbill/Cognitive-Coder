@@ -80,7 +80,7 @@ function size.
 
 | | |
 |---|---|
-| a Python repair of a file over `narrow_min_lines` (150) lines | the functions the error is in |
+| a Python repair of a file over `narrow_min_lines` (40; was 150 until 2026-10-22 — see HYBRID.md, the second-attempt finding) lines | the functions the error is in |
 | the same attempt came back twice (F5), or a reply was refused for leaving code out | for the rest of that task |
 | any repair or change when the whole file does not fit the context | the targets in full, every other definition as its header (`condensed_view`) |
 | `"always"` | every repair and change of an existing Python file |

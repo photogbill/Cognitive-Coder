@@ -65,7 +65,11 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "blocked", "audit", "model_check", "baseline",
                   "interfaces", "canvas", "debug", "constraints",
                   "mutation", "adjudicate", "phase", "swap", "narrow",
-                  "keep", "recall")
+                  "keep", "recall",
+                  # the tabs (docs/NEXT_TABS.md) and the structured ask
+                  "structured", "bughunt", "improve", "improve_structure",
+                  "improve_apply", "redteam_threats", "redteam_attack",
+                  "blueprint", "blueprint_plan", "blueprint_module")
 
 
 # --------------------------------------------------------------------------

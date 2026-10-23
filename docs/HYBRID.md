@@ -278,3 +278,145 @@ host no longer varies sampling on its own when the engine has this ladder.
 * Devstral's real speed when it fits in VRAM. The probe will say; a
   Q3-class quantization with a 16 K context and a quantized KV cache is the
   first thing to try.
+
+---
+
+## The next five builds, read 2026-10-22 — what the journals say now
+
+*Five journals (2026-10-18 ×2, 2026-10-20 ×3) plus 26 Debug & Repair
+sessions, read from `.cc_journal/*.jsonl` and `.cc_state/debug/history.
+jsonl`, not from memory. The 10-18 pair are the builds the hybrid was
+designed from, re-read with the hybrid in place; the 10-20 runs are
+DiffusionGemma alone and DiffusionGemma + Qwen3-Coder-30B. None finished.
+Ranked by the minutes they cost. Each item names the fix; none is built
+yet.*
+
+### 1. Rung 2 is wasted on an autoregressive model, every time
+
+Devstral, physics.py, attempts 1→2: 2,696 tokens then **2,696**. Repair
+phase: 2,482 then **2,482**. Finish phase: 2,460 then **2,460**. render.py:
+3,020 then **3,020**. Shown its own whole file plus the located error, the
+model returns the file byte-identical — D3 in its purest form — and at
+3–5 tok/s that is ten minutes per file-task for zero information. The
+physics.py `IndentationError` at line 118 took four whole-file attempts of
+~2,500 tokens; a narrowed edit of the one function is ~200.
+
+**Fix.** For a `chat`-kind model the second attempt is a narrowed edit
+(`symedit`) of the located definition, not "the whole file with the
+errors". The 2026-10-19 change made narrowing the answer to a *refusal*
+and to "the same attempt twice"; it has to be the default second rung.
+Whole-file stays for the **first** attempt of a new file — that is where
+Devstral did well (models, parser, render all verified first try) — and
+for nothing after it, in any tab, for any model.
+
+### 2. Canvas mode mostly does not fire
+
+In the 10-18 diffusion run, **10 of 19** repair attempts were `canvas:
+skip`. The reasons, verbatim from the journal: *"could not be cut out as a
+hole that fits one canvas"* (`impact_shield_sector`, `apply_damage`,
+`compute_ai_orders` — every real function body was over 256 tokens), and
+*"the same lines came back"* at `noise 1.0` with confidence 0.0 — the model
+copies the hole back from the **prompt**, where the file is shown marked
+with the old lines inside the markers. Every file that verified in that
+run was a whole-file generate. The canvas was not the thing that worked.
+
+**Fix.** (a) Multi-canvas holes: a body that does not fit one canvas is
+filled as consecutive canvases with the previous canvas's tail held — the
+server already supports held positions. (b) The prompt never shows the
+hole's old contents: the marked file shows `# >>> HOLE: apply_damage (34
+lines) <<<` and nothing inside it. The diagnostics carry forward; the old
+code does not. (c) A fill with confidence 0.0 is not a candidate.
+
+### 3. Diffusion output is eating characters
+
+`from.models` in five files of the 10-20 "almost" run, `if'scripted_
+commands'` in main.py, `"SHIELDCTORS"` on 10-22. Every instance is
+DiffusionGemma output; none in Devstral's. The pattern is a dropped space
+at a token boundary where the next token begins with punctuation — the
+SentencePiece `▁` lost between the server's `pieces_hex` readout and ATK's
+byte join (`dgemma._read_canvas`) — or a dropped character mid-word. A
+share of the `syntax: failed` verdicts blamed on the model are this.
+
+**Fix.** In ATK's fork of llama.cpp (the readout is ATK patch 2, not
+upstream code): return the canvas text as ONE detokenized string with
+per-position byte offsets, never as per-token pieces the client joins.
+Pin with a test that round-trips `from .models import x` and `if 'a' in
+b:` through the server. Until then, `_read_canvas` detokenizes with the
+`lstrip=False` path and a regression test holds the two strings above.
+
+### 4. `keep.py` protected the model's own garbage
+
+main.py gained `run_headless_demo_fixed()` with a `pass` body, plus model
+narration written as comments (*"I will provide the clean, corrected
+version"*). The dropped-code guard then **refused** the next two repairs
+because they removed `run_headless_demo_fixed` — two debug sessions ended
+`no-change` defending a placeholder the model had planted.
+
+**Fix.** A *new* definition whose body is only `pass` / `...` / a comment
+is a placeholder and is refused on arrival, the same as a stubbed body. A
+name introduced by an earlier attempt **in this session** is never
+protected; `keep` reads the session's own `patch` events for the names it
+added. Narration comments (first-person, "I will", "Note: the user", "the
+provided snippet") are stripped before the parse, and their presence is
+logged as a D2 finding.
+
+### 5. The lying green
+
+Builds 2 and 3 on 10-20 over the same folder reported `ok: true` with
+**every file untested**: the project's own failing tests were baselined as
+"already failing" and excluded, so nothing ran, and the headline said ok.
+Recommendation.md line 193 did say *"no tests ran"* — honest in the
+caveats, wrong where the operator looks.
+
+**Fix.** A session in which zero project tests executed cannot report
+`ok`; it reports `untested` as its own state, and the Recommendation's
+first line says so. A baseline that excludes *every* test is a warning
+at session start, not a silent fact.
+
+### 6. Debug & Repair was being used as the Improve tab
+
+Of 26 sessions, most of the pasted text was feature requests: *"No command
+history (Up/Down arrows), no F1 help"*, *"Upgrade parse_bank_spec() to
+split on , first"*, *"Set can_cloak = faction in …"*. **11 of 26** ended
+at `located` — *"the fault is most likely in src/models.py, src/physics.
+py — repair them?"* — zero rounds, a question that cost a click each
+time. **4 of 26** were `attempted relative import with no known parent
+package` / `No module named 'src'`: the program was run from inside
+`src/`, the code was right, and the tab tried to repair it.
+
+**Fix.** (a) An Improve tab — free text in, a proposed change list with
+checkboxes, applied file by file through narrowed edits, with a project
+notes file carrying cross-file consequences forward. (b) `located` is not
+a terminal state: the default is to repair the located files and say
+which, with the question only when the operator set *ask first*. (c)
+Before any model call, a non-error classifier: the two import errors
+above, `ModuleNotFoundError` for the project's own package, and a
+traceback whose cwd is inside the package all answer *"run it as `python
+-m src.main` from the project root — the code is not wrong"*.
+
+### 7. The spec's own typo was pinned and then half-corrected
+
+BUILD_SPEC.md line 89 says `Reserve_energy` (capital R). The interface
+stage pinned it faithfully; Devstral silently lowercased it and diverged
+from the spec and from `test_physics.py` for the rest of the build.
+
+**Fix.** A spec lint before the plan: a field or function name that
+breaks PEP 8 is reported with the line, and the operator confirms it or
+fixes the spec. A model is never left to decide which spelling the
+operator meant.
+
+### What the numbers say about the two models
+
+| | DiffusionGemma 10-18 | Devstral 10-18 | DGemma 10-20 (closest) |
+|---|---|---|---|
+| wall | 80 min | 331 min | 78 min |
+| model time of wall | 58 % | **76 %** | 60 % |
+| tokens out | 49,613 | 71,292 | 59,350 |
+| files verified | 5 of 10 | 5 of 9 | 5 of 10 |
+| canvas repairs that ran | 9 of 19 | — | similar |
+
+Devstral spends three quarters of the wall clock decoding at 3–5 tok/s;
+DiffusionGemma spends two fifths of its wall in prompt processing because
+every canvas attempt re-sends the prompt. Neither model's *failures* were
+mostly the model's: items 1–6 above are harness defects, and item 7 is the
+spec's. The order of work is the order above.

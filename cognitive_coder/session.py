@@ -39,7 +39,7 @@ from typing import Any
 import uuid
 
 from . import journal as journal_mod
-from . import langs, models, personas, runner
+from . import langs, models, personas, runner, speclint
 from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import (
@@ -77,6 +77,11 @@ class SessionConfig:
     project_mode: bool = True
     use_tools: bool = True
     autofix: bool = True
+    #: the deterministic floor (loop.py, 2026-10-22): format before the
+    #: write; certain-bug lint codes fail the attempt before it is written
+    format_before_write: bool = True
+    lint_gate: tuple[str, ...] = ("F821", "F822", "F823", "F811", "F631",
+                                  "F632", "F702", "F706", "E999")
     skeleton_first: bool = True
     wall_clock_s: float = 0.0            # 0 ⇒ no ceiling (F11)
     per_task_s: float = 0.0
@@ -194,7 +199,13 @@ class SessionConfig:
     #: "always" — every repair and change of an existing Python file;
     #: "off" — the whole file, always.
     narrow: str = "auto"
-    narrow_min_lines: int = 150
+    #: 150 → 40 on 2026-10-22, from the journals: shown its whole file plus
+    #: the error, Devstral returned the file BYTE-IDENTICAL on attempt 2
+    #: in every phase of the 10-18 build (2,696→2,696, 2,482→2,482,
+    #: 2,460→2,460 tokens; ai.py at 880 tokens too) — ten minutes per
+    #: file-task at 3–5 tok/s for no information. A whole-file second
+    #: attempt only earns its tokens on a file too small to narrow.
+    narrow_min_lines: int = 40
     #: Each located error's line marked, with the def/class lines around
     #: it, in every repair prompt (diagnostics.where_block).
     mark_errors: bool = True
@@ -269,6 +280,8 @@ class Session:
                 max_tokens=self.config.max_tokens, seed=self.config.seed,
                 project_mode=self.config.project_mode,
                 use_tools=self.config.use_tools, autofix=self.config.autofix,
+                format_before_write=self.config.format_before_write,
+                lint_gate=tuple(self.config.lint_gate or ()),
                 wall_clock_s=self.config.per_task_s,
                 timeouts=Timeouts(build=self.config.build_timeout,
                                   run=self.config.run_timeout,
@@ -371,6 +384,7 @@ class Session:
         caps = self._plan_hybrid(caps)
         self._pin_constraints(request, source="the request")
         self._git_warning()
+        self._spec_lint(request)
 
         stats = self.codemap.index_project()
         self.journal.log("codemap", files=stats.files, symbols=stats.symbols,
@@ -1238,8 +1252,26 @@ class Session:
         if not failing:
             failing = [str(p).replace("\\", "/") for p in existing]
         self.loop.config.known_failing = tuple(failing)
+        # 2026-10-22: when EVERY test module in the folder is already
+        # failing, nothing this build writes can be verified by them, and
+        # the session must not end `ok`. Two re-runs over one folder did
+        # exactly that — all files "untested", headline green.
+        modules = {str(p).replace("\\", "/") for p in existing
+                   if _looks_like_test(str(p))}
+        all_excluded = bool(modules) and len(set(failing)) >= len(modules)
+        self._all_tests_baselined = bool(all_excluded)
         self.journal.log("baseline", existing=list(existing),
-                         failing=list(failing), ok=False)
+                         failing=list(failing), ok=False,
+                         all_excluded=bool(all_excluded))
+        if all_excluded:
+            self.host.emit(
+                "warning",
+                "every test module in the folder was already failing, so "
+                "NOTHING this build writes can be checked by them — the "
+                "session will not report ok, whatever builds. Repair the "
+                "tests first (Debug & Repair on a test file), or build "
+                "into an empty folder.",
+                {"phase": "baseline", "all_excluded": True})
         names = ", ".join(failing[:6]) + (" …" if len(failing) > 6 else "")
         self.host.emit(
             "warning",
@@ -2038,18 +2070,44 @@ class Session:
         final = self._final_outcomes()
         unverified = self._unverified(final)
         untested = self._untested(final)
+        # 2026-10-22: a session in which NO source file has a test that ran
+        # is not ok, however green every file's build was. "untested" is
+        # its own state, said as such, so a re-run over a folder whose own
+        # tests were all baselined away cannot print a green headline.
+        sources = [o.path for o in final
+                   if o.ok and not _looks_like_test(o.path)]
+        no_evidence = set(untested) | set(unverified)
+        evidence = bool(sources) and any(p not in no_evidence
+                                         for p in sources)
+        all_untested = bool(sources) and not evidence
+        # A project that never had tests and whose plan wrote none is still
+        # "untested, ok" (some files genuinely have none — the 2026-10-19
+        # decision stands). A project that HAS tests — in the plan, or in
+        # the folder — and ran none of them is not ok: that is the case
+        # where the tests were all baselined away and the headline lied.
+        tests_present = (getattr(self, "_all_tests_baselined", False)
+                         or any(_looks_like_test(t.path)
+                                for t in (self.plan.tasks if self.plan
+                                          else ()))
+                         or any(_looks_like_test(o.path) for o in final))
+        not_ok_untested = all_untested and tests_present
         self.journal.log(
             "session_end",
             #: "ok" means VERIFIED. A file whose test file exists and ran
             #: nothing is not, however green its build was — and a session
             #: that crashed is not, however green the files before the
-            #: crash were.
+            #: crash were. And a session with tests where none ran is not.
             ok=(bool(final) and all(o.ok for o in final) and not unverified
-                and not self._failed),
+                and not self._failed and not not_ok_untested),
             files=[o.path for o in final if o.ok],
             failed=[o.path for o in final if not o.ok],
             unverified=unverified,
             untested=untested,
+            all_untested=all_untested,
+            why_not_ok=("no tests ran for any file this session built"
+                        if not_ok_untested and bool(final)
+                        and all(o.ok for o in final) and not unverified
+                        and not self._failed else ""),
             seconds=round(time.monotonic() - self._started, 1),
             codemap=stats.one_line(),
             remote=self.gate.active,
@@ -2284,6 +2342,12 @@ class Session:
                          f"{', '.join(unverified)}")
         built = [o for o in final if o.ok and not _looks_like_test(o.path)]
         untested = self._untested(final)
+        if untested and built and len(set(untested) | set(unverified)) \
+                >= len(built):
+            # 2026-10-22: the FIRST thing the report says when nothing ran
+            lines.insert(0, "[UNTESTED]  no tests ran for any file this "
+                            "session built — nothing here shows the "
+                            "program works; this is not an ok result")
         if untested:
             lines.append(f"[tests]     {len(untested)} of {len(built)} "
                          f"file(s) have no tests — built and run, not "
@@ -2379,6 +2443,29 @@ class Session:
         raise BudgetExceeded("wall-clock",
                              f"{self.config.wall_clock_s / 60:.0f} minutes",
                              done)
+
+    def _spec_lint(self, request: str) -> None:
+        """What the request says that the build will carry into code
+        exactly as written (speclint.py, 2026-10-22). A warning and a
+        journal row, never a stop: the operator decides, and a model never
+        'corrects' a spelling on its own."""
+        try:
+            findings = speclint.lint(request)
+        except Exception:                                    # noqa: BLE001
+            return
+        if not findings:
+            return
+        self.journal.log("speclint", findings=[
+            {"line": f.line, "kind": f.kind, "text": f.text,
+             "suggestion": f.suggestion} for f in findings])
+        self.host.emit("warning", speclint.report(findings),
+                       {"phase": "speclint",
+                        "findings": [(f.line, f.kind, f.text)
+                                     for f in findings]})
+        try:
+            self.log.block("specification lint", speclint.report(findings))
+        except Exception:                                    # noqa: BLE001
+            pass
 
     def _git_warning(self) -> None:
         """Say once if the project is a git repo with uncommitted work (§6.5b).

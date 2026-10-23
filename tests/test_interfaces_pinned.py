@@ -104,7 +104,12 @@ def test_a_module_level_type_alias_is_a_symbol_with_its_exact_source():
     alias = next((s for s in symbols if s.name == "TrackSegment"), None)
     assert alias is not None, "the alias is not indexed at all"
     assert alias.kind == "alias"
-    assert alias.signature == "TrackSegment = Tuple[float, float, int]"
+    # rendered in builtin-generic form on 3.13 (`tuple[...]`), as spelled on
+    # 3.11 (`Tuple[...]`): the alias's SHAPE is the claim, not its casing
+    # (pre-existing red on 2026-10-22; the same needle as
+    # test_repair_acceptance)
+    assert alias.signature in ("TrackSegment = Tuple[float, float, int]",
+                               "TrackSegment = tuple[float, float, int]")
     assert alias.docstring == "(curve_value, color_pattern, z_position)"
 
 
@@ -200,8 +205,10 @@ def test_render_is_shown_what_a_track_segment_is(tmp_path):
         attempts=1, pin_interfaces=False, review_after_build=False))
     session.run("a track and something that draws it")
     text = _user_text(_prompt_for(host, "src/render.py"))
-    assert "TrackSegment = Tuple[float, float, int]  # (curve_value, " \
-           "color_pattern, z_position)" in text, text
+    assert ("TrackSegment = Tuple[float, float, int]  # (curve_value, "
+            "color_pattern, z_position)" in text
+            or "TrackSegment = tuple[float, float, int]  # (curve_value, "
+            "color_pattern, z_position)" in text), text
     assert "def __init__(self, segment_count: int = 300)" in text
 
 
