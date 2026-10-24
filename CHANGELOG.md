@@ -10,6 +10,43 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — a reply stuck repeating itself, found while it streams; `cut` (2026-10-24)
+
+Bill: "Is it possible to add another tab to cognitive coder that shows any
+code being written as it's being written? That way, it can be stopped if the
+user notices that it's stuck in a loop or repeating itself." The tab is
+ATK's (its Live tab); the engine supplies the two things a host needs for
+it to be more than a window.
+
+- `repetition.py` — `find(text)` names the verbatim repetition a reply ENDS
+  in, or None; `Watch` is the same for a stream (checks every 256
+  characters). Only the tail counts, the unit needs four different letters
+  (a tile map of zeros, a `# ----` rule and a run of `}` are never a loop),
+  three copies, and real length: `watch` from 400 repeated characters,
+  `loop` from 2,000. Candidate periods come from where the reply's last 32
+  characters recur, so a check is a few slice comparisons, not a scan.
+  Stdlib only. Its test streams the engine's own 40,000 lines through a
+  `Watch` seven characters at a time: not one `watch`.
+- `finish_reason="cut"` — a host stopped THIS reply while it was being
+  written (it was looping, or the operator pressed "Cut this reply").
+  Unlike `cancelled` the build goes on. `text` is what came before the cut
+  (one copy of a loop, never the copies); `error` says why.
+- The loop treats a cut as an attempt, honestly recorded — a `generate`
+  event with `finish_reason: cut` and the reason, a warning naming the
+  attempt, the reply in `BUILD_LOG.txt`, nothing on disk — that hands on
+  the inputs it was given (`last` skips it), so the next attempt is the cut
+  one done again, not a repair of nothing.
+- **The attempt after a cut samples differently** (`Loop._after_cut`): the
+  next temperature rung and a seed no rung uses. The ladder keeps attempt 2
+  at attempt 1's sampling on purpose, and with the same seed llama.cpp
+  writes the same loop token for token. Journalled as the attempt's
+  `escalation`.
+- A cut reply is never continued (`_is_truncated`), never mined for
+  text-marker lookups, never placed as a narrowed edit, and never used as a
+  diagnosis or implementation notes. The give-up sentence names cut
+  attempts; fix recall skips them.
+- `tests/test_repetition.py` (16).
+
 ### Added — Continue: a stopped build picked up where it left off (2026-10-23)
 
 Bill: "What if an operator stops the coding, but wants to go back to where

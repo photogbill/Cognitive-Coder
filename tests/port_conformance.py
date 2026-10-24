@@ -378,7 +378,7 @@ def check_llm(llm: Any, report: Report | None = None) -> Report:
               hasattr(out, "finish_reason") and hasattr(out, "text"))
         r.add("complete() sets finish_reason from the closed set",
               out.finish_reason in ("stop", "length", "tool_calls",
-                                    "cancelled", "error"),
+                                    "cancelled", "error", "cut"),
               f"finish_reason={out.finish_reason!r}")
         r.add("complete() names the model that answered (C8)",
               bool(out.model) or not caps.loaded,

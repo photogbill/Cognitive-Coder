@@ -369,6 +369,11 @@ class Loop:
     #: too large to show, this becomes the attempt's refusal — it used to
     #: end the task as "the model returned nothing" (review, 2026-10-19).
     _unplaced: Any = field(default=None, repr=False)
+    #: {path: the attempt whose reply the host CUT while it was being
+    #: written} — the next attempt of that task samples differently
+    #: (`_after_cut`), because the ladder's next rung is the same seed and
+    #: temperature, and those write the same loop again word for word.
+    _cut: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     # the escalation ladder
@@ -410,6 +415,31 @@ class Loop:
                       f"{'a new seed' if canvas else f'temperature {temperature:.2f}, seed {seed}'}")
         return Sampling(attempt=attempt, temperature=temperature, seed=seed,
                         rung=rung, fresh=fresh, canvas=canvas, reason=reason)
+
+    def _after_cut(self, s: Sampling, persona: Persona) -> Sampling:
+        """The attempt after a reply was CUT: a new seed, and warmer.
+
+        The ladder keeps attempt 2 at attempt 1's sampling on purpose — a
+        repair wants the model at its most deterministic. But a reply cut
+        for looping was the model at its most deterministic: llama.cpp with
+        the same seed and temperature writes the same loop token for token,
+        so attempt 2 would be cut at the same place. A loop is the classic
+        failure of near-greedy sampling, and the cure is the next rung up
+        and a seed no rung uses. A canvas model keeps its own temperature,
+        so for it this is a new seed, and the record says so.
+        """
+        rungs = tuple(self.config.temperatures) or (persona.temperature,)
+        warmer = [t for t in rungs if t > s.temperature + 1e-9]
+        temperature = (warmer[0] if warmer
+                       else round(min(1.0, s.temperature + 0.2), 2))
+        seed_base = self.config.seed if self.config.seed is not None else 0
+        seed = seed_base + 7919 * s.attempt + 104729
+        how = ("a new seed" if s.canvas else
+               f"temperature {temperature:.2f}, seed {seed}")
+        return dataclasses.replace(
+            s, temperature=temperature, seed=seed, rung=max(s.rung, 1),
+            reason=f"the last reply was cut while it was being written — "
+                   f"{how}")
 
     # ------------------------------------------------------------------
     # the judge (adjudicate.py)
@@ -662,7 +692,11 @@ class Loop:
 
                 diag_text = ""
                 autofixed: tuple[str, ...] = ()
-                last = attempts[-1] if attempts else None
+                # A CUT attempt is skipped here: it hands on the inputs of
+                # the attempt before it, so the next one is the cut one
+                # done again rather than a repair of nothing.
+                last = next((a for a in reversed(attempts)
+                             if a.finish_reason != "cut"), None)
                 if last is not None and last.diagnostics:
                     carried = last.diagnostics
                 elif last is None or not last.code_sha:
@@ -735,6 +769,32 @@ class Loop:
 
                 if completion.finish_reason == "cancelled":
                     raise Cancelled(f"generating {task.path}")
+
+                # A REPLY CUT WHILE IT WAS BEING WRITTEN (2026-10-24) — by
+                # the operator from ATK's Live tab, or by the host because
+                # it was repeating itself word for word. Not a file: what
+                # came before the cut is in the build log, never on disk.
+                # An attempt, recorded as one (it cost model time), that
+                # hands on the inputs it was given (`last` skips it) — the
+                # next attempt is the one that was cut, done again — and
+                # the next attempt samples differently (`_after_cut`).
+                if completion.finish_reason == "cut":
+                    self._refusal = None
+                    note = (completion.error or "the reply was cut while it "
+                            "was being written")
+                    attempts.append(AttemptRecord(
+                        n=n, finish_reason="cut", note=f"cut: {note}"))
+                    self._journal_attempt(task, n, completion, sent,
+                                          {"ok": False, "cut": True,
+                                           "note": note})
+                    self._cut[task.path] = n
+                    self._emit("warning",
+                               f"{task.path}: attempt {n} was cut — {note}. "
+                               f"The next attempt starts again with a new "
+                               f"seed and a higher temperature.",
+                               {"task": task.path, "attempt": n,
+                                "cut": True})
+                    continue
 
                 # A narrowed reply that could not be placed, for a file no
                 # other path can take: an attempt, refused, with the reason
@@ -1368,6 +1428,8 @@ class Loop:
         # print what was used (the 2026-10-16 Devstral log printed the
         # config's 0.15 on every attempt while the host varied it unseen).
         sampling = self.sampling_for(attempt, persona, caps)
+        if attempt > 1 and self._cut.get(task.path) == attempt - 1:
+            sampling = self._after_cut(sampling, persona)
         self._sampling[task.path] = sampling
         fresh = bool(repair and sampling.fresh)
         arch = ""
@@ -1685,6 +1747,9 @@ class Loop:
 
         text, completion, continued, messages = self._complete_text(
             messages, caps, task, sampling, attempt, persona, lang)
+        if completion.finish_reason == "cut":
+            # nothing to extract: `run_task` records the cut attempt
+            return "", completion, continued, messages
 
         # -- commentary detector at the CONSUMING call site (M36) -------
         if detect_commentary(text, lang):
@@ -1742,8 +1807,10 @@ class Loop:
         text = strip_think(completion.text)       # D13, M37 — before ANY use
 
         # -- the text-marker fallback, for models without tools (M31) ---
+        # Never after a cut: lookups found in a looping reply are the loop.
         if (not tools and self.codemap is not None
-                and not caps.supports_tools):
+                and not caps.supports_tools
+                and completion.finish_reason != "cut"):
             answer = self.codemap.answer_text_lookups(text)
             if answer:
                 messages = list(messages) + [
@@ -1996,7 +2063,7 @@ class Loop:
             messages, caps, task, sampling, attempt, persona, lang)
         if completion.finish_reason == "cancelled":
             return "", completion, continued, messages
-        if completion.finish_reason == "error" or not text.strip():
+        if completion.finish_reason in ("error", "cut") or not text.strip():
             return "", completion, continued, messages
         applied = symedit.apply(code, text, targets=targets)
         if not applied.ok and detect_commentary(text, lang):
@@ -2235,7 +2302,8 @@ class Loop:
         self._journal_call(task, attempt, completion, messages, "diagnosis")
         said = strip_think(completion.text or "").strip()
         said = re.sub(r"```.*?```", "", said, flags=re.S).strip()
-        if completion.finish_reason in ("error", "cancelled") or not said:
+        if completion.finish_reason in ("error", "cancelled", "cut") \
+                or not said:
             return ""
         said = said[:1200]
         self._diagnosis[task.path] = said
@@ -2596,7 +2664,7 @@ class Loop:
                            "planning call failed; bodies are written "
                            "without them", details=[f"error: {exc}"])
             return ""
-        if completion.finish_reason in ("error", "cancelled"):
+        if completion.finish_reason in ("error", "cancelled", "cut"):
             self._readable(task, attempt, f"no implementation notes — the "
                            f"planning call ended "
                            f"({completion.finish_reason}); bodies are "
@@ -3046,6 +3114,9 @@ class Loop:
         tried = []
         for a in attempts:
             bits = [f"attempt {a.n}"]
+            if a.finish_reason == "cut":
+                tried.append(f"attempt {a.n} — {a.note}")
+                continue
             if a.continued:
                 bits.append("continued after truncation")
             if a.autofixes:
@@ -3055,7 +3126,8 @@ class Loop:
                 bits.append(f"{sum(1 for d in a.diagnostics if d.is_error)} "
                             f"error(s)")
             tried.append(" — ".join(bits))
-        last = attempts[-1]
+        last = next((a for a in reversed(attempts)
+                     if a.finish_reason != "cut"), attempts[-1])
         detail = ""
         if last.diagnostics:
             detail = (f" The last real error was: "
@@ -3076,6 +3148,7 @@ class Loop:
         model fix, which no later prompt could learn anything from, and
         nothing read the table back anyway.
         """
+        attempts = [a for a in attempts if a.finish_reason != "cut"]
         if self.codemap is None or len(attempts) < 2:
             return
         last, previous = attempts[-1], attempts[-2]
@@ -3367,7 +3440,9 @@ def _is_truncated(completion: Completion, text: str, lang: str = "") -> bool:
     """
     if completion.finish_reason == "length":
         return True
-    if not text.strip():
+    if completion.finish_reason == "cut" or not text.strip():
+        # A cut reply ends where the host stopped it, not where the model
+        # ran out of room: continuing it would ask for more of the loop.
         return False
     body = _unfenced(text)
     if lang == "python":

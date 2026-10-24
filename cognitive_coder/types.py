@@ -42,7 +42,15 @@ ROLES = ("system", "user", "assistant", "tool")
 
 #: Valid `Completion.finish_reason` values. "length" is how truncation is
 #: DETECTED rather than inferred (D1, M32).
-FINISH_REASONS = ("stop", "length", "tool_calls", "cancelled", "error")
+#: ``cut`` (2026-10-24): the host stopped THIS reply while it was being
+#: written — because it was repeating itself word for word, or because the
+#: operator pressed "Cut this reply" on the Live tab. Unlike ``cancelled``
+#: the build goes on: the attempt is recorded and the next one samples
+#: differently. ``text`` is what came before the cut (one copy of a loop,
+#: never the copies); ``error`` says why. No provider of the engine's own
+#: returns it; a host that streams may.
+FINISH_REASONS = ("stop", "length", "tool_calls", "cancelled", "error",
+                  "cut")
 
 #: The closed set of `EventPort.event` kinds (§5.4, M19). New kinds are a
 #: minor version; RENAMED kinds are a major one, because hosts render them.
@@ -179,6 +187,9 @@ class Completion:
     #: returned an error". Deliberately NOT carried in ``text``: the loop
     #: reads any non-empty text as the generated file, and would verify and
     #: "repair" the sentence as code. Defaulted, so this is a minor version.
+    #: When ``finish_reason == "cut"``: why the host cut the reply, in the
+    #: same register ("it was repeating itself: the same 3 lines, 12 times
+    #: over").
     error: str = ""
 
     def __post_init__(self) -> None:
