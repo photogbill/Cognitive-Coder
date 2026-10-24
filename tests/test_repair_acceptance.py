@@ -227,5 +227,5 @@ if __name__ == "__main__":
     fix = [o for o in session.outcomes if o.path == "src/calc.py"][-1]
     assert not fix.ok and len(fix.attempts) == 1
     assert "the model returned the same code" in fix.stopped_because
-    assert "certain the test itself is wrong" in fix.stopped_because
+    assert "the test is wrong in every failure it names" in fix.stopped_because
     assert len(host.llm.prompts) == 4

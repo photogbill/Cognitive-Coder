@@ -80,6 +80,8 @@ from . import (
 )
 from . import canvas as cv
 from . import diagnostics as dx
+from . import repetition as _repetition
+from . import suspects as suspects_mod
 from .context import CHARS_PER_TOKEN, Piece, build_context
 from .errors import Cancelled
 from .interfaces import broken_contract as _broken_contract
@@ -374,6 +376,14 @@ class Loop:
     #: (`_after_cut`), because the ladder's next rung is the same seed and
     #: temperature, and those write the same loop again word for word.
     _cut: dict = field(default_factory=dict, repr=False)
+    #: {path: the attempt cut for GOING IN CIRCLES} — the next attempt is
+    #: told so, and told to decide once (repetition.CIRCLES_NUDGE).
+    _dithered: dict = field(default_factory=dict, repr=False)
+    #: {path: the SUSPECT lines of the latest reply} (suspects.py), and
+    #: {path: {(what, name): Suspect}} — every one named for that file so
+    #: far, which later attempts are shown so they do not argue it again.
+    _suspects_now: dict = field(default_factory=dict, repr=False)
+    _suspects_seen: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     # the escalation ladder
@@ -788,6 +798,8 @@ class Loop:
                                           {"ok": False, "cut": True,
                                            "note": note})
                     self._cut[task.path] = n
+                    if _repetition.CIRCLES_REASON in note:
+                        self._dithered[task.path] = n
                     self._emit("warning",
                                f"{task.path}: attempt {n} was cut — {note}. "
                                f"The next attempt starts again with a new "
@@ -863,16 +875,24 @@ class Loop:
                     # unchanged file can mean. Ask the judge; if it agrees
                     # with a quote from the request, the session repairs
                     # the TEST next instead of giving up here.
+                    named = tuple(self._suspects_now.get(task.path) or ())
+                    if named:
+                        stopped += (f". It named as wrong: "
+                                    f"{suspects_mod.words(named)}")
                     if seed and task.test_path and not self._caller \
                             and accept is None:
                         verdict, _asked = self._adjudicate(
                             Task(id=task.id, path=task.test_path,
                                  purpose="", persona="tester",
-                                 lang=lang), task.path, tuple(seed),
+                                 lang=lang), task.path,
+                            tuple(seed) + _suspect_diagnostics(
+                                task.test_path, named),
                             request, n, again=True)
                         if verdict is not None and verdict.test_is_wrong:
                             self.test_wrong[task.test_path] = (
-                                task.path, verdict, tuple(seed))
+                                task.path, verdict, tuple(seed)
+                                + _suspect_diagnostics(task.test_path,
+                                                       named))
                             stopped = (f"the model returned the file "
                                        f"unchanged, and the judge agrees "
                                        f"the test is wrong — "
@@ -1091,6 +1111,22 @@ class Loop:
                         self.blamed[task.path] = (covers, diags)
                         self._emit("warning", f"{task.path}: {stopped}",
                                    {"task": task.path, "covers": covers})
+                        break
+
+                # -- the only failures left are the ones it named wrong ----
+                # (2026-10-24, suspects.py). Another repair of THIS file
+                # cannot help: it has fixed what it believes is its to fix.
+                # The judge hears the model's reasons; if it agrees,
+                # quoting the request, the TEST is repaired next. If not,
+                # the build stops here and names each one and why.
+                named = tuple(self._suspects_now.get(task.path) or ())
+                if (named and seed and task.test_path and not is_test
+                        and not self._caller and accept is None):
+                    failing = suspects_mod.failing_tests(
+                        p.output for p in result.phases)
+                    if suspects_mod.covers(named, failing):
+                        stopped = self._suspects_remain(
+                            task, n, named, failing, diags, request, lang)
                         break
 
                 # -- the error is in ANOTHER file of this project ----------
@@ -1437,6 +1473,26 @@ class Loop:
         #: The same tail blocks as (label, text), so they can be put back
         #: together under a budget when the whole prompt would not fit.
         tail_pieces: list[tuple[str, str]] = []
+        # The latest reply's SUSPECT lines are this attempt's to give.
+        self._suspects_now[task.path] = ()
+        # AFTER A CUT FOR GOING IN CIRCLES (2026-10-24): say so, and say
+        # what deciding looks like. The cut alone only changes the sampling.
+        if attempt > 1 and self._dithered.get(task.path) == attempt - 1:
+            tail_extra.append(f"[YOUR LAST REPLY WAS CUT]\n"
+                              f"{_repetition.CIRCLES_NUDGE}")
+            tail_pieces.append(("YOUR LAST REPLY WAS CUT",
+                                _repetition.CIRCLES_NUDGE))
+        named = list((self._suspects_seen.get(task.path) or {}).values())
+        if named and attempt > 1:
+            said = ("You named these as wrong in an earlier reply:\n"
+                    + "\n".join(f"SUSPECT {s.what.upper()}: {s.line()}"
+                                for s in named)
+                    + "\nDo not argue them again. Leave them as you judged "
+                      "them, fix everything else, and list them again at "
+                      "the top of your reply if you still believe them "
+                      "wrong.")
+            tail_extra.append(f"[WHAT YOU ALREADY DECIDED]\n{said}")
+            tail_pieces.append(("WHAT YOU ALREADY DECIDED", said))
         interfaces = examples = staleness = ""
         if self.codemap is not None:
             arch = self.codemap.prefix_block(task.path)
@@ -1575,22 +1631,22 @@ class Loop:
             caller_source = self._read(self._caller) if self._caller else ""
             if test_source:
                 # The test is the specification this repair answers to. The
-                # escape hatch matters: a model that believes the test is
-                # wrong should say so by changing nothing, which the
-                # stagnation check turns into an honest stop, rather than
-                # bend the code into agreement with a mistake.
+                # escape hatch matters, and since 2026-10-24 it is per
+                # ASSERTION: fix the file for every test that is right, and
+                # name each assertion believed wrong on a SUSPECT TEST line
+                # (suspects.py). The all-or-nothing hatch it replaces —
+                # "if you are certain the test itself is wrong, return this
+                # file unchanged" — left a file with real bugs AND a wrong
+                # assertion nowhere to stand, and the model went back and
+                # forth for 17,620 characters. Unchanged is still the
+                # answer when EVERY failure is a suspect; the stagnation
+                # check turns that into an honest stop.
                 tail_extra.append(
                     f"[THE TEST THIS FILE MUST PASS — {task.test_path}]\n"
-                    f"{test_source}\n\n"
-                    f"The test is the specification. Change this file so "
-                    f"the test passes. If you are certain the test itself "
-                    f"is wrong, return this file unchanged.")
+                    f"{test_source}\n\n{TEST_RULE}")
                 tail_pieces.append(
                     (f"THE TEST THIS FILE MUST PASS — {task.test_path}",
-                     f"{test_source}\n\nThe test is the specification. "
-                     f"Change this file so the test passes. If you are "
-                     f"certain the test itself is wrong, return this file "
-                     f"unchanged."))
+                     f"{test_source}\n\n{TEST_RULE}"))
             if caller_source:
                 # A CALLER that ran and died inside this file. The error
                 # under [ERRORS] is located here; the caller is shown so
@@ -1603,9 +1659,7 @@ class Loop:
                         f"the real definitions shown under the error "
                         f"whether this file misuses another module (fix "
                         f"the misuse) or lacks something the caller is "
-                        f"right to expect (add it). If you are certain the "
-                        f"caller itself is wrong, return this file "
-                        f"unchanged.")
+                        f"right to expect (add it). {CALLER_RULE}")
                 tail_extra.append(
                     f"[THE CALLER THAT FAILS INSIDE THIS FILE — "
                     f"{self._caller}]\n{caller_source}\n\n{rule}")
@@ -1856,10 +1910,35 @@ class Loop:
                 model=more.model or completion.model,
                 prompt_ms=more.prompt_ms or completion.prompt_ms)
 
+        # SUSPECT lines (2026-10-24): the assertions the model believes are
+        # wrong, at the top of its reply. Taken out here — before the code
+        # is extracted, by either path — and kept for the loop.
+        if completion.finish_reason != "cut":
+            text, named = suspects_mod.split(text)
+            self._note_suspects(task, attempt, named)
+
         # The prompt that produced the answer: after tool round-trips and
         # the text-lookup fallback, before any continuation (a continuation
         # is derived from this prompt, not a different one).
         return text, completion, continued, list(messages)
+
+    def _note_suspects(self, task: Task, attempt: int,
+                       named: Sequence[Any]) -> None:
+        """Keep, say and log the SUSPECT lines of a reply."""
+        self._suspects_now[task.path] = tuple(named)
+        if not named:
+            return
+        seen = self._suspects_seen.setdefault(task.path, {})
+        for s in named:
+            seen[(s.what, s.key)] = s
+        words = suspects_mod.words(named)
+        self._emit("status",
+                   f"{task.path}: attempt {attempt} names "
+                   f"{len(named)} assertion(s) it believes wrong — {words}",
+                   {"task": task.path, "attempt": attempt,
+                    "suspects": [{"test": s.test, "why": s.why,
+                                  "what": s.what} for s in named]})
+        self._log_line(f"  attempt {attempt} names as wrong: {words}")
 
     # ------------------------------------------------------------------
     # NARROWED EDITS (symedit.py, F5)
@@ -3287,6 +3366,42 @@ class Loop:
         except Exception:                                # noqa: BLE001
             pass          # a log must never fail a build
 
+    def _suspects_remain(self, task: Task, n: int, named: Sequence[Any],
+                         failing: Sequence[str],
+                         diags: Sequence[Diagnostic], request: str,
+                         lang: str) -> str:
+        """The sentence a repair stops with when every test still failing
+        is one the model named as wrong — after the judge has heard it."""
+        mine = [s for s in named if s.key in set(failing)]
+        words = suspects_mod.words(mine or named)
+        sus = _suspect_diagnostics(task.test_path, mine or named)
+        verdict, _asked = self._adjudicate(
+            Task(id=task.id, path=task.test_path, purpose="",
+                 persona="tester", lang=lang), task.path,
+            tuple(diags) + sus, request, n, again=True)
+        if verdict is not None and verdict.test_is_wrong:
+            self.test_wrong[task.test_path] = (task.path, verdict,
+                                               tuple(diags) + sus)
+            stopped = (f"every test still failing is one the model named "
+                       f"as wrong — {words} — and the judge agrees: "
+                       f"{verdict.describe()}. {task.test_path} is "
+                       f"repaired next")
+        else:
+            judged = (f"The judge: {verdict.describe()}" if verdict
+                      is not None else "The judge was not asked")
+            stopped = (f"every test still failing is one the model named "
+                       f"as wrong — {words}. {judged}. Check those "
+                       f"assertions against the request by hand: fix the "
+                       f"test if the model is right, or the module if not")
+        self._emit("warning", f"{task.path}: {stopped}",
+                   {"task": task.path, "attempt": n,
+                    "suspects": [s.test for s in (mine or named)],
+                    "failing": list(failing),
+                    "test_repaired_next": task.test_path
+                    in self.test_wrong})
+        self._log_line(f"  {task.path}: {stopped}")
+        return stopped
+
     def _journal_attempt(self, task: Task, n: int, completion: Completion,
                          sent: Sequence[Message], verify: dict) -> None:
         """One `generate` event, hashing the messages actually SENT (C8).
@@ -3297,6 +3412,11 @@ class Loop:
         """
         if self.journal is None:
             return
+        named = self._suspects_now.get(task.path) or ()
+        if named:
+            verify = dict(verify, suspects=[
+                {"test": s.test, "why": s.why, "what": s.what}
+                for s in named])
         try:
             caps = self.host.llm.capabilities()
             remote = bool(caps.is_remote)
@@ -3819,6 +3939,38 @@ def _pinned_piece(path: str, pinned: str) -> tuple[str, str]:
             f"{pinned}\n\n{rule}")
 
 
+#: The rule a repair against a test is given (2026-10-24): per assertion,
+#: not all or nothing. See the comment where it is used, and suspects.py.
+TEST_RULE = (
+    "The test is the specification. Change this file so that every test "
+    "that is right passes. If a particular assertion is wrong — it "
+    "contradicts its own comment, the request, the other assertions, or "
+    "plain arithmetic — do not bend the code to it: implement what the "
+    "request says, and put one line for each such assertion at the very "
+    "top of your reply, before the code:\n"
+    "SUSPECT TEST: <test name> — <one sentence: why it is wrong>\n"
+    "Decide once; do not argue it back and forth. Return this file "
+    "unchanged only if every failing test is one you list.")
+#: Its twin for a repair against a caller that failed inside this file.
+CALLER_RULE = (
+    "If part of the failure is the caller's own mistake, fix what is this "
+    "file's and put one line at the very top of your reply: SUSPECT "
+    "CALLER: <file:line> — <one sentence: why>. Decide once. Return this "
+    "file unchanged only if the whole failure is the caller's.")
+
+
+def _suspect_diagnostics(test_path: str, named: Sequence[Any]
+                         ) -> tuple[Diagnostic, ...]:
+    """The model's reasons, as diagnostics the judge reads and a test
+    repair is seeded with."""
+    return tuple(Diagnostic(
+        file=test_path, severity="error", code="suspect", tool="suspect",
+        message=(f"{s.test}: the module's author believes this assertion "
+                 f"is wrong — {s.why or 'no reason given'}. Check it against "
+                 f"the request; change it only if the request agrees."))
+        for s in named if getattr(s, "what", "test") == "test")
+
+
 def _unchanged_sentence(path: str, blamer: str, *, by_caller: bool) -> str:
     """Why a repair that returned the file unchanged is NOT a repair."""
     whose = (f"{blamer}'s failure" if blamer else "the failure it was "
@@ -3826,9 +3978,9 @@ def _unchanged_sentence(path: str, blamer: str, *, by_caller: bool) -> str:
     who = "caller" if by_caller else "test"
     return (f"the model returned the same code — {path} is unchanged "
             f"(identical after normalising), so {whose} cannot have gone "
-            f"away. It was told to return the file unchanged only if it is "
-            f"certain the {who} itself is wrong: either it is, or the fix "
-            f"is one the model cannot see. Read the error and fix "
+            f"away. It was told to return the file unchanged only if the "
+            f"{who} is wrong in every failure it names: either it is, or "
+            f"the fix is one the model cannot see. Read the error and fix "
             f"whichever is wrong by hand")
 
 

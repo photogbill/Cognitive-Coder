@@ -229,3 +229,150 @@ def test_a_build_of_cuts_gives_up_saying_so(tmp_path):
     assert not outcome.ok
     assert "repeating itself" in outcome.stopped_because, outcome
     assert [a.finish_reason for a in outcome.attempts] == ["cut", "cut"]
+
+
+# --- going in circles (2026-10-24) ------------------------------------------
+#
+# Bill's Live tab, the same day: a repair against a test that contradicted
+# itself, 17,620 characters of "Wait, … No. … Actually, … I'll stick to the
+# standard …" and never the file. Not one stretch of it repeats word for
+# word. The fixture is that reply as the tab showed it.
+
+DITHER = (ROOT / "tests" / "fixtures" / "dithering_reply.txt").read_text(
+    encoding="utf-8")
+
+
+def _stream(text: str, step: int = 5):
+    """(first watch offset, first loop offset, the last answer)."""
+    w = repetition.Watch()
+    first: dict = {}
+    for k in range(0, len(text), step):
+        w.feed(text[k:k + step])
+        if w.found is not None and w.found.level not in first:
+            first[w.found.level] = (len(w), w.found)
+    return first.get("watch"), first.get("loop"), w.found
+
+
+def test_a_reply_going_in_circles_is_seen_early_and_cut_before_its_end():
+    watch, loop, _last = _stream(DITHER)
+    assert watch is not None and loop is not None
+    at_watch, found = watch
+    assert found.kind == "dithering" and found.dithering
+    assert at_watch <= 6000                      # well before its end
+    at_loop, cut = loop
+    assert at_loop <= 12000 < len(DITHER)        # cut before its end
+    assert cut.looping and cut.keep == cut.end   # nothing to trim
+    assert cut.reversals >= 20 and cut.repeats >= 2
+    assert cut.since_file >= repetition.CIRCLE_CUT_SINCE
+    words = cut.describe()
+    assert words.startswith("going in circles") and "reversals" in words
+    d = cut.to_dict()
+    assert d["kind"] == "dithering" and d["level"] == "loop"
+    assert d["markers"] and d["since_file"] == cut.since_file
+
+
+def test_a_verbatim_loop_is_still_a_verbatim_loop():
+    text = "Here is the fix.\n" + BLOCK * 40
+    found = repetition.find(text)
+    assert found is not None and found.kind == "verbatim" and found.looping
+
+
+def _linear_explanation() -> str:
+    nouns = ["heading", "warp factor", "shield sector", "phaser bank",
+             "torpedo", "energy reserve", "hull", "sensor range", "turn rate",
+             "cooldown"]
+    verbs = ["computes", "returns", "updates", "clamps", "normalises",
+             "advances", "checks", "records"]
+    out = ["Here is how the module fits together, function by function.\n"]
+    for i in range(60):
+        a, b, c = nouns[i % 10], verbs[i % 8], nouns[(i * 3) % 10]
+        out.append(f"{i + 1}. `step_{i}` {b} the {a} from the {c} once per "
+                   f"sub-tick, using dt={0.05 * (i % 4 + 1):.2f}. It is called "
+                   f"from `advance_{i % 7}` after the {nouns[(i + 4) % 10]} is "
+                   f"known, so the order of the calls matters here. The value "
+                   f"it produces is stored as `{a.replace(' ', '_')}_{i}`.\n")
+        if i == 20:
+            out.append("Actually, the shield regen runs before the damage "
+                       "step, which is why the order above has it first.\n")
+        if i == 41:
+            out.append("Wait, one detail: the torpedo list is iterated over "
+                       "a copy, so removal during the loop is safe.\n")
+    return "".join(out)
+
+
+def _test_by_test_check() -> str:
+    return "".join(
+        f"   `test_case_{i}`:\n   input {i}.0 and {i * 2}.5 with dt 0.1 gives "
+        f"{i * 0.37:.3f} after one step, which matches the expected "
+        f"{i * 0.37:.3f}. Correct.\n\n" for i in range(70))
+
+
+def _faq_of_noes() -> str:
+    return "".join(
+        f"Does feature {i} accept negative inputs in mode {i % 5}? No. It "
+        f"rejects them with a ValueError naming argument {i}, because the "
+        f"integrator for case {i} assumes a non-negative step.\n"
+        for i in range(40))
+
+
+def _careful_reasoning() -> str:
+    out = []
+    for i in range(45):
+        out.append(f"For assertion {i}, the expected value {i * 1.5:.1f} "
+                   f"follows from multiplying the rate {i % 9 + 1} by the "
+                   f"interval and adding the offset {i % 4}; the code computes "
+                   f"the interval before the clamp, so case {i} is right. ")
+        if i in (12, 30):
+            out.append("Wait, that holds only when the clamp is inactive, "
+                       "and here it is, because the input is below the "
+                       "limit. ")
+        if i == 22:
+            out.append("Hmm, the second branch also needs the offset, and "
+                       "it adds it two lines later. ")
+        out.append("\n")
+    return "".join(out)
+
+
+def _code_full_of_noes() -> str:
+    rows = "\n".join(f'    ("question {i}", "No.", "No, not in mode {i}."),'
+                     f'  # No. {i}: wait for the operator' for i in range(220))
+    return ("Here is the file.\n\n```python\nANSWERS = [\n" + rows
+            + "\n]\n\n\ndef answer(i):\n    return ANSWERS[i][1]\n```\n")
+
+
+def test_careful_reasoning_and_data_never_go_amber():
+    for name, text in (("linear", _linear_explanation()),
+                       ("check", _test_by_test_check()),
+                       ("faq", _faq_of_noes()),
+                       ("careful", _careful_reasoning()),
+                       ("code", _code_full_of_noes())):
+        watch, loop, _ = _stream(text, step=7)
+        assert watch is None and loop is None, (name, watch)
+        assert len(text) > repetition.CIRCLE_WATCH_SINCE, name
+
+
+def test_writing_the_file_is_progress_and_clears_the_amber():
+    head = DITHER[:7000]
+    w = repetition.Watch()
+    w.feed(head)
+    assert w.found is not None and w.found.dithering
+    body = "".join(f"    x_{i} = shortest_angle_diff({i}.0, -90.0)\n"
+                   for i in range(40))
+    w.feed("\n\n```python\ndef build():\n" + body)
+    w.feed(" " * repetition.CIRCLE_EVERY)          # the next reading
+    assert w.found is None                         # a file is being written
+    assert repetition.circling(head + "\n```python\n" + body) is None
+
+
+def test_circles_can_be_switched_off():
+    assert repetition.find(DITHER[:11000], circles=False) is None
+    assert repetition.find(DITHER[:11000]).dithering
+    w = repetition.Watch(circles=False)
+    w.feed(DITHER)
+    assert w.found is None
+
+
+def test_the_nudge_and_the_reason_are_the_engines_words():
+    assert "going in circles" in repetition.CIRCLES_REASON
+    assert "SUSPECT TEST" in repetition.CIRCLES_NUDGE
+    assert "Decide once" in repetition.CIRCLES_NUDGE

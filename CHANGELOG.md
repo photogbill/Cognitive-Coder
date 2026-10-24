@@ -10,6 +10,50 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — a reply going in circles; a wrong assertion named, not obeyed (2026-10-24)
+
+Bill, on ATK's Live tab: "i think something isn't working right, and the
+new live screen let me see." A repair of `src/physics.py` against a test
+the engine had written itself — two of its assertions wrong (90.0 asserted
+under a comment saying -90; a torpedo expected to hit after overshooting),
+the rest right with real bugs behind them — went back and forth for 17,620
+characters ("Wait … No … Actually … I'll stick to the standard …") and
+never wrote the file. Two causes, two fixes.
+
+- **Per-assertion escape hatch.** The repair prompt's rule was all or
+  nothing: "if you are certain the test itself is wrong, return this file
+  unchanged". Now (`loop.TEST_RULE`, and `CALLER_RULE` for a caller): fix
+  the file for every test that is right; name each assertion believed
+  wrong on a line of its own at the top — `SUSPECT TEST: <name> — <why>`;
+  decide once; unchanged only if every failure is listed.
+  `suspects.py` reads the lines out of the reply before any code is
+  extracted (by either path), and they go to the journal with the attempt,
+  to the build log and to the host as a `status` event. When every test
+  still failing is one the model named, the module is not repaired again:
+  the judge (adjudicate.py) is asked with the model's reasons, and if it
+  agrees, quoting the request, the TEST is repaired next, seeded with
+  those reasons; otherwise the build stops naming each suspect and why.
+  A later attempt is shown what it already decided, so it does not argue
+  it again. The "returned the file unchanged" stop sentence is reworded to
+  match.
+- **Going in circles** (`repetition.circling`, and `find`/`Watch` by
+  default, as ``kind="dithering"``). Over the last 6,000 characters of
+  PROSE (fenced code set aside): reversal markers by kind ("Wait", "No.",
+  "Actually", "Hmm", "Let me re-read", "I'll stick to", "on second
+  thought" …), sentences said again, and characters since a fenced block
+  long enough to be the file. Amber from 3,000 characters without a file
+  with 8 reversals of 2+ kinds at 2 per thousand; a cut needs 10,000
+  without a file, 20 reversals of 3+ kinds at 3 per thousand and 2
+  repeated sentences. On Bill's reply: amber at 5,200, cut at 10,400 of
+  17,620. A FAQ of "No." answers, a linear walk-through, a test-by-test
+  check, careful reasoning that corrects itself twice and a file full of
+  "No." strings never reach amber. A host cuts it like a loop
+  (`finish_reason="cut"`, next rung); when the cut's reason carries
+  `CIRCLES_REASON`, the next attempt is told `CIRCLES_NUDGE` — decide
+  once, list the suspects, write the file. `Watch` reads for doubt every
+  `CIRCLE_EVERY` (1,024) characters and pairs fences only in the last
+  40,000, so a long stream costs no more than it did.
+
 ### Added — a reply stuck repeating itself, found while it streams; `cut` (2026-10-24)
 
 Bill: "Is it possible to add another tab to cognitive coder that shows any

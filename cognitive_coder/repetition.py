@@ -67,8 +67,9 @@ of `"No."` strings is data, not doubt):
 `CIRCLE_WATCH_DENSITY` per thousand; `loop` (a host may cut) needs all of:
 `CIRCLE_CUT_SINCE` characters without a file, `CIRCLE_CUT_REVERSALS`
 reversals of three kinds or more at `CIRCLE_CUT_DENSITY` per thousand, and
-`CIRCLE_CUT_REPEATS` sentences said again. On Bill's reply that is amber
-at 4,864 characters and a cut at 10,240 of its 17,620; careful reasoning
+`CIRCLE_CUT_REPEATS` sentences said again. Streamed through a `Watch`
+(read for doubt every `CIRCLE_EVERY` characters), Bill's reply goes amber
+at 5,200 characters and is cut at 10,400 of its 17,620; careful reasoning
 that corrects itself twice in ten thousand characters, a linear
 walk-through, a test-by-test check and a FAQ of "No." answers never reach
 amber (tests/test_repetition.py). The result is a `Repetition` of
@@ -184,7 +185,8 @@ class Repetition:
             said = ", ".join(self.markers[:3]) or "wait, no, actually"
             return (f"going in circles — {self.reversals} reversals "
                     f"({said} …)"
-                    + (f" and {self.repeats} sentences said again"
+                    + (f" and {self.repeats} sentence"
+                       f"{'' if self.repeats == 1 else 's'} said again"
                        if self.repeats else "")
                     + f", {self.since_file:,} characters without the file")
         times = int(self.copies)
@@ -318,15 +320,19 @@ _ANYWHERE = (
 )
 
 
-def _fences(text: str) -> list[tuple[int, int, int, bool]]:
+def _fences(text: str, ticks_before: int | None = None
+            ) -> list[tuple[int, int, int, bool]]:
     """(start, end, lines, still open) for each fenced block in the last
     `CIRCLE_SCAN` characters, paired in order; the last one may still be
     being written. A block that began before the scan is taken as starting
     where the scan does — a stream of megabytes is never re-read whole."""
     lo = max(0, len(text) - CIRCLE_SCAN)
     pos = [m.start() for m in _FENCE_LINE.finditer(text, lo)]
-    if lo and text.count("```", 0, lo) % 2:
-        pos.insert(0, lo)
+    if lo:
+        ticks = text.count("```", 0, lo) if ticks_before is None \
+            else ticks_before
+        if ticks % 2:
+            pos.insert(0, lo)
     out = []
     for i in range(0, len(pos), 2):
         s = pos[i]
@@ -340,14 +346,19 @@ def _fences(text: str) -> list[tuple[int, int, int, bool]]:
     return out
 
 
-def circling(text: str, *, window: int = CIRCLE_WINDOW) -> Repetition | None:
+def circling(text: str, *, window: int = CIRCLE_WINDOW,
+             ticks_before: int | None = None) -> Repetition | None:
     """A reply going in circles — deciding and undeciding, and no file —
     or None. See the module docstring for the three signals and why each
-    threshold is where it is."""
+    threshold is where it is.
+
+    ``ticks_before``: how many ``` occur before the last `CIRCLE_SCAN`
+    characters, when the caller keeps count (a `Watch` does), so a long
+    stream is not counted from the start at every check."""
     n = len(text or "")
     if n < CIRCLE_WATCH_SINCE:
         return None
-    blocks = _fences(text)
+    blocks = _fences(text, ticks_before)
     since = n
     for s, e, lines, still_open in blocks:
         if lines >= FILE_LINES:
@@ -466,6 +477,10 @@ class Watch:
         self._circle_every = max(self.every, int(circle_every))
         self._circled = 0
         self._circle: Repetition | None = None
+        #: ``` counted in the text before the circle scan, kept up to date
+        #: a stretch at a time
+        self._ticks = 0
+        self._ticked = 0
 
     def __len__(self) -> int:
         return self._len
@@ -496,7 +511,14 @@ class Watch:
         if self._circles:
             if self._len - self._circled >= self._circle_every:
                 self._circled = self._len
-                self._circle = circling(text)
+                lo = max(0, self._len - CIRCLE_SCAN)
+                if lo > self._ticked:
+                    # from two back: a ``` split by the last boundary was
+                    # not whole then, and is counted now
+                    self._ticks += text.count("```", max(0, self._ticked - 2),
+                                              lo)
+                    self._ticked = lo
+                self._circle = circling(text, ticks_before=self._ticks)
             if found is None:
                 found = self._circle
         self.found = found

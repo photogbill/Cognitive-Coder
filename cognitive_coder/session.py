@@ -1011,8 +1011,12 @@ class Session:
         self.log.event(f"REPAIR {test.path}",
                        f"against the request, not the module — the judge: "
                        f"{verdict.describe()}")
+        # the module's author's reasons (SUSPECT TEST lines, 2026-10-24)
+        # travel with the judge's: each names one assertion and why
+        reasons = tuple(d for d in failing if d.code == "suspect")
         outcome = self.loop.run_task(fix, request=self.plan.request,
-                                     covers=module.path, seed=(judged,),
+                                     covers=module.path,
+                                     seed=(judged, *reasons),
                                      planned=self._planned_paths(test))
         self._record(fix, outcome, label="REPAIRED" if outcome.ok
                      else "NOT REPAIRED")
