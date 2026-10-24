@@ -169,7 +169,20 @@ class Cancelled(CognitiveCoderError):
     not a hope of the catcher.
     """
 
-    def __init__(self, where: str = "") -> None:
+    def __init__(self, where: str = "", *, after: str = "") -> None:
+        #: The file a graceful stop finished first (`Session.stop_after_current`),
+        #: or "". Kept on the exception so the journal can record it as data
+        #: rather than a host having to parse it back out of the sentence.
+        self.after = after
+        if after:
+            # Nothing was cut short, so there is nothing to roll back — and
+            # saying "rolled back" after a clean stop would make an operator
+            # go looking for damage that does not exist.
+            super().__init__(
+                f"Stopped at your request after {after} was finished, as "
+                f"asked. Work already verified has been kept; Continue picks "
+                f"up from the next file.")
+            return
         super().__init__(
             f"Stopped at your request{f' during {where}' if where else ''}. "
             f"Work already verified has been kept; anything half-applied was "

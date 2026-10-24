@@ -57,10 +57,14 @@ MAX_TEXT_LOOKUPS = 3          # the fallback's hard cap (M31)
 #: `context.py` extends it rather than keeping copies: it had two of its
 #: own, neither with `.cc_state/` — where the scratch copies autofix works
 #: on and the compiled test harnesses now live — so a project's own build
-#: debris would have been offered to the model as source.
+#: debris would have been offered to the model as source. `.cc_tabs/` is
+#: where a UI keeps its chat tabs' conversations per project (ATK,
+#: 2026-10-23) — a transcript is not source, and with remote mode on it
+#: would have been outbound context.
 SKIP_DIRS = (".git", "__pycache__", "node_modules", ".venv", "venv",
              "target", "build", "dist", ".cc_snapshots", ".atk_snapshots",
-             ".cc_journal", ".cc_state", ".ccoder", ".python", ".tools")
+             ".cc_journal", ".cc_state", ".cc_tabs", ".ccoder", ".python",
+             ".tools")
 
 #: `read_slice` returns at most this much, whatever it is asked for. One
 #: call returning 400 KB (100 long lines) was observed; that is a context

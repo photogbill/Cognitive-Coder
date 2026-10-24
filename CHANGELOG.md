@@ -10,6 +10,53 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — Continue: a stopped build picked up where it left off (2026-10-23)
+
+Bill: "What if an operator stops the coding, but wants to go back to where
+he left off?" `Session.resume` existed (§6.13) but was not something an
+operator could lean on — it rebuilt no task board, wrote no build-log
+header, forgot the pinned constraints, the spec vectors, the hybrid phases
+and the test baseline, and trusted the journal over the disk. Now it is the
+engine half of a Continue button.
+
+- `resumable.py` — what a project's journal says about every build in it,
+  as plain data a UI can show without running anything: how it ended
+  (`stopped` / `budget` / `error` / `crashed` / `finished` / `abandoned` /
+  `preview` / `empty`, judged on the LATEST run so a continued build is not
+  still "stopped"), parts done and left, last file, model, a title from the
+  request, and one sentence in Guided or Engineer register. `scan(root)`
+  finds the unfinished builds under a projects folder read-only;
+  `abandon()` sets one aside (journal event `abandoned`, files untouched).
+- `Session.resume` restores everything a run had: the baseline
+  (`known_failing`), the language, constraints, spec vectors, hybrid
+  phases; emits a `plan` event (`continued: true`, per-task `verified`) so
+  the board shows green work green; writes `SESSION … — CONTINUED` into
+  `BUILD_LOG.txt`; journals `continue`.
+- **Re-verify before writing anything.** `session_end` now records a hash
+  of every plan file. On Continue, if nothing changed and the last run
+  ended cleanly, nothing is re-run (`reverify` journalled `skipped`);
+  otherwise every done file and every edited pending file is checked
+  again. A done file that still passes is kept; a hand fix to a pending
+  file that passes is KEPT, not overwritten; a file broken during the
+  pause goes back to pending and is repaired from what is there. A crash
+  (no `session_end`) is treated as "unknown — check everything".
+  `SessionConfig.reverify_on_continue` (default on).
+- `resume_state` is last-verdict-wins: a file that failed and was then
+  fixed is done, and one that was done and failed a re-check is not —
+  the old append-only reading kept both.
+- **The graceful stop.** `Session.stop_after_current()` — thread-safe like
+  `cancel()` — finishes and checks the part being written, then stops
+  before the next one: nothing in progress is thrown away or rolled back.
+  `Cancelled(after=path)`; the `cancel` journal event and the status
+  carry `after` and `graceful`.
+- CLI: `ccoder resume` lists each build with how it ended and
+  "← can be continued"; `ccoder resume --last` continues the newest
+  unfinished build; `ccoder resume --discard ID` sets one aside.
+- `.cc_tabs/` — where ATK now keeps each chat tab's conversation per
+  project — joins `SKIP_DIRS` and `scope.SKIP`: a transcript is never
+  indexed, scoped or offered to the model as source.
+- `tests/test_continue.py` (25) and 4 CLI tests: 1520 passed, 13 skipped.
+
 ### Added — the four tabs built, and a grammar-backed structured ask (2026-10-22)
 
 Bill asked to finish the tabs ("the most bang for buck per reinstall") and

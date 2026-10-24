@@ -33,6 +33,7 @@ dist/
 # Cognitive Coder's own working directories, when the tool is run on itself
 .cc_journal/
 .cc_snapshots/
+.cc_tabs/
 
 # Editor and OS
 .vscode/

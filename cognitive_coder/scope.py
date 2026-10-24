@@ -7,7 +7,7 @@ from typing import Any
 
 #: Never part of a scope: the engine's own state, environments, caches.
 SKIP = (".venv/", "venv/", ".cc_state/", ".cc_journal/", ".cc_snapshots/",
-        "__pycache__/", ".git/", "node_modules/", "site-packages/",
+        ".cc_tabs/", "__pycache__/", ".git/", "node_modules/", "site-packages/",
         ".mypy_cache/", ".pytest_cache/", ".ruff_cache/")
 SOURCE_SUFFIXES = (".py",)
 

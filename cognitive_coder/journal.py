@@ -323,7 +323,8 @@ class SessionLog:
                 self.line(cut.strip("\n"))
 
     # -- the shapes the engine actually produces --------------------------
-    def start(self, request: str, model: str, config: dict) -> None:
+    def start(self, request: str, model: str, config: dict, *,
+              continued: str = "") -> None:
         #: APPENDED, NOT REPLACED. Re-running a build in the same folder adds
         #: a session rather than erasing the last one — and comparing this
         #: run against the previous one is most of what the file is for.
@@ -346,7 +347,14 @@ class SessionLog:
                           "provenance record")
                 self.line("  .cc_snapshots/     every version of every "
                           "file")
-            self.rule(f"SESSION {self.session_id}")
+            #: A CONTINUED session keeps its id — it is the same build, and
+            #: the journal is one file — so without the word a reader saw the
+            #: same SESSION header twice and could not tell a restart from a
+            #: duplicate. `continued` is the sentence saying where it left off.
+            self.rule(f"SESSION {self.session_id}"
+                      + (" — CONTINUED" if continued else ""))
+            if continued:
+                self.line(f"continued {continued}")
             self.line(f"started   {time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.line(f"model     {model or '(none reported)'}")
             self.line("config    " + ", ".join(
@@ -776,14 +784,21 @@ def resume_state(fs: Any, session_id: str,
     rows = list(read_jsonl(fs, f"{directory}/{session_id}.jsonl"))
     done: list[str] = []
     failed: list[str] = []
+    #: Done files whose LAST verdict also said tests ran and passed — the
+    #: difference between "verified" (green) and "built, nothing proved it"
+    #: (grey) on a board that picks a build up again.
+    verified: list[str] = []
     attempts: dict[str, int] = {}
     plan: dict | None = None
     request = ""
+    lang = ""
     for row in rows:
         event = row.get("event")
         task = row.get("task") or ""
         if event == "session_start":
-            request = (row.get("data") or {}).get("request", "") or request
+            data = row.get("data") or {}
+            request = data.get("request", "") or request
+            lang = str((data.get("config") or {}).get("lang") or "") or lang
         elif event == "plan":
             data = row.get("data") or {}
             # A `plan` event is written twice for different reasons: once by
@@ -801,15 +816,34 @@ def resume_state(fs: Any, session_id: str,
             attempts[task] = max(attempts.get(task, 0),
                                  int(row.get("attempt", 1)))
         elif event == "verify" and task:
+            # THE LAST VERDICT WINS. This used to be append-only — once
+            # "done", always done — so a module that passed its own check
+            # and was then blamed by its test, repaired, and still failed
+            # came back from a resume as finished, and Continue would have
+            # skipped exactly the file that needed the work. A verdict is
+            # about the file as it stood when it was given; the latest one
+            # is the one about the file as it stands.
             verdict = (row.get("verify") or {})
             if verdict.get("ok") or verdict.get("test") == "ok":
+                if task in failed:
+                    failed.remove(task)
                 if task not in done:
                     done.append(task)
-            elif task not in failed:
-                failed.append(task)
+                if verdict.get("verified") and task not in verified:
+                    verified.append(task)
+                elif verdict.get("verified") is False and task in verified:
+                    verified.remove(task)
+            else:
+                if task in done:
+                    done.remove(task)
+                if task in verified:
+                    verified.remove(task)
+                if task not in failed:
+                    failed.append(task)
     return {"session": session_id, "request": request, "plan": plan,
             "done": done, "failed": [t for t in failed if t not in done],
-            "attempts": attempts, "events": len(rows),
+            "verified": [t for t in verified if t in done],
+            "attempts": attempts, "events": len(rows), "lang": lang,
             "complete": bool(rows and rows[-1].get("event") == "session_end")}
 
 

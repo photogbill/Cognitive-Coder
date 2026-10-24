@@ -35,7 +35,7 @@ from pathlib import Path
 import sys
 import urllib.parse
 
-from . import langs
+from . import langs, resumable
 from .codemap import parse_treesitter
 from .errors import CognitiveCoderError
 from .filestorage import JsonFileStorage
@@ -641,13 +641,41 @@ def resume(args: argparse.Namespace) -> int:
         return 2
     host = _host(root, args, approval=ConsoleApproval(auto=args.yes))
     sessions = Session.previous_sessions(host)
+    if getattr(args, "discard", ""):
+        if args.discard not in sessions:
+            print(f"There is no session called {args.discard} in {root}.",
+                  file=sys.stderr)
+            return 2
+        resumable.abandon(host.fs, args.discard,
+                          reason="discarded with ccoder resume --discard")
+        print(f"{args.discard} will not be offered again. Its files and its "
+              f"journal are kept; `ccoder resume {args.discard}` still "
+              f"picks it up by name.")
+        return 0
+    if getattr(args, "last", False) and not args.session:
+        waiting = resumable.unfinished(host.fs)
+        if not waiting:
+            print("There is no unfinished build in this project to continue.")
+            return 1
+        args.session = waiting[0].session_id
+        print(f"Continuing {args.session}: {waiting[0].title}\n"
+              f"  {waiting[0].sentence('engineer')}")
     if not args.session:
         if not sessions:
             print("There are no previous sessions in this project.")
             return 1
-        print("Previous sessions:")
+        # How each one was left — stopped, crashed, finished with failures —
+        # and how far it got. A bare list of ids answered "which sessions
+        # exist", when the question anyone runs this to ask is "which one
+        # do I continue?".
+        print("Previous sessions (newest last):")
         for name in sessions:
-            print(f"  {name}")
+            state = resumable.state_of(host.fs, name)
+            mark = "  ← can be continued" if state.continuable else ""
+            print(f"  {name}  {state.sentence('engineer')}{mark}")
+            print(f"      {state.title}")
+        print("\nContinue one with `ccoder resume <id>`, or the newest "
+              "unfinished one with `ccoder resume --last`.")
         return 0
     if args.session not in sessions:
         known = (f" The ones here are: {', '.join(sessions)}." if sessions
@@ -944,8 +972,13 @@ def _add_build_parser(sub, common) -> Handler:
 
 def _add_resume_parser(sub, common) -> Handler:
     r = sub.add_parser("resume", parents=[common],
-                       help="resume a session, or list them")
+                       help="continue a stopped build, or list them")
     r.add_argument("session", nargs="?", default="")
+    r.add_argument("--last", action="store_true",
+                   help="continue the newest unfinished build — no id needed")
+    r.add_argument("--discard", default="", metavar="ID",
+                   help="never offer this build again (its files and journal "
+                        "are kept)")
     _add_remote_option(r)
     return resume
 

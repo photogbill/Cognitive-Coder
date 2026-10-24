@@ -39,7 +39,7 @@ from typing import Any
 import uuid
 
 from . import journal as journal_mod
-from . import langs, models, personas, runner, speclint
+from . import langs, models, personas, resumable, runner, speclint
 from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import (
@@ -215,6 +215,14 @@ class SessionConfig:
     #: Opt-in: one short "what is wrong and what to change" call before
     #: each repair, shown to the repair (Aider's architect/editor split).
     diagnose_first: bool = False
+    #: CONTINUE (resumable.py, 2026-10-23): before a continued build writes
+    #: anything, the files already on disk are checked when anything may
+    #: have changed since the last run — a file the operator fixed by hand
+    #: that now passes is KEPT and counted, one that broke is REPAIRED from
+    #: what is there rather than regenerated, and work a crash left behind
+    #: is checked instead of thrown away. Nothing changed (the last run
+    #: ended cleanly and every file hashes the same) costs nothing.
+    reverify_on_continue: bool = True
 
 
 class Session:
@@ -337,6 +345,18 @@ class Session:
         #: {path: the diagnostics a re-opened task's first attempt repairs
         #: against} — how a later phase hands a failed file its errors.
         self._seeds: dict[str, tuple] = {}
+        #: CONTINUE. `resume()` sets `_resumed` to the journal's summary of
+        #: the build being picked up (resumable.BuildState); `run()` then
+        #: prepares the continuation once, on the worker thread, instead of
+        #: planning. `_verified_paths` is what the board may draw green.
+        self._resumed: Any = None
+        self._continue_prepared = False
+        self._verified_paths: set[str] = set()
+        #: THE GRACEFUL STOP. `cancel()` stops at the next safe point, which
+        #: can be mid-generation — on a 24B model at 4 tok/s a file four
+        #: minutes in is four minutes thrown away. This one lets the file in
+        #: hand finish (verified or not) and stops before the next.
+        self.stop_token = Cancel()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -679,12 +699,24 @@ class Session:
                   "depends_on": list(t.depends_on), "status": t.status,
                   "attempts": t.attempts}
                  for t in self.plan.tasks]
+        data = {"tasks": tasks, "revised": revised,
+                "request": self.plan.request,
+                "caveats": list(self.plan.caveats)}
+        if self._resumed is not None:
+            # A CONTINUED build's board starts with files already done, and
+            # "done" alone cannot say whether a test proved one: the board
+            # drew every one of them grey ("built, not checked") — including
+            # the files whose tests had passed — so the first thing an
+            # operator saw after pressing Continue was their work demoted.
+            for row in tasks:
+                row["verified"] = row["path"] in self._verified_paths
+            data["continued"] = True
         self.host.emit("plan",
                        f"plan: {len(tasks)} file(s)"
-                       + (" (revised)" if revised else ""),
-                       {"tasks": tasks, "revised": revised,
-                        "request": self.plan.request,
-                        "caveats": list(self.plan.caveats)})
+                       + (" (revised)" if revised else "")
+                       + (" (continued)" if self._resumed is not None
+                          and not revised else ""),
+                       data)
 
     def preview(self, request: str, profile: dict | None = None) -> dict:
         """Plan, and stop. What would be built, before anything is built.
@@ -1022,6 +1054,7 @@ class Session:
                           if outcome.stopped_because else ""))
         self.journal.log("verify", task=task.path,
                          verify={"ok": outcome.ok,
+                                 "verified": bool(outcome.verified),
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
@@ -1668,10 +1701,13 @@ class Session:
         try:
             if request:
                 self.start(request, profile)
+            elif self._resumed is not None and not self._continue_prepared:
+                self._prepare_continue(profile)
             while True:
                 outcome = self.step()
                 if outcome is None:
                     break
+                self._stop_if_asked(outcome)
             # Hybrid mode's later phases re-open what failed (and attempt
             # what was blocked on it) with the other model loaded.
             self._hybrid_phases()
@@ -1698,8 +1734,13 @@ class Session:
                                f"needs {', '.join(blockers)}, "
                                f"which did not build")
         except Cancelled as exc:
-            self.journal.log("cancel", sentence=str(exc))
-            self.host.emit("status", str(exc))
+            after = getattr(exc, "after", "")
+            self.journal.log("cancel", sentence=str(exc),
+                             **({"after": after} if after else {}))
+            self.log.event("STOPPED", str(exc))
+            self.host.emit("status", str(exc),
+                           {"phase": "stopped", "after": after,
+                            "graceful": bool(after)})
         except BudgetExceeded as exc:
             self.journal.log("budget", sentence=str(exc), exhausted=True)
             self.host.emit("budget", str(exc))
@@ -1883,8 +1924,10 @@ class Session:
             self._reopen(left)
             fixed_before = sum(1 for o in self._final_outcomes() if o.ok)
             while True:
-                if self.step() is None:
+                outcome = self.step()
+                if outcome is None:
                     break
+                self._stop_if_asked(outcome)
             final = self._final_outcomes()
             fixed = sum(1 for o in final if o.ok) - fixed_before
             still = [t.path for t in self._unfinished()]
@@ -2091,8 +2134,16 @@ class Session:
                                           else ()))
                          or any(_looks_like_test(o.path) for o in final))
         not_ok_untested = all_untested and tests_present
+        # What every planned file looked like when this run ended, so a
+        # Continue can tell a file the operator edited during the pause
+        # from one nobody touched (resumable.changed_since). Hashes, not
+        # contents: the snapshots already hold the contents.
+        hashes = (resumable.file_hashes(self.host.fs,
+                                        [t.path for t in self.plan.tasks])
+                  if self.plan else {})
         self.journal.log(
             "session_end",
+            hashes=hashes,
             #: "ok" means VERIFIED. A file whose test file exists and ran
             #: nothing is not, however green its build was — and a session
             #: that crashed is not, however green the files before the
@@ -2182,11 +2233,30 @@ class Session:
     def cancel(self) -> None:
         """Stop at the next phase boundary. Thread-safe (§5.2).
 
-        The ONE method a host may call from another thread. Everything else
-        in this class assumes single-threaded use, and the token is what
-        makes the exception safe.
+        One of the TWO methods a host may call from another thread (the
+        other is `stop_after_current`). Everything else in this class
+        assumes single-threaded use, and the tokens are what make the
+        exception safe.
         """
         self.cancel_token.set()
+
+    def stop_after_current(self) -> None:
+        """Finish the file in hand, then stop. Thread-safe, like `cancel`.
+
+        `cancel()` is right when the build is going wrong. This is for the
+        other reason to stop — the operator has to leave, or wants the GPU
+        back — when the file being written is fine and four minutes from
+        done: it is finished and verified (or not) as normal, and the build
+        stops before the next one starts. Nothing is rolled back, because
+        nothing was cut short, and Continue picks up at the next file.
+        """
+        self.stop_token.set()
+
+    def _stop_if_asked(self, outcome: TaskOutcome | None) -> None:
+        """Between two tasks: honour `stop_after_current`."""
+        if self.stop_token.is_set():
+            raise Cancelled(after=getattr(outcome, "path", "") or
+                            "the file in hand")
 
     # ------------------------------------------------------------------
     # resume (§6.13)
@@ -2231,8 +2301,21 @@ class Session:
             if row.get("event") == "skeleton":
                 kept = (row.get("data") or {}).get("kept") or []
                 session.planner.kept_as_found = set(kept)
+            #: THE BASELINE. Tests that were failing before the first run
+            #: wrote a line were excused from blame — then a resume forgot,
+            #: and the stale test that cost the Aug 8 and Oct 1 builds their
+            #: afternoons was charged to the resumed files all over again.
+            elif row.get("event") == "baseline":
+                data = row.get("data") or {}
+                failing = tuple(str(p) for p in data.get("failing") or ())
+                if failing:
+                    session.loop.config.known_failing = failing
+                session._all_tests_baselined = bool(data.get("all_excluded"))
+        session._resumed = resumable.state_of(host.fs, session_id, directory)
+        session._verified_paths = set(state.get("verified") or ())
         session.journal.log("session_start", resumed_from=session_id,
                             request=state["request"],
+                            config={"lang": session.config.lang},
                             done=state["done"], remaining=[
                                 t.path for t in (session.plan.tasks
                                                  if session.plan else ())
@@ -2285,6 +2368,233 @@ class Session:
                 status="done" if path in done else "pending",
                 attempts=state["attempts"].get(path, 0)))
         return tasks
+
+    # -- continuing a resumed session (resumable.py) ---------------------
+    def _prepare_continue(self, profile: dict | None) -> None:
+        """What `start()` is to a new build, for one picked up again.
+
+        `resume()` rebuilt the plan from the journal and stopped there, so a
+        resumed session went straight to the step loop with half its setup
+        missing: no build-log header (the continued run's lines ran on under
+        the last run's summary), no model check, no pinned requirements, no
+        spec-vector tests, no hybrid roles, a session clock that started at
+        zero — and no `plan` event, so a host's task board stayed empty
+        while files were being written. Each of those is restored here, on
+        the worker thread, before anything is generated.
+        """
+        self._continue_prepared = True
+        self._started = time.monotonic()
+        self._where = "picking the build up again"
+        self.profile = dict(profile or {})
+        state = self._resumed
+        request = self.plan.request if self.plan else state.request
+        caps = self._capabilities(boundary="continue")
+        self._check_model(caps)
+        left = [t.path for t in (self.plan.tasks if self.plan else ())
+                if t.status == "pending"]
+        how = resumable.ENDED_WORDS.get(state.ended, state.ended)
+        said = (f"run {state.runs + 1} of this build — the last one ended "
+                f"because {how}; {len(state.done)} of {len(state.files)} "
+                f"file(s) were done, {len(left)} left")
+        self.log.start(request, caps.name,
+                       {"attempts": self.config.attempts,
+                        "temperature": self.config.temperature,
+                        "max_tokens": self.config.max_tokens,
+                        "max_files": self.config.max_files,
+                        "lang": self.config.lang,
+                        "diffusion": self._diffusion_state(caps)},
+                       continued=said)
+        self.journal.log("continue", ended=state.ended, run=state.runs + 1,
+                         done=list(state.done), remaining=left,
+                         previous_model=state.model, model=caps.name)
+        if state.model and caps.name and state.model != caps.name:
+            # Not a warning: a different model for the rest is often the
+            # whole reason for stopping. Said so the record shows it.
+            self.log.line(f"  model     this build was started with "
+                          f"{state.model}; it continues with {caps.name}")
+            self.host.emit("status",
+                           f"this build was started with {state.model}; "
+                           f"it continues with {caps.name}",
+                           {"phase": "continue", "model": caps.name,
+                            "previous_model": state.model})
+        self._apply_skill_triggers(request)
+        caps = self._plan_hybrid(caps)
+        self._pin_constraints(request, source="the request")
+        self._restore_spec_vectors(request)
+        # The board first, then the check: every row appears at once with
+        # the state the journal proves, and the re-check updates them live.
+        self._emit_plan(revised=False)
+        self._reverify_before_continue()
+        if self.plan is not None:
+            ready = [t.path for t in self.plan.tasks if t.status == "pending"]
+            done = [t.path for t in self.plan.tasks if t.status == "done"]
+            self.host.emit(
+                "status",
+                f"Continuing: {len(done)} of {len(self.plan.tasks)} file(s) "
+                f"already done, {len(ready)} to go"
+                + (f" — next: {ready[0]}" if ready else ""),
+                {"phase": "continue", "done": done, "remaining": ready})
+
+    def _restore_spec_vectors(self, request: str) -> None:
+        """The request's own examples, as tests (specvectors.py), are pinned
+        to their modules for the loop — a mapping that lived only in the
+        first run's memory. Recomputed from the request (deterministic), and
+        kept only for test files the first run actually wrote."""
+        self.loop.spec_tests = {}
+        if not self.config.spec_vectors or self.plan is None:
+            return
+        if (self.config.lang or "python") != "python":
+            return
+        from . import specvectors
+        try:
+            vectors = specvectors.extract(request,
+                                          [t.path for t in self.plan.tasks])
+        except Exception:                                 # noqa: BLE001
+            return
+        if not vectors:
+            return
+        layout = self.planner.observe_layout()
+        test_dir = layout.get("test_dir") or self.planner.test_dir or "tests"
+        mapping = {module: specvectors.test_path_for(module, test_dir)
+                   for module in specvectors.by_module(vectors)}
+        self.loop.spec_tests = {m: p for m, p in mapping.items()
+                                if self.host.fs.exists(p)}
+        if self.loop.spec_tests:
+            self.log.line(f"  spec vectors  still in force from the first "
+                          f"run: "
+                          f"{', '.join(sorted(set(self.loop.spec_tests.values())))}")
+
+    def _reverify_before_continue(self) -> None:
+        """Check what is on disk before writing anything new.
+
+        Between a Stop and a Continue the operator may have done exactly
+        what a stopped build invites: opened the file it was stuck on and
+        fixed it. Continue used to trust the journal over the disk — a hand
+        fix was ignored and its file regenerated over, and a file broken by
+        an edit was still counted "done". Now:
+
+          * the last run ended cleanly and NO file changed (the hashes in
+            its session_end match) → nothing is re-run; this costs nothing;
+          * otherwise every DONE file is verified again — a change to one
+            file can break another's tests — and a pending file that holds
+            real work the operator (or a crash) left is verified too:
+
+            done, still passes       → stays done, re-counted this run
+            done, now fails          → pending, its first attempt REPAIRS
+                                        it from what is there
+            pending, passes          → KEPT as it is and counted done
+            pending, fails           → pending, repaired from what is
+                                        there rather than started over
+
+        A pending file the skeleton kept as found (the operator's own file
+        its task is to extend) is only checked when it changed: passing its
+        old tests says nothing about whether the task's change was made.
+        """
+        if self.plan is None or not self.config.reverify_on_continue:
+            return
+        state = self._resumed
+        paths = [t.path for t in self.plan.tasks]
+        now = resumable.file_hashes(self.host.fs, paths)
+        changed = resumable.changed_since(
+            getattr(state, "hashes", None), now)
+        done_before = [t for t in self.plan.tasks if t.status == "done"]
+        if changed == []:
+            self.log.line(f"  re-check  none needed — nothing changed since "
+                          f"the last run ended; {len(done_before)} done "
+                          f"file(s) taken as they were")
+            self.journal.log("reverify", changed=[], checked=[],
+                             skipped=True)
+            return
+        kept = set(getattr(self.planner, "kept_as_found", ()) or ())
+        targets: list[Task] = []
+        for t in self.plan.tasks:
+            if t.path not in now:
+                continue
+            if t.status == "done":
+                targets.append(t)
+            elif t.status == "pending":
+                edited = changed is not None and t.path in changed
+                if t.path in kept and not edited:
+                    continue
+                if (edited or changed is None) \
+                        and self.planner._has_real_work(t.path):
+                    targets.append(t)
+        if not targets:
+            self.journal.log("reverify", changed=changed or [], checked=[],
+                             skipped=True)
+            return
+        self._where = "checking the files already on disk"
+        self.log.rule("CONTINUE — the files already on disk, checked before "
+                      "anything is written")
+        if changed is None:
+            self.log.line("  the last run did not end cleanly, so every file "
+                          "on disk is checked")
+        else:
+            self.log.line(f"  changed since the last run: {', '.join(changed)}")
+        self.host.emit(
+            "status",
+            f"checking the {len(targets)} file(s) already on disk before "
+            f"writing anything new"
+            + (f" — changed since the stop: {', '.join(changed)}"
+               if changed else ""),
+            {"phase": "reverify", "files": [t.path for t in targets],
+             "changed": list(changed or [])})
+        still_ok: list[str] = []
+        now_failing: list[str] = []
+        kept_now: list[str] = []
+        repair_from: list[str] = []
+        for task in targets:
+            was_done = task.status == "done"
+            outcome = self.loop.reverify(
+                task, because="the build was continued")
+            # A failure placed in ANOTHER file is the step loop's to repair
+            # when it runs this task, from fresh evidence — not from this.
+            self.loop.blamed.pop(task.path, None)
+            diags = tuple(outcome.result.diagnostics) if outcome.result \
+                else ()
+            current = self.plan.task(task.id) or task
+            if outcome.ok:
+                label = "STILL OK" if was_done else "KEPT"
+                self._record(current, outcome, label=label)
+                self.plan = self.plan.replace(current.with_status("done"))
+                if outcome.verified:
+                    self._verified_paths.add(task.path)
+                (still_ok if was_done else kept_now).append(task.path)
+                if not was_done:
+                    self.host.emit(
+                        "status",
+                        f"{task.path}: kept as it is — it passes its checks "
+                        f"now, so nothing will be written over it",
+                        {"task": task.path, "ok": True,
+                         "verified": outcome.verified, "kept": True})
+                continue
+            self._record(current, outcome,
+                         label="NO LONGER OK" if was_done else "STILL FAILS")
+            self._verified_paths.discard(task.path)
+            if diags:
+                self._seeds[task.path] = diags
+            self.plan = self.plan.replace(current.with_status("pending",
+                                                              attempts=0))
+            (now_failing if was_done else repair_from).append(task.path)
+            self.host.emit(
+                "warning",
+                f"{task.path}: "
+                + ("passed before the stop but fails now — something "
+                   "changed since; it will be repaired from what is there"
+                   if was_done else
+                   "has work in it that does not pass yet — its first "
+                   "attempt repairs that rather than starting over"),
+                {"task": task.path, "phase": "reverify",
+                 "was_done": was_done})
+        self.journal.log("reverify", changed=list(changed or []),
+                         unknown=changed is None,
+                         checked=[t.path for t in targets],
+                         still_ok=still_ok, now_failing=now_failing,
+                         kept=kept_now, repair_from=repair_from)
+        self.log.line(f"  re-check  {len(still_ok)} still ok, "
+                      f"{len(kept_now)} kept as found, "
+                      f"{len(now_failing)} no longer ok, "
+                      f"{len(repair_from)} to repair from what is there")
 
     @staticmethod
     def previous_sessions(host: Host,

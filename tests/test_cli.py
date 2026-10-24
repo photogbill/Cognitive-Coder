@@ -710,6 +710,52 @@ def test_resume_with_remote_uses_the_resumed_sessions_gate(
     assert kwargs["journal"] is not None and kwargs["gate"].active
 
 
+def test_resume_lists_how_each_build_was_left(tmp_path, scripted, capsys):
+    """A bare list of ids answered "which sessions exist"; the question
+    anyone runs this to ask is "which one do I continue?"."""
+    session_id = _stopped_before_building(tmp_path, scripted)
+    capsys.readouterr()
+    assert cli.main(["resume", "-p", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert session_id in out
+    # the fixture's scripted model runs dry during the skeleton: an error
+    assert "error" in out and "0/2 done" in out
+    assert "can be continued" in out
+    assert "ccoder resume --last" in out
+
+
+def test_resume_last_continues_the_newest_unfinished_build(
+        tmp_path, scripted, no_input, capsys):
+    session_id = _stopped_before_building(tmp_path, scripted)
+    scripted([ALPHA, BETA])
+    rc = cli.main(["resume", "--last", "--yes", "-p", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Continuing {session_id}" in out
+    assert "return 2" in (tmp_path / "src" / "beta.py").read_text()
+
+
+def test_resume_last_with_nothing_unfinished_says_so(tmp_path, scripted,
+                                                     no_input, capsys):
+    scripted([PLAN, SKELETON, ALPHA, BETA])
+    assert cli.main(["build", "two", "--yes", "-p", str(tmp_path),
+                     "--attempts", "1"]) == 0
+    capsys.readouterr()
+    assert cli.main(["resume", "--last", "-p", str(tmp_path)]) == 1
+    assert "no unfinished build" in capsys.readouterr().out
+
+
+def test_resume_discard_sets_a_build_aside(tmp_path, scripted, capsys):
+    session_id = _stopped_before_building(tmp_path, scripted)
+    capsys.readouterr()
+    assert cli.main(["resume", "--discard", session_id,
+                     "-p", str(tmp_path)]) == 0
+    assert "will not be offered again" in capsys.readouterr().out
+    assert cli.main(["resume", "--last", "-p", str(tmp_path)]) == 1
+    assert cli.main(["resume", "--discard", "cc-nope",
+                     "-p", str(tmp_path)]) == 2
+
+
 # -- doctor ----------------------------------------------------------------
 
 def test_doctor_lists_remote_providers_as_remote(scripted, capsys):

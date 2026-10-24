@@ -69,7 +69,10 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   # the tabs (docs/NEXT_TABS.md) and the structured ask
                   "structured", "bughunt", "improve", "improve_structure",
                   "improve_apply", "redteam_threats", "redteam_attack",
-                  "blueprint", "blueprint_plan", "blueprint_module")
+                  "blueprint", "blueprint_plan", "blueprint_module",
+                  # Continue (resumable.py): a stopped build picked up again,
+                  # the files re-checked first, or one set aside for good
+                  "continue", "reverify", "abandoned")
 
 
 # --------------------------------------------------------------------------
