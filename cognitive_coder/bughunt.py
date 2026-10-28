@@ -29,22 +29,16 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-import json
 import re
 from typing import Any
 
-from . import keep, langs, runner, structured
+from . import keep, langs, runner, structured, typecheck
 from . import scope as scope_mod
 from .personas import PERSONAS
 
 #: Lint codes that are warnings an operator can act on but not bugs.
 _STYLE_PREFIX = ("E", "W", "I", "N", "D", "Q", "COM", "UP", "SIM", "RET",
                  "ANN", "PL")
-_PYRIGHT_SEVERITY = {"error": "error", "warning": "warning",
-                     "information": "note"}
-_MYPY = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+)(?::(?P<col>\d+))?: "
-                   r"(?P<sev>error|warning|note): (?P<msg>.*)$", re.M)
-
 
 @dataclass
 class BugItem:
@@ -180,56 +174,20 @@ def _keep(path: str, code: str, lang: str, hunt: BugHunt) -> None:
 
 
 def _typecheck(session: Any, files: list[str], hunt: BugHunt) -> None:
+    """The type checker's findings — ALL of them here, not only the gated
+    codes: the Evaluate tab is where an operator reads what a checker
+    thinks; the build loop's gate (typecheck.GATE_CODES) is the certain
+    subset. One reader for both (typecheck.py, 2026-10-27)."""
     ex, fs = session.host.exec, session.host.fs
     root = fs.root()
-    tool = ex.which("pyright")
-    if tool:
-        argv = [tool, "--outputjson"] + [runner._join(root, f) for f in files]
-        try:
-            proc = ex.run(argv, cwd=root, timeout=300.0,
-                          env=runner.scrubbed_env(root, root))
-        except Exception as exc:                             # noqa: BLE001
-            hunt.notes.append(f"pyright could not be run: {exc}")
-            return
-        try:
-            data = json.loads(proc.stdout or "{}")
-        except ValueError:
-            hunt.notes.append("pyright did not return JSON")
-            return
-        hunt.tools_ran.append("pyright")
-        for d in data.get("generalDiagnostics", []) or []:
-            sev = _PYRIGHT_SEVERITY.get(str(d.get("severity")), "warning")
-            file = _rel(str(d.get("file", "")), root)
-            line = int(((d.get("range") or {}).get("start") or {})
-                       .get("line", -1)) + 1
-            hunt.items.append(BugItem(file, max(line, 0),
-                                      str(d.get("message", "")).strip(),
-                                      "pyright", sev,
-                                      str(d.get("rule") or "")))
+    res = typecheck.check(ex, fs, files, root=root, timeout=300.0)
+    if not res.ran:
+        hunt.notes.append(res.note or "the type checker did not run")
         return
-    tool = ex.which("mypy")
-    if tool:
-        argv = [tool, "--no-error-summary", "--show-column-numbers",
-                "--ignore-missing-imports"] + \
-            [runner._join(root, f) for f in files]
-        try:
-            proc = ex.run(argv, cwd=root, timeout=300.0,
-                          env=runner.scrubbed_env(root, root))
-        except Exception as exc:                             # noqa: BLE001
-            hunt.notes.append(f"mypy could not be run: {exc}")
-            return
-        hunt.tools_ran.append("mypy")
-        for m in _MYPY.finditer(proc.stdout or ""):
-            sev = {"error": "error", "warning": "warning"}.get(
-                m.group("sev"), "note")
-            hunt.items.append(BugItem(_rel(m.group("file"), root),
-                                      int(m.group("line")),
-                                      m.group("msg").strip(), "mypy", sev))
-        return
-    hunt.notes.append("no type checker installed (pyright or mypy) — a "
-                      "wrong argument order, a tuple used as an object, a "
-                      "method called with the wrong count will only show "
-                      "when a test or a run reaches it")
+    hunt.tools_ran.append(res.tool)
+    for d in res.diagnostics:
+        hunt.items.append(BugItem(d.file, max(d.line, 0), d.message,
+                                  res.tool, d.severity, str(d.code or "")))
 
 
 def _rel(path: str, root: str) -> str:

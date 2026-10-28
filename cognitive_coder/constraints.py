@@ -30,6 +30,17 @@ import re
 
 MAX_CONSTRAINTS = 15
 MAX_CHARS = 240
+#: THE OPERATOR'S DECISIONS (interview.py, 2026-10-27). The interview
+#: appends its answers under this heading at the END of the request. They
+#: are pinned FIRST and WHOLE — one bullet is one requirement, never split
+#: by the sentence rule (a question that holds `e.g. 'km/h'` is one
+#: decision, not two), never pushed out by the cap (a written spec
+#: routinely has fifteen MUSTs before the block begins), and cut only at
+#: `DECISION_CHARS`, past where a question and its answer fit. Found by
+#: the 2026-10-27 review: every confirmed decision of a real spec landed
+#: in "… and N more, not pinned".
+DECISIONS_HEADING = "## Decisions confirmed by the operator"
+DECISION_CHARS = 400
 TITLE = ("[HARD REQUIREMENTS — from the request, word for word. Every file "
          "and every repair must keep them]")
 
@@ -91,6 +102,33 @@ class Constraints:
         return "\n".join(lines)
 
 
+def split_decisions(text: str) -> tuple[str, list[str]]:
+    """(the request without the decisions block, its bullet lines).
+
+    The block starts at `DECISIONS_HEADING` and runs to the next heading
+    or the end; every bullet under it is one decision, kept whole."""
+    lines = (text or "").splitlines()
+    rest: list[str] = []
+    decisions: list[str] = []
+    inside = False
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped == DECISIONS_HEADING:
+            inside = True
+            continue
+        if inside and stripped.startswith("#"):
+            inside = False
+        if inside:
+            if _BULLET.match(raw):
+                decisions.append(_unemphasise(_BULLET.sub("", raw).strip()))
+            elif stripped and decisions:
+                # a wrapped continuation of the bullet above
+                decisions[-1] = f"{decisions[-1]} {_unemphasise(stripped)}"
+            continue
+        rest.append(raw)
+    return "\n".join(rest), decisions
+
+
 def _sentences(text: str) -> list[str]:
     out: list[str] = []
     fenced = False
@@ -110,6 +148,15 @@ def extract(text: str) -> Constraints:
     """The requirement sentences of a request or specification."""
     found = Constraints()
     seen: set[str] = set()
+    text, decisions = split_decisions(text)
+    for line in decisions:
+        key = re.sub(r"\W+", " ", line.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if len(line) > DECISION_CHARS:
+            line = line[:DECISION_CHARS - 1].rstrip() + "… (cut here)"
+        found.items.append(line)
     for sentence in _sentences(text):
         if not (_STRONG.search(sentence) or _WEAK.search(sentence)):
             continue
@@ -117,7 +164,7 @@ def extract(text: str) -> Constraints:
         if not key or key in seen:
             continue
         seen.add(key)
-        if len(found.items) >= MAX_CONSTRAINTS:
+        if len(found.items) >= MAX_CONSTRAINTS + len(decisions):
             found.more += 1
             continue
         if len(sentence) > MAX_CHARS:

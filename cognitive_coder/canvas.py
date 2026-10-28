@@ -226,9 +226,16 @@ def located_error(diagnostics: Sequence[Diagnostic], path: str,
 def repair_hole(code: str, lang: str, path: str,
                 diagnostics: Sequence[Diagnostic],
                 same_file: Callable[[str, str], bool],
-                count_tokens: Callable[[str], int] | None = None
+                count_tokens: Callable[[str], int] | None = None, *,
+                max_body_lines: int = BODY_MAX_LINES,
+                fits: Callable[[Hole], bool] | None = None
                 ) -> Hole | None:
-    """The hole for a repair, from the first located error — or None."""
+    """The hole for a repair, from the first located error — or None.
+
+    ``max_body_lines`` and ``fits`` are FIM mode's (fim.py): a FIM hole
+    has no canvas to fit, so it takes a longer body and its own rule for
+    what fits. The defaults are the canvas's.
+    """
     err = located_error(diagnostics, path, same_file)
     if err is None or not code.strip():
         return None
@@ -237,6 +244,9 @@ def repair_hole(code: str, lang: str, path: str,
         return None
     idx = min(err.line, len(lines)) - 1
     lo, hi = 0, len(lines)
+    if fits is None:
+        def fits(h: Hole) -> bool:
+            return _fits(h, count_tokens)
     if lang == "python":
         try:
             tree = ast.parse(code)
@@ -263,8 +273,7 @@ def repair_hole(code: str, lang: str, path: str,
                     hole = _make(path, lines, start, end, kind="body",
                                  head_from=_def_line(node) - 1, name=name,
                                  line=err.line)
-                    if (end - start <= BODY_MAX_LINES
-                            and _fits(hole, count_tokens)):
+                    if end - start <= max_body_lines and fits(hole):
                         return hole
                     lo, hi = first - 1, last         # a window in this body
     start = max(lo, idx - WINDOW_BEFORE)
@@ -273,7 +282,7 @@ def repair_hole(code: str, lang: str, path: str,
         start = max(lo, idx - before)
         end = min(hi, idx + after + 1)
         hole = _make(path, lines, start, end, kind="window", line=err.line)
-        if _fits(hole, count_tokens):
+        if fits(hole):
             return hole
     return None
 
@@ -826,7 +835,7 @@ class Candidate:
     def mean(self) -> float:
         """Mean confidence over the fill's non-blank lines."""
         lines = (self.fill or "").rstrip("\n").split("\n")
-        vals = [c for c, ln in zip(self.confidence, lines)
+        vals = [c for c, ln in zip(self.confidence, lines, strict=False)
                 if ln.strip() and c == c]
         return sum(vals) / len(vals) if vals else 0.0
 
@@ -834,7 +843,7 @@ class Candidate:
     def least(self) -> float:
         """The least certain non-blank line of the fill."""
         lines = (self.fill or "").rstrip("\n").split("\n")
-        vals = [c for c, ln in zip(self.confidence, lines)
+        vals = [c for c, ln in zip(self.confidence, lines, strict=False)
                 if ln.strip() and c == c]
         return min(vals) if vals else 1.0
 

@@ -72,8 +72,15 @@ def is_pinned(text: str) -> bool:
 
 def task_text(request: str, modules: Sequence[tuple[str, str]],
               tests: Sequence[str] = (),
-              existing: Sequence[tuple[str, str]] = ()) -> str:
-    """The prompt body for the one interface call."""
+              existing: Sequence[tuple[str, str]] = (),
+              size_rule: str = "") -> str:
+    """The prompt body for the one interface call.
+
+    ``size_rule`` (sizing.py, 2026-10-27) is the sentence that tells the
+    architect how big a module and a function may be: the contract is
+    where a 96-line `apply_orders` is decided, and every repair of it
+    afterwards pays for that decision.
+    """
     lines = [
         "Write the INTERFACE SKELETON for this project: one stub per file "
         "listed below, before any file is written. Each file will later be "
@@ -119,6 +126,7 @@ def task_text(request: str, modules: Sequence[tuple[str, str]],
         "window and no main loop at the top level. The entry point "
         "defines `main()` and calls it only under "
         "`if __name__ == \"__main__\":`.",
+        *([f"- {size_rule}"] if size_rule else []),
         "",
         "Example of one block:",
         "```python",

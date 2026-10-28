@@ -117,3 +117,62 @@ def test_a_suite_with_a_broken_task_says_which(tmp_path):
 def test_the_cli_checks_the_suite():
     from cognitive_coder.cli import main
     assert main(["bench", "--check", "--only", "build-roman"]) == 0
+
+
+# --------------------------------------------------------------------------
+# calibration (profiles.py, 2026-10-27)
+# --------------------------------------------------------------------------
+
+def test_calibration_measures_a_run_and_chooses_by_what_passed():
+    from cognitive_coder import bench
+    rows = [{"ok": True, "hidden": {"passed": 3, "total": 3},
+             "generations": 4, "narrow_unplaced": 1, "keep_refused": 0,
+             "fim_tried": 2, "fim_filled": 1, "tokens_out_total": 400,
+             "decode_ms_total": 20000, "seconds": 30},
+            {"ok": False, "hidden": {"passed": 1, "total": 3},
+             "generations": 6, "narrow_unplaced": 0, "keep_refused": 2,
+             "seconds": 40}]
+    m = bench.measure(rows)
+    assert m["passed"] == 1 and m["hidden_passed"] == 4
+    assert m["well_formed"] == 0.7 and m["tok_s"] == 20.0
+    assert m["fim_filled"] == 1 and m["seconds"] == 70
+    measured = {"whole": {"passed": 2, "hidden_passed": 5, "well_formed": 0.9},
+                "symbols": {"passed": 2, "hidden_passed": 6,
+                            "well_formed": 0.8},
+                "fim": {"passed": 2, "hidden_passed": 6, "well_formed": 0.95,
+                        "fim_filled": 0}}
+    # fim filled nothing, so it is not offered; symbols beats whole on
+    # hidden tests
+    assert bench.choose_format(measured) == "symbols"
+    measured["fim"]["fim_filled"] = 3
+    assert bench.choose_format(measured) == "fim"
+    assert bench.choose_format({}) == "auto"
+
+
+def test_calibration_writes_the_profile_from_its_runs(tmp_path, monkeypatch):
+    from cognitive_coder import bench, profiles
+
+    def fake_run_suite(make_llm, *, suite, out, only, label, config, say,
+                       events, ex):
+        fmt = label.split("-", 1)[1]
+        ok = fmt == "symbols"
+        rows = [{"task": "t", "ok": ok, "generations": 2,
+                 "hidden": {"passed": 2 if ok else 0, "total": 2},
+                 "fim_tried": 1 if fmt == "fim" else 0,
+                 "fim_filled": 1 if fmt == "fim" else 0}]
+        run_dir = tmp_path / "runs" / label
+        run_dir.mkdir(parents=True)
+        return bench.BenchRun(path=run_dir, rows=rows, problems=[])
+    monkeypatch.setattr(bench, "run_suite", fake_run_suite)
+    report = bench.calibrate(lambda t, f: None, "Qwen3-Coder-30B-Q4.gguf",
+                             suite=tmp_path, out=tmp_path / "runs",
+                             say=lambda _s: None,
+                             profile_dir=tmp_path / "profiles")
+    assert report["chosen"] == "symbols"
+    assert "| symbols | 1/1 |" in report["text"]
+    found = profiles.profile_for("Qwen3-Coder-30B-Q4.gguf",
+                                 directory=tmp_path / "profiles")
+    assert found.source == "calibrated" and found.edit_format == "symbols"
+    assert found.measured["formats"]["fim"]["fim_filled"] == 1
+    assert found.sampling() == profiles.builtin_for("qwen3-coder").sampling()
+    assert (tmp_path / "runs" / "CALIBRATION.md").exists()

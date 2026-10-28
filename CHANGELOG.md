@@ -10,6 +10,338 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — ten changes for working code per hour on a small model (2026-10-27)
+
+Bill: "see if you can come up with any additional features, capabilities,
+or processes that can improve its performance with local model backed
+coding performance" — and then "Can you build all of them?" The ten were
+chosen by reading the whole engine against the journals of HYBRID.md: most
+of the loop-level machinery was built; what was left fell into three
+buckets. Things the engine REPORTED but never USED (`supports_fim`,
+logprobs, the sampler knobs, the type checker the Evaluate tab already
+ran); a planner that produced units too big for every mechanism downstream
+of it; and repair being asked for when sampling again would have been
+cheaper. Version 0.10.0: every addition is optional and additive — a host
+written to the 1.0 Ports sees nothing new unless it asks.
+
+**1. Plan for the model's reach** (`sizing.py`; `SessionConfig.
+max_module_lines` 200, `max_function_lines` 40; 0 is off). The planner
+persona asked for "the smallest set of files", which a model reads as FEWER
+files and so bigger ones, and nothing capped a file or a function — while
+narrowing starts at 40 lines, a canvas holds 256 tokens (10 of 19 canvas
+repairs on 10-18 skipped because the body did not fit one), and a
+whole-file first attempt has to fit the reply budget. The rule now goes
+where the sizes are decided: the planner's task text, the architect's
+skeleton call and the cached prefix all carry it (`sizing.rule_text`,
+`planner_rule`, `architect_rule`); a pinned stub that will plainly outgrow
+a module is said at the skeleton (`stub_warning`, `Planner.size_notes`);
+a verified file over either cap is a `size` journal event, a `SIZE:` line
+in BUILD_LOG.txt and a `[size]` caveat in the report — never a refusal. A
+working 300-line file is still working; the cap is a preference the next
+Improve pass can act on, said where the operator reads.
+
+**2. FIM holes — the canvas without the diffusion model** (`fim.py`,
+`docs/FIM_MODE.md`; `ports.FimLLM`, `types.FimRequest` / `FimResult`;
+`SessionConfig.fim` auto / on / off, `fim_candidates` 2). canvas.py's own
+docstring recorded that every provider reported `supports_fim` and nothing
+read it. Now, for a model that fills in the middle, a REPAIR rewrites only
+the body the located error is in — the file before it as the prefix (ending
+in a one-line comment, at the hole's indentation, that says what the old
+body did wrong and the values at the failure; in the prompt only, never on
+disk), the file after it as the suffix — and can touch nothing else: no
+fence, no contract to misread, nothing outside the hole to drop, ~200
+tokens instead of 2,500, and unlike a canvas no 256-token limit, so a long
+body is a hole too. Where the hole goes is canvas.py's rule (the body the
+error is in; else the body a failing test calls; else the body the engine
+doubts most — which the resample's disagreement map now fills for an
+ordinary model); the fill is cleaned and spliced by canvas.py's open-style
+rules and refused when it does not parse, is the old lines again, or
+defines a name the file already has. The same hole failing with the same
+error twice is not filled a third time. **A name in a list is not
+evidence**: at the model check (and after every swap) the session asks the
+model to fill one known hole with one known answer (`fim.probe_request`,
+`probe_verdict`); only a correct fill turns FIM mode on, said in the log
+(`fim on/off — why`) and journaled (`fim` event, `kind: probe`). Devstral's
+card documents FIM for Codestral, not Devstral — so it is probed like
+everything else, and `providers.base.supports_fim` is no longer trusted
+for anything. Providers: `local_llamacpp` builds the prompt from token ids
+(`fim_prompt_ids` — the model's own FIM tokens as single specials, refused
+in a sentence when the tokenizer lacks them); `openai_compatible` uses
+llama-server's `/infill` (the server knows its model's tokens) and falls
+back to `/v1/completions` with `suffix` (vLLM, Ollama). Journal event
+`fim`; `generate` events carry `via: fim`; BUILD_LOG.txt shows the hint,
+every fill and which was kept. Repairs go hole → narrowed edit → whole
+file, each reason for stepping aside said.
+
+**3. Sample again before repairing** (`Loop._resample`; `SessionConfig.
+resample` — 1 for one of the engine's own providers, 0 for any other port
+until the host asks; `resample_max_lines` 150). The journals' most expensive
+pattern: attempt 2 returning the file byte-identical at 0.15, with the
+warmer rungs arriving only at attempts 3–4. When a FIRST attempt of a
+Python file fails its tests, the SAME prompt is asked again at the next
+rung with a new seed before any repair prompt is built — the prefix is in
+the server's cache, so a sample costs one decode — each sample is written
+and verified exactly like the first (tests, the lint and type gates, the
+dropped-code guard, the static screen), and the best (most ok, fewest
+errors) stays on disk as attempt 1. Two by-products: the definitions the
+samples DISAGREE on are where the model was unsure — a doubt map with no
+logprobs (`Loop.doubt`, which FIM and canvas repairs read when a failure
+names no line) — and are named to the repair under `[WHERE THE SAMPLES
+DISAGREED]`; and a sample that passes skips the repair entirely. Not for
+a test file (its disagreements go to the judge), a canvas model (its
+candidates are canvases), a file that does not parse, a culprit elsewhere,
+or a file too long to decode again cheaply. Every reply paid for is one
+`generate` event under the sampling it was made at: the kept sample is
+attempt 1's own, the reply it replaced is journaled as `replaced by sample
+k`, the rest as `resample k of n`; a `resample` event records every
+candidate's verdict and the disagreement.
+
+**4. The values at the failure** (`testrun.py`; `SessionConfig.
+capture_values`, on; `Diagnostic.values`). `enrich.py` put the STATIC
+truth under an error — the real signature, the fields a class has. The
+DYNAMIC truth was never shown: a repair was told `AssertionError: 45.0 !=
+90.0` and had to work out from the source what `x1, y1, x2, y2` had been.
+The project's Python tests now run through a stdlib-only script the engine
+writes into the project (`.cc_state/cc_testrun.py`, rewritten whenever the
+engine's copy changes) that runs the SAME runner with the SAME arguments
+and prints the same output — tracebacks, `Ran N tests`, the exit codes,
+pytest's `FAILED path::test` lines, so every parser keeps working — and
+under each failure one block per frame that matters:
+
+    [VALUES AT THE FAILURE] src/physics.py:118 in bearing_between
+        x1 = 0
+        y1 = 0
+        x2 = 1
+        y2 = 1
+        heading = 45.0
+
+the deepest frame in the PROJECT first (arguments, then locals), then the
+test's own frame (the inputs and the expected value), at most 12 names of
+120 characters; frames inside the interpreter, site-packages, a virtualenv
+or the script itself never. `parse_values` reads the blocks back, `attach`
+puts each on the Diagnostic it belongs to, `diagnostics.feedback` prints
+it under the excerpt, and a FIM hint carries the first four values. No
+model call; exact. The script puts the project root first on `sys.path`
+where `python <script>` would have put `.cc_state/`, and compares Windows
+paths without regard to case.
+
+**5. The type checker's gate** (`typecheck.py`; `LoopConfig.type_gate` /
+`SessionConfig.type_gate` — `typecheck.GATE_CODES` for one of the engine's
+own providers, off for any other port until the host asks; `()` is off).
+bughunt.py ran pyright or mypy for the Evaluate tab; the build loop never
+did, so `'tuple' object has no attribute 'x'`, a keyword the constructor
+does not take and one argument too many were found the slow way, by a
+traceback, one per attempt. Now, after a Python file is written and
+verified, `basedpyright`, `pyright` or `mypy` — whichever the ExecPort
+finds — reads it IN THE PROJECT, so its siblings' real signatures are what
+it checks against, and a finding with one of the codes that are CERTAIN
+bugs (`attr-defined`, `call-arg`, `name-defined`; `reportAttributeAccess
+Issue`, `reportCallIssue`, `reportUndefinedVariable`) joins the verdict as
+a located error, like the lint gate's F821 — whether or not a test reached
+the line. Not `arg-type`, not `union-attr`, not a missing stub for pygame:
+a checker reading half-annotated code is right about those often, not
+always, and a gate that is sometimes wrong teaches the loop to repair code
+that works. Only findings in the file under construction count; mypy's
+cache lives in the project's `.cc_state/`, never under a user profile.
+The absence of all three is one note per session with what it costs and
+which one installs offline (mypy is pure Python; basedpyright ships its own
+Node in the wheel; the `pyright` pip package downloads Node on first run and
+is the wrong choice for an air-gapped machine). bughunt.py reads through
+the same module, so the tab and the loop agree. Journal event `typecheck`;
+`ccoder doctor` names the checker found.
+
+**6. Per-model profiles, calibrated by the bench** (`profiles.py`;
+`SessionConfig.profile`, `profile_dir`; `ccoder bench --calibrate
+[--formats whole|symbols|fim]`; the optional `sampling=` kwarg on
+`LLMPort.complete`). `models.py` decided whether a model is for code;
+everything else was one global default — the Engineer's 0.15, the
+ladder's rungs, whole-file replies until 40 lines. Devstral's card says
+0.15; Qwen3-Coder's says 0.7 with top_p 0.8, top_k 20 and a repetition
+penalty of 1.05, and the engine ran it at Devstral's number; and the
+ladder moved only temperature — `complete()` could not pass a sampler at
+all, so every rung ran on the binding's unrecorded defaults while ATK's
+`chat_stream` had accepted all four since August. A profile holds the
+card's temperature and samplers, the edit format the model gets
+well-formed most often (`auto` / `whole` / `symbols` / `fim`), its FIM
+token order and texts, and its thinking switch; it is found by the loaded
+model's name — a calibrated file beside the engine (`bench/profiles/
+<stem>.json`) first, then the built-in table (Qwen3-Coder, Qwen2.5-Coder,
+Qwen3, Devstral, Codestral, Magistral, Mistral, DeepSeek-Coder, DeepSeek-
+R1, StarCoder, CodeGemma, Granite Code, Code Llama, Gemma 3, GLM-4,
+gpt-oss, DiffusionGemma), then a generic profile that changes nothing —
+and applied at the model check and after every swap: the samplers go with
+every call on a port whose `complete()` names `sampling` (and only there —
+`profiles.accepts` reads the signature, so a 1.0 host never sees it), the
+card's temperature is the ladder's base with the same steps up from it
+(`rungs_for`: a model whose card says 0.7 is not sent to 0.15 and back),
+the edit format sets `narrow` when the operator left it on auto, and the
+`generate` line prints the knobs actually sent. `bench --calibrate` runs
+the suite once per edit format with a live model, measures the well-formed
+rate, the pass rate and tok/s of each, and writes the profile with the
+format that passed most (`source: calibrated`); a `calibrate` journal
+event and `bench/runs/calibrate-*/` keep the evidence. Journal event
+`profile` at every model check.
+
+**7. Thinking models: think for the diagnosis, not for the file**
+(`profiles.ModelProfile.thinking` none / switch / always; `think_off`; the
+optional `thinking=` kwarg on `LLMPort.complete`). Nothing switched
+thinking; `strip_think` cleaned up afterwards. The 17,620-character
+"Wait… No… Actually…" reply of 10-24 was reasoning leaking into a
+file-writing call. For a model with a switch (Qwen3's `/no_think` and
+`enable_thinking`; GLM-4's template) every call whose output the engine
+PARSES — code, JSON, a file list, which is every call but one — is sent
+`thinking=False` where the port takes it, and the profile's text switch is
+appended to the last user message by the engine itself (`profiles.
+soft_switch`, so the cached prefix is untouched and the journal hashes
+what was sent); the diagnosis (`diagnose_first`) is sent `thinking=True`
+with its `max_tokens` as the budget. A model that always thinks
+(Magistral, DeepSeek-R1, gpt-oss) is left to think and stripped as before.
+
+**8. A worked example in each output contract** (`personas.CONTRACT_EDIT`,
+`CONTRACT_SYMBOLS`). A small model follows one correct example of the
+shape better than a paragraph of rules about it — Aider's edit-format
+leaderboard rests on that — and the two contracts whose shape the engine
+has to PARSE were paragraphs. Each now ends with one short example,
+labelled as the shape and not as this file, in names no project file is
+likely to have (`src/tally.py`; `Beacon.bearing_to`). The bench's
+well-formed rate is what measures it. The example is part of the cached
+prefix: it changes per session, never per attempt.
+
+**9. The interview before the build** (`interview.py`; `SessionConfig.
+interview`, off; `Session.interview(request)`; `ccoder build --interview`;
+persona `interviewer`). A small model fills a gap in a request with an
+invention, consistently enough that the invention becomes the build's
+truth: the y-up world that cost ten wrong tests on 10-16 was never in the
+spec, and eleven of twenty-six Debug & Repair sessions on 10-20 were the
+operator typing what the request had not said. Before the plan, ONE
+structured call (`structured.py`, grammar-backed where the host has it)
+lists the decisions the request leaves open that would change the code —
+at most five, each with up to four short options and the answer the
+model would otherwise assume. The host shows them as plain-language
+choices with the default pre-selected (`ask_on_terminal` for the CLI);
+each answer becomes a sentence in the operator's name with MUST in it
+under `## Decisions confirmed by the operator`, which `constraints.py`
+pins into every prompt of the session word for word. Never runs unasked:
+it needs a person, so headless and bench runs never see it; a model that
+returns nothing usable costs one call and a note. Journal event
+`interview`.
+
+**10. The one lever the engine cannot pull** (`docs/SPEED.md`). On 10-16,
+76 % of the wall clock was Devstral decoding at 3–5 tok/s. The engine
+measures speed and cuts tokens; it cannot make a model decode faster —
+that is the inference server. Most of what a build asks a model to write
+is text it was just shown (a whole-file repair, a continuation, a
+narrowed edit's signature and docstring), which is what llama.cpp's
+DRAFTLESS speculative decoding is for: `llama-server --spec-type
+ngram-simple` guesses the next tokens from the prompt itself — no draft
+model, no second GGUF, no VRAM — and llama.cpp's own documentation says
+that mode "fits rewriting source code". ATK's in-process binding has
+prompt-lookup drafting switched off by `_draft_guard` (the binding's
+logits-buffer bug of 09-26), so for ATK this is a `llama-server` feature,
+reached through `ccoder build --url`. The speed probe's under-8-tok/s
+warning and `ccoder doctor` now name the flag when a llama.cpp endpoint
+is answering; SPEED.md is the engine's whole advice to the host.
+
+Public (all additive, a minor version): `FimLLM`, `FimRequest`,
+`FimResult`; `LLMPort.complete(..., sampling=, thinking=)` as OPTIONAL
+keyword arguments a host may decline by not naming them; `Diagnostic.
+values`; `SessionConfig.max_module_lines`, `max_function_lines`,
+`capture_values`, `type_gate`, `profile`, `profile_dir`, `fim`,
+`fim_candidates`, `resample`, `resample_max_lines`, `interview`;
+`Session.interview`; the modules `sizing`, `fim`, `profiles`, `testrun`,
+`typecheck`, `interview`; journal events `size`, `typecheck`, `profile`,
+`fim`, `resample`, `interview`, `calibrate`; persona `interviewer`;
+`ccoder build --interview`, `ccoder bench --calibrate` / `--formats`.
+ATK's host (`atk/core/ccoder_host.py`) takes `sampling` and `thinking`
+(mapped to `chat_stream`'s samplers and `reasoning_strength="off"`),
+implements `fim_fill` on the loaded GGUF through `run_on_model`, and asks
+for `resample=1` and the type gate in its SessionConfig; a settings.json
+key turns either off. ATK's panel gains "Ask me the open questions
+first" beside the mode buttons (on by default, `ccoder.interview`) and
+the dialog that asks them — the model's guess pre-selected, "Build
+without them" pins nothing; `ATKExec.which` looks for a tool beside the
+project's interpreter and ATK's own, because ATK is launched without
+activating its environment and `shutil.which("ruff")` found nothing
+there — the formatter, the lint gate and now the type gate had been
+going without on a machine that had the tools; and `install.bat` installs
+`ruff` and `mypy` into ATK's environment, which it never had.
+
+**Fixed before it shipped — three independent reviews of the change,
+each over a third of it, found thirty-one defects, each reproduced, each
+now a test** (`test_review_oct27_plan` (11), `test_review_oct27_fim` (10),
+`test_review_oct27_loop` (11)):
+- the size rule was measured only on the repair and Continue paths — an
+  ordinary build never measured a file; the PLANNER persona still asked
+  for "the smallest set of files"; the architect's rule asked for a split
+  of the plan that `split_reply` throws away (it now says `# SIZE:` in
+  the stub instead); a test file was held to the module cap; a
+  definition under a module-level `if`/`try` was not measured;
+- the interview's decisions were appended at the END of the request and
+  pinned LAST, so a spec with fifteen MUSTs pushed every confirmed
+  decision into "… and N more, not pinned"; a question holding `e.g.
+  'km/h'` was split by the sentence rule and lost its answer; a long
+  question was cut before its answer; Ctrl+C in the terminal interview
+  CONFIRMED the model's defaults in the operator's name (it is a cancel;
+  EOF declines, pinning nothing); `"options": "up or down"` became the
+  choices `u`/`p`/`o`/`r`; the schema's own placeholder, echoed back, was
+  asked as a question. The decisions block (`constraints.
+  DECISIONS_HEADING`) is now pinned first and whole, one bullet one
+  requirement, up to `DECISION_CHARS` (400), outside the cap;
+- a model that repeated the contract's worked example before its own
+  edit had the example PLACED — in a project with a `Beacon.bearing_to`
+  (a direction-finding tool: the operator's own domain) the real method
+  was replaced; the example is now `ExampleLedger.rounded_total`, held as
+  data (`personas.SYMBOLS_EXAMPLE`, `EDIT_EXAMPLE_*`), and a verbatim
+  echo is dropped by `symedit.reply_code` and `patcher.parse_edits`;
+- a calibration against a dead server measured every format at zero and
+  wrote a profile pinning `symbols` ("narrowest wins") for every later
+  build; no evidence now writes no profile, and says so;
+- a dict that names no profile field (ATK's `ccoder.profile` is the
+  operator's skill level) became a blank "operator" profile that cost
+  Devstral its 0.15 and Qwen its FIM tokens; ignored now, and ATK reads
+  the model profile from `ccoder.model_profile`;
+- FIM: the `generate` event asserted a cache count no host reported
+  (`prompt_processed`) and the report diagnosed a broken prefix cache;
+  `/infill` double-counted cached tokens (`tokens_evaluated` is the whole
+  prompt); `fim_fill` could raise on `http.client`'s own exceptions; the
+  probe passed a server that ignores the suffix (a prefix completion
+  that runs on into `def sub` and hits the token limit now fails it);
+  a refused swap kept the previous model's profile and probe verdict in
+  force; the same-hole key compared raw messages, so an object address
+  made every failure new; an echoed hint comment was spliced into the
+  file; the attempt's record carried the first candidate's sampling when
+  the warmer second fill was kept; the probe was journaled without its
+  tokens; `DeepSeek-R1-0528-Qwen3-8B` matched "qwen3" first (the longest
+  marker now wins);
+- resample: a NARROWED first attempt was resampled as a whole file; a
+  comment-only sample was skipped as identical yet still counted into the
+  doubt map and named in the prompt (definitions are now compared by
+  their AST, docstrings aside, after the identity check); a class whose
+  body differed was dropped from the record; BUILD_LOG.txt showed the
+  first reply's test output under the kept sample's code; the record
+  counted the samples asked for, not drawn;
+- the type gate failed LEGAL code — `s.score = 5` then `s.score` with no
+  `score` declared is Python, and both checkers call it `attr-defined`
+  (an attribute the file assigns anywhere is no longer a certain error;
+  pyright's "Cannot assign to attribute" never is); `check()` never read
+  the exit code, so a checker that could not start was "ran, found
+  nothing"; a timed-out checker was retried on every attempt for the
+  rest of the session, silently after the first; `LoopConfig.type_gate`
+  defaulted on, so every directly-built Loop in the suite ran whatever
+  checker the machine had (off; the Session decides, as for `resample`);
+  `pyright` — the pip package that downloads Node into a user folder —
+  ranked above mypy; enrich's fact for mypy's `… for "move" of "Ship"`
+  named the first `move` in the project, not `Ship.move`;
+- a structured ask that was cancelled was retried as "the reply was
+  empty"; a non-Python repair logged a FIM decision on every attempt.
+
+Tests: `test_fim` (20), `test_profiles` (15), `test_sizing` (12),
+`test_typecheck` (12), `test_values` (12), `test_interview` (6),
+`test_resample` (7), `test_contract_examples` (5), the three review
+suites (32), and additions to `test_bench`; ATK's `tests/test_ccoder.py`
+gains sections [16] and [17]. Whole suite (Python 3.13, Linux): 1673
+pass, 14 skipped.
+
 ### Added — a reply going in circles; a wrong assertion named, not obeyed (2026-10-24)
 
 Bill, on ATK's Live tab: "i think something isn't working right, and the

@@ -64,6 +64,27 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         r"'(?P<attr>\w+)'")),
     ("name_error", re.compile(
         r"NameError: name '(?P<name>\w+)' is not defined")),
+    # THE TYPE CHECKER'S SHAPES (typecheck.py, 2026-10-27): the same facts
+    # answer mypy's and pyright's wording, so a gated finding reaches the
+    # repair with the real definition under it, like a traceback does.
+    ("object_attr", re.compile(
+        r'"(?P<cls>\w+)" has no attribute "(?P<attr>\w+)"')),
+    ("object_attr", re.compile(
+        r'Cannot access attribute "(?P<attr>\w+)" for class '
+        r'"(?P<cls>\w+)')),
+    # mypy says `for "move" of "Ship"`: the class is a second group, and
+    # the fact must be `Ship.move`'s — not the first `move` in the project
+    # (the 2026-10-27 review)
+    ("bad_kwarg", re.compile(
+        r'Unexpected keyword argument "(?P<arg>\w+)" for '
+        r'"(?P<callable>[\w.]+)"(?: of "(?P<owner>\w+)")?')),
+    ("bad_kwarg", re.compile(
+        r'No parameter named "(?P<arg>\w+)"(?: for "(?P<callable>[\w.]+)")?')),
+    ("arity", re.compile(
+        r'(?:Too many|Too few|Missing positional) arguments? for '
+        r'"(?P<callable>[\w.]+)"(?: of "(?P<owner>\w+)")?')),
+    ("name_error", re.compile(
+        r'Name "(?P<name>\w+)" is not defined')),
 )
 
 MAX_FACTS = 4
@@ -130,6 +151,10 @@ def _no_module(g: dict, *, store: Any, fs: Any) -> str:
 
 
 def _bad_kwarg(g: dict, *, store: Any, fs: Any) -> str:
+    if not g.get("callable"):
+        return ""
+    if g.get("owner") and "." not in g["callable"]:
+        g = dict(g, callable=f"{g['owner']}.{g['callable']}")
     return _callable_fact(g["callable"], store=store, fs=fs,
                           lead=f"`{g['callable']}` has no parameter "
                                f"`{g['arg']}`.")
@@ -141,6 +166,8 @@ def _no_args(g: dict, *, store: Any, fs: Any) -> str:
 
 
 def _arity(g: dict, *, store: Any, fs: Any) -> str:
+    if g.get("owner") and "." not in g["callable"]:
+        g = dict(g, callable=f"{g['owner']}.{g['callable']}")
     return _callable_fact(g["callable"], store=store, fs=fs,
                           lead=f"The call to `{g['callable']}` does not match "
                                f"its signature.")

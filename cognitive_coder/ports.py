@@ -45,6 +45,8 @@ from .types import (
     CanvasRequest,
     CanvasResult,
     Completion,
+    FimRequest,
+    FimResult,
     Message,
     ModelCapabilities,
     ModelSlot,
@@ -153,6 +155,23 @@ class LLMPort(Protocol):
         5. Set `Completion.model` to what actually answered, every time —
            the host may have swapped models since the last call (§0.1) and
            the journal records it per call (C8).
+
+        *Two OPTIONAL keyword arguments* (2026-10-27, a minor version). The
+        core sends each one only to a `complete` whose signature names it
+        (or takes `**kw`), so a host written to the 1.0 signature never
+        sees either:
+
+        - ``sampling``: a dict of the model profile's samplers, in
+          llama.cpp's names — ``top_p``, ``top_k``, ``min_p``,
+          ``repeat_penalty`` — for the host to pass to its sampler where
+          it has them (`profiles.py`). A host may ignore any it lacks.
+        - ``thinking``: ``False`` to turn a reasoning model's thinking OFF
+          for this call (every call whose output the core parses — code,
+          JSON, a file list), ``True`` to turn it on with the call's
+          ``max_tokens`` as the budget (a diagnosis). Sent only for a model
+          whose profile has a switch. A host applies it through its chat
+          template (``enable_thinking``) where it can; the core also
+          appends the profile's text switch (``/no_think``) itself.
         """
         ...
 
@@ -223,6 +242,39 @@ class CanvasLLM(Protocol):
            the free region. ``text`` is the free region only.
         3. Generation-wise the request is a non-thinking reply: the free
            region starts at the very first position of the reply.
+        """
+        ...
+
+
+@runtime_checkable
+class FimLLM(Protocol):
+    """OPTIONAL, beside `LLMPort`: a model that fills in the middle.
+
+    Fill-in-the-middle (fim.py, docs/FIM_MODE.md, 2026-10-27) is the
+    autoregressive cousin of the canvas: the model is given the code before
+    and after a hole, in the FIM format it was trained on, and writes only
+    the hole. A host whose loaded model has FIM tokens implements this one
+    method on the SAME object as its `LLMPort`; the core PROBES it at the
+    model check (a known hole, a known answer) and uses it for repairs
+    only when the probe passed — never on the strength of a name. A host
+    without it never sees a call, exactly like `CanvasLLM`.
+    """
+
+    def fim_fill(self, request: FimRequest, *,
+                 cancel: CancelToken | None = None) -> FimResult:
+        """Write what goes between ``request.prefix`` and ``request.suffix``.
+
+        *A host must guarantee*:
+
+        1. **This MUST NOT raise** (as M11 for `complete`). A model with no
+           FIM tokens, a server that refuses, a Stop — each comes back as a
+           `FimResult` with ``finish_reason`` "error" (and an ``error``
+           sentence) or "cancelled". The core falls back to its other
+           paths on any of them.
+        2. ``text`` is the middle only: never the prefix, never the suffix,
+           never the FIM tokens themselves.
+        3. The request's ``temperature`` and ``seed`` are honoured, so two
+           candidates with different seeds are two different fills.
         """
         ...
 
@@ -489,9 +541,13 @@ class ScriptedLLM:
         self._tools = supports_tools
         self._ctx = context_tokens
         self.prompts: list[tuple[Message, ...]] = []
+        #: The keyword arguments of each call, in order — what a test reads
+        #: to see the sampling and the thinking switch a call was sent.
+        self.calls: list[dict] = []
 
     def complete(self, messages: Sequence[Message], **kw) -> Completion:
         self.prompts.append(tuple(messages))
+        self.calls.append(dict(kw))
         if not self._replies:
             raise AssertionError(
                 "ScriptedLLM ran out of replies — the engine asked for more "

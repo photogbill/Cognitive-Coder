@@ -347,11 +347,23 @@ _FENCED = re.compile(r"```[ \t]*([\w+#.-]*)[^\n]*\n(.*?)```", re.S)
 _PY_TAGS = ("", "python", "py", "python3", "py3")
 
 
+def _is_contract_example(block: str) -> bool:
+    """The output contract's own worked example, echoed back verbatim: not
+    a reply, never placed (the 2026-10-27 review)."""
+    from . import personas
+    return (" ".join(block.split()) == " ".join(
+        personas.SYMBOLS_EXAMPLE.split()))
+
+
 def reply_code(text: str) -> str:
-    """The code of a reply: every Python fence, in order, else the text."""
+    """The code of a reply: every Python fence, in order, else the text —
+    the contract's own example, repeated, left out."""
     body = _norm(text)
-    blocks = [m.group(2) for m in _FENCED.finditer(body)
+    fences = [m.group(2) for m in _FENCED.finditer(body)
               if m.group(1).lower() in _PY_TAGS]
+    blocks = [b for b in fences if not _is_contract_example(b)]
+    if fences and not blocks:
+        return ""           # the example alone is no reply at all
     if blocks:
         return "\n\n".join(b.strip("\n") + "\n" for b in blocks)
     m = re.search(r"```[ \t]*(?:python3?|py3?)?[ \t]*\n", body)

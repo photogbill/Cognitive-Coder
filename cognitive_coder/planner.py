@@ -52,7 +52,7 @@ import posixpath
 import re
 from typing import Any
 
-from . import interfaces, langs
+from . import interfaces, langs, profiles, sizing
 from .codemap import parse_python, parse_regex
 from .errors import Cancelled
 from .personas import (
@@ -152,6 +152,18 @@ class Planner:
     conventions: list = field(default_factory=list)
     #: What the import of the skeleton said, per module, for the log.
     import_notes: list = field(default_factory=list)
+    #: PLAN FOR THE MODEL'S REACH (sizing.py, 2026-10-27): the planner is
+    #: told to size files for about this many lines and the architect to
+    #: keep functions under the second; a pinned stub that will plainly
+    #: outgrow the first is said at the skeleton. 0 switches either off.
+    max_module_lines: int = sizing.DEFAULT_MODULE_LINES
+    max_function_lines: int = sizing.DEFAULT_FUNCTION_LINES
+    #: The skeleton's size warnings, per path, for the session's log.
+    size_notes: dict = field(default_factory=dict)
+    #: The model profile (profiles.py): its samplers go with the plan and
+    #: the interface calls, and its thinking switch is thrown off for
+    #: both — a file list and a skeleton are parsed, not read.
+    profile: Any = None
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -159,13 +171,19 @@ class Planner:
         self.prompts.profile = dict(profile or self.prompts.profile)
         layout = self.observe_layout()
         persona = PERSONAS["planner"]
-        task_text = _plan_prompt(request, self.lang, layout)
+        task_text = _plan_prompt(request, self.lang, layout,
+                                 size_rule=sizing.planner_rule(
+                                     self.max_module_lines,
+                                     self.max_function_lines))
         prompt = self.prompts.build(persona, task_text,
                                     architecture=self._architecture(),
                                     contract=CONTRACT_LIST)
         completion = self.host.llm.complete(
-            prompt.messages(), temperature=persona.temperature,
-            max_tokens=700)
+            profiles.soft_switch(prompt.messages(), self.profile,
+                                 thinking=False),
+            temperature=persona.temperature, max_tokens=700,
+            **profiles.call_kwargs(self.host.llm, self.profile,
+                                   thinking=False))
         rows, not_code = _parse_file_list_with_skipped(
             strip_think(completion.text))
 
@@ -614,7 +632,10 @@ class Planner:
             persona,
             interfaces.task_text(plan.request,
                                  [(t.path, t.purpose) for t in modules],
-                                 tests=tests, existing=existing),
+                                 tests=tests, existing=existing,
+                                 size_rule=sizing.architect_rule(
+                                     self.max_module_lines,
+                                     self.max_function_lines)),
             architecture=self._architecture(), contract=CONTRACT_FILES)
         messages = prompt.messages()
         self.host.emit("status",
@@ -628,8 +649,10 @@ class Planner:
                      min(400 * len(modules), 8192))
         try:
             completion = self.host.llm.complete(
-                messages, temperature=persona.temperature,
-                max_tokens=budget)
+                profiles.soft_switch(messages, self.profile, thinking=False),
+                temperature=persona.temperature, max_tokens=budget,
+                **profiles.call_kwargs(self.host.llm, self.profile,
+                                       thinking=False))
         except (AssertionError, Cancelled):
             raise           # a cancel, or a scripted model out of replies
         except Exception as exc:                         # noqa: BLE001
@@ -675,6 +698,15 @@ class Planner:
             stub = interfaces.with_conventions(stub, task.path,
                                                self.conventions)
             out[task.path] = stub
+            # PLAN FOR THE MODEL'S REACH (sizing.py): a stub that already
+            # declares more than its module can hold is said now, while
+            # the operator can still split it, not after the build.
+            size_note = sizing.stub_warning(
+                stub, task.path, max_module=self.max_module_lines)
+            self.size_notes.pop(task.path, None)      # this call's verdict
+            if size_note:
+                self.size_notes[task.path] = size_note
+                notes.append(size_note)
             if dropped:
                 notes.append(f"{task.path}: dropped "
                              + ", ".join(dropped[:4])
@@ -1457,10 +1489,12 @@ def _required_tests(request: str) -> list[str]:
     return out
 
 
-def _plan_prompt(request: str, lang: str, layout: dict) -> str:
+def _plan_prompt(request: str, lang: str, layout: dict,
+                 size_rule: str = "") -> str:
     lang_obj = langs.get(lang)
     lines = [
-        "Break this request into the smallest set of files that delivers it.",
+        "Break this request into the set of files that delivers it, each "
+        "small enough to be written and repaired one function at a time.",
         "",
         f"REQUEST: {request}",
         "",
@@ -1473,9 +1507,11 @@ def _plan_prompt(request: str, lang: str, layout: dict) -> str:
         lines.append(f"Files that already exist: {shown}")
     lines += [
         "",
-        "Rules: three to five files is usually right. Do not invent "
+        "Rules: three to five files is usually right for a short request; "
+        "a long specification needs as many as its parts. Do not invent "
         "structure the request does not need. Do not list test files — they "
-        "are paired automatically.",
+        "are paired automatically."
+        + (f" {size_rule}" if size_rule else ""),
     ]
     return "\n".join(lines)
 
@@ -1684,7 +1720,7 @@ def _place_tests(ordered: Sequence[Task], depends: dict[str, set],
     A test that depends on more than its module (its file already exists
     and imports others) is placed after the last of those, never earlier.
     """
-    tests = {tid for tid in covered}
+    tests = set(covered)
     rest = [t for t in ordered if t.id not in tests]
     by_module: dict[str, list[Task]] = {}
     for t in ordered:

@@ -175,6 +175,13 @@ numbered obligations is met; 48 have a test that asserts it
 | **Narrowed edits** | a repair or change returns only the functions it rewrites, put back by name; long files and files too large to show whole become repairable (F5) |
 | **The dropped-code guard** | a reply that leaves out code the file had, or writes `# ... rest unchanged`, is refused before it is written |
 | **The regression suite** | `ccoder bench`: tasks graded by hidden tests, each run compared with the last, replay of recorded replies with no model |
+| **FIM holes** | a model that fills in the middle repairs only the body the error is in — probed at the model check, never trusted by name (`docs/FIM_MODE.md`) |
+| **Sample before repair** | a failed first attempt is sampled again at a new seed before any repair; the best stays; where the samples disagree is the repair's doubt map |
+| **The values at the failure** | the locals of the frame that failed, printed under every test failure by a stdlib-only runner and shown to the repair |
+| **The type checker's gate** | mypy / basedpyright / pyright in the loop: a wrong attribute, a wrong call, an undefined name fail the attempt before a test has to reach them |
+| **Model profiles** | the model card's sampling and temperature, its edit format, its FIM tokens and its thinking switch, per family; `ccoder bench --calibrate` measures a model's own |
+| **The size rule** | modules of ~200 lines and functions of ~40, asked of the planner and measured on what came back |
+| **The interview** | the decisions a request leaves open, asked once before the plan and pinned as hard requirements (`ccoder build --interview`) |
 
 **The review stage says something worth knowing about C5.** On the worked
 example the model reported "reads fine to me" while the deterministic scanner
@@ -245,6 +252,10 @@ never reported as unqualified success.**
 - `docs/NARROWED_EDITS.md` — how an existing file is changed: narrowed
   edits, the dropped-code guard, marked error lines, regression memory
 - `docs/BENCH.md` — the regression suite, `ccoder bench`, and replay
+- `docs/FIM_MODE.md` — holes for an ordinary code model: where a hole goes,
+  the probe, the providers that fill one
+- `docs/SPEED.md` — where the minutes go, and the draftless speculative
+  decoding the inference server can turn on
 - `COGNITIVE_CODER_BUILD_SPEC_v1.1.md` — the full specification this
   implements, including the reasoning behind every constraint
 

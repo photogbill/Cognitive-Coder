@@ -43,7 +43,7 @@ real one. Diffusion canvases are not recorded: replay is for chat models.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import json
 import os
@@ -469,7 +469,8 @@ def run_task(task: BenchTask, folder: Path, llm: Any, *,
 
 def _journal_counts(session: Any) -> dict:
     out = {"narrow_placed": 0, "narrow_unplaced": 0, "keep_refused": 0,
-           "generations": 0}
+           "generations": 0, "fim_filled": 0, "fim_tried": 0,
+           "tokens_out_total": 0, "decode_ms_total": 0, "resamples": 0}
     try:
         events = session.journal.events()
     except Exception:                                    # noqa: BLE001
@@ -484,6 +485,14 @@ def _journal_counts(session: Any) -> dict:
             out["keep_refused"] += 1
         elif kind == "generate":
             out["generations"] += 1
+            out["tokens_out_total"] += int(e.get("tokens_out") or 0)
+            out["decode_ms_total"] += int(e.get("decode_ms") or 0)
+        elif kind == "fim" and data.get("kind") == "repair":
+            out["fim_tried"] += 1
+            if data.get("kept") is not None:
+                out["fim_filled"] += 1
+        elif kind == "resample":
+            out["resamples"] += 1
     return out
 
 
@@ -637,6 +646,147 @@ def summarise(rows: Sequence[dict], before: Sequence[dict], name: str,
     if problems:
         lines += ["", "## Suite problems", ""] + [f"- {p}" for p in problems]
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# calibration: which edit format THIS model gets right (profiles.py)
+# --------------------------------------------------------------------------
+
+#: The formats a calibration runs the suite under, and the settings each
+#: one is: whole files always; named definitions for every change; holes
+#: first (which the session's probe may turn off — then the format is not
+#: offered).
+FORMATS: tuple[tuple[str, dict], ...] = (
+    ("whole", {"narrow": "off", "fim": "off"}),
+    ("symbols", {"narrow": "always", "fim": "off"}),
+    ("fim", {"narrow": "auto", "fim": "auto"}),
+)
+
+
+def measure(rows: Sequence[dict]) -> dict:
+    """What one run of the suite says about a format: tasks passed, hidden
+    tests passed, the well-formed rate (generations that were placed and
+    kept, over all generations), and tok/s where the journal timed it."""
+    gens = sum(r.get("generations", 0) for r in rows)
+    refused = sum(r.get("narrow_unplaced", 0) + r.get("keep_refused", 0)
+                  for r in rows)
+    tried = sum(r.get("fim_tried", 0) for r in rows)
+    filled = sum(r.get("fim_filled", 0) for r in rows)
+    tokens = sum(r.get("tokens_out_total", 0) for r in rows)
+    ms = sum(r.get("decode_ms_total", 0) for r in rows)
+    return {
+        "tasks": len(rows),
+        "passed": sum(1 for r in rows if r.get("ok")),
+        "hidden_passed": sum(r.get("hidden", {}).get("passed", 0)
+                             for r in rows),
+        "hidden_total": sum(r.get("hidden", {}).get("total", 0)
+                            for r in rows),
+        "generations": gens,
+        "well_formed": round(1.0 - refused / gens, 3) if gens else 0.0,
+        "fim_tried": tried, "fim_filled": filled,
+        "tok_s": round(tokens / (ms / 1000.0), 1) if ms > 0 else 0.0,
+        "seconds": round(sum(r.get("seconds", 0) for r in rows), 1),
+    }
+
+
+def choose_format(measured: Mapping[str, Mapping[str, Any]]) -> str:
+    """The format to write into the profile: most tasks passed, then most
+    hidden tests, then the best well-formed rate, then the narrowest
+    (fim > symbols > whole) — a tie goes to the one that writes least."""
+    order = {"fim": 0, "symbols": 1, "whole": 2}
+    # a format that passed nothing and generated nothing is no evidence —
+    # a dead server measures every format at zero, and "narrowest wins"
+    # would then pin `symbols` for every later build (the 2026-10-27
+    # review); a format needs at least one generation to be judged
+    def evidence(v: Mapping[str, Any]) -> bool:
+        return bool(v.get("generations", 0) or v.get("passed", 0)
+                    or v.get("hidden_passed", 0))
+    usable = {k: v for k, v in measured.items()
+              if evidence(v) and (k != "fim" or v.get("fim_filled", 0) > 0)}
+    if not usable or not any(v.get("passed", 0) > 0
+                             or v.get("hidden_passed", 0) > 0
+                             for v in usable.values()):
+        return "auto"
+    best = max(usable.items(), key=lambda kv: (
+        kv[1].get("passed", 0), kv[1].get("hidden_passed", 0),
+        kv[1].get("well_formed", 0.0), -order.get(kv[0], 9)))
+    return best[0]
+
+
+def calibrate(make_llm: Callable[[BenchTask, Path], Any],
+              model_name: str, *, suite: Path | str = SUITE_DIR,
+              out: Path | str = RUNS_DIR, only: Sequence[str] = (),
+              formats: Sequence[str] = (), config: dict | None = None,
+              say: Callable[[str], None] = print, events: Any = None,
+              ex: Any = None, profile_dir: Path | str | None = None) -> dict:
+    """Run the suite once per edit format and write the model's profile
+    (profiles.py) with the format it got right most often and what was
+    measured. Returns the report (also written as `CALIBRATION.md` in the
+    runs folder)."""
+    from . import profiles
+    wanted = [f for f, _c in FORMATS if not formats or f in formats]
+    measured: dict[str, dict] = {}
+    runs: dict[str, str] = {}
+    for name in wanted:
+        settings = dict(config or {})
+        settings.update(dict(FORMATS)[name])
+        say(f"== calibrating: {name} ==")
+        run = run_suite(make_llm, suite=suite, out=out, only=only,
+                        label=f"calibrate-{name}", config=settings, say=say,
+                        events=events, ex=ex)
+        measured[name] = measure(run.rows)
+        runs[name] = run.path.name
+    chosen = choose_format(measured)
+    base = profiles.profile_for(model_name, directory=profile_dir)
+    if base.source == "calibrated":
+        base = profiles.builtin_for(model_name)
+    report = {"model": model_name, "chosen": chosen, "measured": measured,
+              "runs": runs, "profile": ""}
+    if chosen == "auto":
+        # nothing was measured (a dead server, every task errored): no
+        # profile is written, and a stale one from an earlier calibration
+        # is left as it was — said, never pinned
+        say("calibration measured no passing generation in any format; "
+            "no profile was written")
+        report["problem"] = ("no format passed a task or a hidden test — "
+                             "the model server may have been down; the "
+                             "profile is unchanged")
+    else:
+        profile = profiles.replace(
+            base, edit_format=chosen,
+            measured={"formats": measured, "runs": runs,
+                      "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "model": model_name})
+        path = profiles.save_calibrated(model_name, profile,
+                                        directory=profile_dir)
+        report["profile"] = str(path)
+    text = calibration_text(report)
+    try:
+        (Path(out) / "CALIBRATION.md").write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    report["text"] = text
+    return report
+
+
+def calibration_text(report: Mapping[str, Any]) -> str:
+    lines = [f"# Calibration — {report.get('model', '')}", "",
+             "| format | tasks passed | hidden tests | well-formed | "
+             "fim filled/tried | tok/s | seconds | run |",
+             "|---|---|---|---|---|---|---|---|"]
+    for name, m in (report.get("measured") or {}).items():
+        lines.append(
+            f"| {name} | {m.get('passed', 0)}/{m.get('tasks', 0)} | "
+            f"{m.get('hidden_passed', 0)}/{m.get('hidden_total', 0)} | "
+            f"{m.get('well_formed', 0.0):.0%} | "
+            f"{m.get('fim_filled', 0)}/{m.get('fim_tried', 0)} | "
+            f"{m.get('tok_s', 0.0)} | {m.get('seconds', 0)} | "
+            f"{(report.get('runs') or {}).get(name, '')} |")
+    lines += ["", f"**Chosen edit format: `{report.get('chosen')}`** — "
+                  f"written to `{report.get('profile', '')}`; the next "
+                  f"session on this model reads it before the built-in "
+                  f"table.", ""]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------

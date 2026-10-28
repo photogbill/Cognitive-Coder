@@ -271,7 +271,10 @@ def check(*, fs: Any, ex: Any, make_fs: Any, run_tests: Any, path: str,
             report.tried.append((m, not getattr(res, "ok", False)))
         return report
     finally:
-        for p in written:
+        # the harness-owned test runner (testrun.py) writes itself into
+        # the copy's own .cc_state on the first run; it goes with the copy
+        from .testrun import SCRIPT_REL as _runner_script
+        for p in [*written, f"{copy_rel}/{_runner_script}"]:
             try:
                 fs.delete(p)
             except Exception:                            # noqa: BLE001

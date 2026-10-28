@@ -121,11 +121,23 @@ def ask(session: Any, persona: Any, task: str, *, keys: tuple[str, ...],
         kw["grammar"] = JSON_GRAMMAR
     if cancel is not None:
         kw["cancel"] = cancel
+    # the model profile (profiles.py): its samplers, and thinking OFF —
+    # a reasoning model's thinking in front of a grammar-constrained JSON
+    # object is a reply that is neither
+    from . import profiles
+    prof = getattr(session, "model_profile", None)
+    kw.update(profiles.call_kwargs(llm, prof, thinking=False))
+    messages = profiles.soft_switch(messages, prof, thinking=False)
     completion = llm.complete(messages, **kw)
+    if completion.finish_reason == "cancelled":
+        # a Stop is a stop, not "the reply was empty" to be asked again
+        # (the 2026-10-27 review)
+        from .errors import Cancelled
+        raise Cancelled("a structured ask")
     text = strip_think(completion.text or "")
     problem = _problem(text, keys)
     attempts = 1
-    if problem and retry:
+    if problem and retry and completion.finish_reason != "error":
         attempts = 2
         from .types import Message
         shown = text.strip()[:300] or "(nothing)"
@@ -138,6 +150,9 @@ def ask(session: Any, persona: Any, task: str, *, keys: tuple[str, ...],
                 f"No explanation."))]
         kw["temperature"] = min(temperature, 0.1)
         completion = llm.complete(messages, **kw)
+        if completion.finish_reason == "cancelled":
+            from .errors import Cancelled
+            raise Cancelled("a structured ask")
         text = strip_think(completion.text or "")
         problem = _problem(text, keys)
     data = None if problem else find_json_object(text, keys=keys)

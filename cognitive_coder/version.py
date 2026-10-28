@@ -10,7 +10,7 @@ nothing and works in every case.
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # The API surface frozen at 1.0 is `cognitive_coder/__init__.py` (C9). Until
 # then this is pre-release and the Ports may still move; after 1.0 a breaking

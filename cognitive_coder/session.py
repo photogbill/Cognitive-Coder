@@ -38,8 +38,18 @@ import time
 from typing import Any
 import uuid
 
+from . import fim as fim_mod
 from . import journal as journal_mod
-from . import langs, models, personas, resumable, runner, speclint
+from . import (
+    langs,
+    models,
+    personas,
+    profiles,
+    resumable,
+    runner,
+    sizing,
+    speclint,
+)
 from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import (
@@ -215,6 +225,57 @@ class SessionConfig:
     #: Opt-in: one short "what is wrong and what to change" call before
     #: each repair, shown to the repair (Aider's architect/editor split).
     diagnose_first: bool = False
+    #: PLAN FOR THE MODEL'S REACH (sizing.py, 2026-10-27). The planner is
+    #: told to size each file for about `max_module_lines`, the architect
+    #: and every prompt to keep a function under `max_function_lines`; a
+    #: pinned stub that will plainly outgrow the first is said at the
+    #: skeleton, and a verified file over either is a `size` journal event,
+    #: a build-log line and a report caveat — never a refusal. 0 is off.
+    max_module_lines: int = sizing.DEFAULT_MODULE_LINES
+    max_function_lines: int = sizing.DEFAULT_FUNCTION_LINES
+    #: THE VALUES AT THE FAILURE (testrun.py, 2026-10-27): the locals of
+    #: the frame that failed and of the test, printed by the harness-owned
+    #: test runner and shown to every repair under the error.
+    capture_values: bool = True
+    #: THE TYPE CHECKER'S GATE (typecheck.py, 2026-10-27): the codes that
+    #: fail an attempt. None: `typecheck.GATE_CODES` for a real model port
+    #: and off for the scripted test doubles (whose suites would otherwise
+    #: have to script replies to findings the checker makes about their
+    #: fixtures); () switches it off; a tuple names the codes. "A real
+    #: model port" means one of the engine's own providers; a host with
+    #: its own port (ATK) asks for the gate in its SessionConfig.
+    type_gate: tuple[str, ...] | None = None
+    #: THE MODEL PROFILE (profiles.py, 2026-10-27): a host may hand the
+    #: session one (a dict of ModelProfile's fields); otherwise the
+    #: calibrated file for the loaded model, else the built-in table by
+    #: name. Its samplers go with every call the port takes them on, its
+    #: temperature is the ladder's base, its edit format sets `narrow`
+    #: when that is still "auto", and its thinking switch is thrown off
+    #: for every parsed reply. `profile_dir` is where calibrated files
+    #: are looked for (None: `bench/profiles/` beside the engine).
+    profile: dict | None = None
+    profile_dir: str | None = None
+    #: FIM MODE (fim.py, docs/FIM_MODE.md, 2026-10-27). "auto": when the
+    #: host fills in the middle and the probe at the model check finds
+    #: the loaded model fills a known hole correctly, a repair rewrites
+    #: only the hole its error is in; "on": the same, probing even the
+    #: scripted test doubles; "off": never.
+    fim: str = "auto"
+    fim_candidates: int = 2
+    #: SAMPLE AGAIN BEFORE REPAIRING (2026-10-27): extra samples of the
+    #: same prompt when a first attempt fails, the best kept, the
+    #: definitions they disagree on shown to the repair. None: 1 for one
+    #: of the engine's own providers, 0 for any other port (a scripted
+    #: double, a host's own port — ATK asks for it in its SessionConfig);
+    #: 0 switches it off.
+    resample: int | None = None
+    resample_max_lines: int = 150
+    #: THE INTERVIEW BEFORE THE BUILD (interview.py, 2026-10-27): a host
+    #: that has a person to ask sets this and calls `Session.interview`
+    #: before `run`, then runs the request the answers were applied to.
+    #: The core never asks on its own — a build with nobody there would
+    #: stall — so False is the default and headless runs never see it.
+    interview: bool = False
     #: CONTINUE (resumable.py, 2026-10-23): before a continued build writes
     #: anything, the files already on disk are checked when anything may
     #: have changed since the last run — a file the operator fixed by hand
@@ -265,7 +326,10 @@ class Session:
             if self.config.use_skills else skills_mod.SkillLoad())
         conventions = "\n\n".join(
             part for part in (self.config.conventions,
-                              self.skill_load.block()) if part)
+                              self.skill_load.block(),
+                              sizing.rule_text(self.config.max_module_lines,
+                                               self.config.max_function_lines))
+            if part)
         self.prompts = personas.PromptBuilder(
             model_system_prompt=self.config.model_system_prompt,
             conventions=conventions)
@@ -277,7 +341,9 @@ class Session:
                                pair_tests=self.config.pair_tests,
                                pin_interfaces=self.config.pin_interfaces,
                                max_tokens=self.config.max_tokens,
-                               test_first=self.config.test_first)
+                               test_first=self.config.test_first,
+                               max_module_lines=self.config.max_module_lines,
+                               max_function_lines=self.config.max_function_lines)
         self.loop = Loop(
             host, codemap=self.codemap, patcher=self.patcher,
             journal=self.journal, prompts=self.prompts,
@@ -305,7 +371,14 @@ class Session:
                 narrow_min_lines=self.config.narrow_min_lines,
                 mark_errors=self.config.mark_errors,
                 recall_fixes=self.config.recall_fixes,
-                diagnose_first=self.config.diagnose_first))
+                diagnose_first=self.config.diagnose_first,
+                capture_values=self.config.capture_values,
+                type_gate=self._resolve_type_gate(host),
+                fim=("off" if str(self.config.fim or "auto").lower() == "off"
+                     else "auto"),
+                fim_candidates=self.config.fim_candidates,
+                resample=self._resolve_resample(host),
+                resample_max_lines=self.config.resample_max_lines))
         #: The readable log is the Loop's too — it is where the verify
         #: phases happen, and their output is the whole point of the file.
         self.loop.log = self.log
@@ -330,6 +403,11 @@ class Session:
         self.constraints: Any = None
         #: One MutationReport per checked file (mutation.py).
         self.mutation: list = []
+        #: Files over the size rule (sizing.Measure), for the report.
+        self.size_findings: list = []
+        #: The model profile in force (profiles.ModelProfile), from the
+        #: model check on; the loop and the planner read it from here.
+        self.model_profile: Any = None
         self._model: str = ""
         self._context: int = 0
         self._started = 0.0
@@ -357,6 +435,56 @@ class Session:
         #: minutes in is four minutes thrown away. This one lets the file in
         #: hand finish (verified or not) and stops before the next.
         self.stop_token = Cancel()
+
+    # ------------------------------------------------------------------
+    # the interview before the build (interview.py)
+    # ------------------------------------------------------------------
+    def interview(self, request: str, *, max_questions: int = 5) -> Any:
+        """The decisions the request leaves open, as questions for the
+        operator — one model call, no file written. The host shows them,
+        collects answers (`interview.answer`), and runs
+        `interview.apply(request)`; the decisions become hard requirements
+        pinned in every prompt of the session."""
+        from . import interview as interview_mod
+        self._where = "the interview"
+        caps = self._capabilities(boundary="the interview")
+        if self.model_profile is None:
+            # the model check has not run yet: the profile is needed so
+            # the structured ask gets the right samplers and no thinking
+            self.model_profile = profiles.profile_for(
+                caps.name, given=self.config.profile,
+                directory=self.config.profile_dir)
+        result = interview_mod.ask(self, request, max_questions=max_questions,
+                                   cancel=self.cancel_token)
+        self.log.event("INTERVIEW", interview_mod.summary(result))
+        for q in result.questions:
+            self.log.line(f"  ? {q.question}  [{' / '.join(q.options)}; "
+                          f"default: {q.default}]")
+        if result.problem:
+            self.log.line(f"  NOTE: {result.problem}")
+        self.host.emit("status", interview_mod.summary(result),
+                       {"phase": "interview",
+                        "questions": [q.as_dict() for q in result.questions],
+                        "problem": result.problem})
+        return result
+
+    def _resolve_resample(self, host: Host) -> int:
+        """`resample` as the loop gets it: the config's number, or one
+        extra sample for a real model port and none for the scripted
+        doubles — the speed probe's rule, for the same reason."""
+        if self.config.resample is not None:
+            return max(0, int(self.config.resample))
+        return 1 if _real_provider(host.llm) else 0
+
+    def _resolve_type_gate(self, host: Host) -> tuple[str, ...]:
+        """`type_gate` as the loop gets it: the config's tuple, or the
+        default codes for a real model port and nothing for the scripted
+        doubles (the speed probe's rule, for the same reason)."""
+        if self.config.type_gate is not None:
+            return tuple(self.config.type_gate)
+        from . import typecheck
+        return tuple(typecheck.GATE_CODES) if _real_provider(host.llm) \
+            else ()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -399,7 +527,10 @@ class Session:
                         "max_tokens": self.config.max_tokens,
                         "max_files": self.config.max_files,
                         "lang": self.config.lang,
-                        "diffusion": self._diffusion_state(caps)})
+                        "diffusion": self._diffusion_state(caps),
+                        "fim": fim_mod.describe_state(
+                            self.loop.fim_ok, self.loop.fim_why,
+                            self.config.fim_candidates)})
         self._speed_probe(caps, after="the model check")
         caps = self._plan_hybrid(caps)
         self._pin_constraints(request, source="the request")
@@ -612,6 +743,11 @@ class Session:
             self.log.line(f"  NOTE: {path} keeps a plain stub — {why}")
         for note in getattr(self.planner, "import_notes", ()) or ():
             self.log.line(f"  NOTE: {note}")
+        for path, note in (getattr(self.planner, "size_notes", {})
+                           or {}).items():
+            self.log.line(f"  SIZE: {note}")
+            self.host.emit("warning", f"skeleton: {note}",
+                           {"phase": "skeleton", "size": True, "task": path})
         first = self._tests_first()
         covered = self.planner._covered_modules(self.plan)
         late = [t.path for t in self.plan.tasks
@@ -838,6 +974,12 @@ class Session:
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
+        # THE SIZE RULE is measured on every verified outcome, whichever
+        # path verified it. It used to be measured in `_record` only —
+        # the repair steps and Continue — so a normal build never measured
+        # a file (found by the 2026-10-27 review).
+        if outcome.ok:
+            self._measure_size(task)
 
         # Re-planning after each file is what stops a plan being wrong by
         # file five (§6.8). A REVISED plan — files added or dropped — is an
@@ -1062,6 +1204,34 @@ class Session:
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
+        if outcome.ok:
+            self._measure_size(task)
+
+    def _measure_size(self, task: Task) -> None:
+        """A file that works but is over the size rule (sizing.py): said
+        in the log, the journal and the report — not refused."""
+        if not (self.config.max_module_lines
+                or self.config.max_function_lines):
+            return
+        try:
+            code = self.host.fs.read(task.path)
+        except Exception:                                 # noqa: BLE001
+            return
+        lang = task.lang or self.config.lang
+        # a test file is measured for its functions only: its length is
+        # one test after another, and the planner does not split tests
+        m = sizing.measure(code, task.path, lang,
+                           max_module=(0 if runner.is_test_path(task.path)
+                                       else self.config.max_module_lines),
+                           max_function=self.config.max_function_lines)
+        if not m.over:
+            return
+        self.size_findings.append(m)
+        note = m.describe()
+        self.log.line(f"  SIZE: {note}")
+        self.journal.log("size", task=task.path, **m.summary())
+        self.host.emit("status", note,
+                       {"task": task.path, "size": m.summary()})
 
     def _check_model(self, caps: ModelCapabilities) -> None:
         """Refuse a model that is not for code; warn about one that is
@@ -1077,6 +1247,14 @@ class Session:
             self.host.emit("warning", verdict.reason,
                            {"phase": "model_check", "model": caps.name,
                             "verdict": verdict.verdict, "refused": True})
+            # a swap carries on with the refused model (said as a
+            # warning), so what is in force must be THIS model's: the
+            # previous model's profile and probe verdict are not (the
+            # 2026-10-27 review)
+            self._apply_profile(caps)
+            self.loop.fim_ok, self.loop.fim_why = False, (
+                "the loaded model was refused as not a coding model; "
+                "no hole is filled on it")
             raise NotACodingModelError(verdict.reason)
         if verdict.refuse:
             self.host.emit("warning",
@@ -1113,6 +1291,102 @@ class Session:
                            "files, as with any model",
                            {"phase": "model_check", "model": caps.name,
                             "diffusion": False})
+        self._apply_profile(caps)
+        self._probe_fim(caps)
+
+    def _probe_fim(self, caps: ModelCapabilities) -> None:
+        """Does the loaded model fill a known hole correctly? One short
+        request at the model check (fim.py); its answer, not a name in a
+        list, decides whether repairs go by FIM holes this session."""
+        self.loop.fim_ok = False
+        mode = str(self.config.fim or "auto").lower()
+        fill = getattr(self.host.llm, "fim_fill", None)
+        why = ""
+        if mode == "off":
+            why = "switched off for this session"
+        elif not callable(fill):
+            why = "the host's model port does not fill in the middle"
+        elif bool(getattr(caps, "supports_canvas", False)):
+            why = "a canvas model fills holes as canvases (diffusion mode)"
+        elif not caps.loaded:
+            why = "no model is loaded"
+        elif mode == "auto":
+            from .ports import NullLLM, ScriptedLLM
+            if isinstance(self.host.llm, (NullLLM, ScriptedLLM)):
+                why = "not probed for a scripted model"
+        if why:
+            self.loop.fim_why = why
+            return
+        self._where = "the FIM probe"
+        ok = False
+        text = ""
+        tokens: dict = {}
+        try:
+            result = fill(fim_mod.probe_request(self.model_profile),
+                          cancel=self.cancel_token)
+        except Cancelled:
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            why = f"the probe raised ({_plain_cause(exc)})"
+        else:
+            if result.finish_reason == "cancelled":
+                raise Cancelled("the FIM probe")
+            ok, why = fim_mod.probe_verdict(result)
+            text = (result.text or "")[:200]
+            # the probe is a model call like any other: its tokens and
+            # timings go to the journal (the 2026-10-27 review)
+            tokens = {"tokens_in": int(result.tokens_in or 0),
+                      "tokens_out": int(result.tokens_out or 0),
+                      "prompt_ms": int(result.prompt_ms or 0),
+                      "decode_ms": int(result.decode_ms or 0),
+                      "finish_reason": result.finish_reason}
+        self.loop.fim_ok, self.loop.fim_why = ok, why
+        self.journal.log("fim", kind="probe", model=caps.name, ok=ok,
+                         why=why, text=text, **tokens)
+        self.log.line(f"  fim       {'on' if ok else 'off'} — {why}")
+        self.host.emit("status",
+                       ("FIM mode: this model fills in the middle, so a "
+                        "repair rewrites only the hole its error is in"
+                        if ok else f"FIM mode is off: {why}"),
+                       {"phase": "model_check", "model": caps.name,
+                        "fim": ok, "why": why})
+
+    def _apply_profile(self, caps: ModelCapabilities) -> None:
+        """The profile for the loaded model (profiles.py), in force from
+        here: on the loop (samplers, the ladder's base, the thinking
+        switch), on the planner, and in the journal and the log."""
+        prof = profiles.profile_for(caps.name, given=self.config.profile,
+                                    directory=self.config.profile_dir)
+        self.model_profile = prof
+        self.loop.profile = prof
+        self.planner.profile = prof
+        # the edit format the model gets right most often, when the
+        # operator left the choice to the engine
+        if str(self.config.narrow or "auto").lower() == "auto":
+            if prof.edit_format == "symbols":
+                self.loop.config.narrow = "always"
+            elif prof.edit_format == "whole":
+                self.loop.config.narrow = "off"
+            elif prof.edit_format == "auto":
+                self.loop.config.narrow = "auto"
+        self.journal.log("profile", model=caps.name, family=prof.family,
+                         source=prof.source, temperature=prof.temperature,
+                         sampling=prof.sampling(),
+                         edit_format=prof.edit_format, fim=prof.fim,
+                         thinking=prof.thinking, think_off=prof.think_off)
+        try:
+            self.log.line(f"  {prof.describe()}")
+        except Exception:                                 # noqa: BLE001
+            pass
+        if prof.sampling() and not profiles.accepts(self.host.llm,
+                                                    "sampling"):
+            self.host.emit("status",
+                           f"the model's profile names samplers "
+                           f"({', '.join(prof.sampling())}) this host's "
+                           f"model port does not take; its temperature "
+                           f"and seed still apply",
+                           {"phase": "model_check", "model": caps.name,
+                            "sampling": False})
 
     #: Below this many tokens per second a chat model is almost certainly
     #: running from system RAM, not the card: a 24B Q4 that fits in VRAM
@@ -1188,8 +1462,13 @@ class Session:
                     f"second, far below what a model that fits in VRAM "
                     f"does; it is probably spilling into system RAM. A "
                     f"smaller quantization, a shorter context, or a "
-                    f"quantized KV cache would be several times faster. "
-                    f"The build goes on at this speed.")
+                    f"quantized KV cache would be several times faster"
+                    + (" — and a llama-server started with `--spec-type "
+                       "ngram-simple` drafts rewrites from the file it was "
+                       "shown at no model cost (docs/SPEED.md)"
+                       if getattr(caps, "supports_grammar", False)
+                       and not getattr(caps, "is_remote", False) else "")
+                    + ". The build goes on at this speed.")
             self.log.line(f"  WARNING   {note}")
             self.host.emit("warning", note,
                            {"phase": "model_check", "model": caps.name,
@@ -1555,8 +1834,8 @@ class Session:
             self._where = f"the mutation check of {o.path}"
             stem = o.path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
-            def run_tests(**kw: Any) -> Any:
-                return runner.run_tests("python", stem=stem, **kw)
+            def run_tests(_stem: str = stem, **kw: Any) -> Any:
+                return runner.run_tests("python", stem=_stem, **kw)
 
             try:
                 rep = mutation.check(
@@ -2668,6 +2947,8 @@ class Session:
                          f"tested: {', '.join(untested)}")
         for rep in self.mutation:
             lines.append(f"[mutation]  {rep.line()}")
+        for m in self.size_findings:
+            lines.append(f"[size]      {m.describe()}")
         if self.constraints is not None and self.constraints.items:
             lines.append(f"[pinned]    {len(self.constraints.items)} hard "
                          f"requirement(s) in every prompt")
@@ -2799,6 +3080,20 @@ class Session:
             "are untouched — but you may want a clean working tree before "
             "letting it write.",
             {"git": True})
+
+
+def _real_provider(llm: Any) -> bool:
+    """Is this model port one of the engine's own providers (a model
+    server, a GGUF in-process)? The defaults that cost model calls or
+    run tools per attempt — extra samples, the type checker's gate — are
+    on for those and off for anything else until the host asks: a test
+    double scripts one reply per attempt, and a host that wants them
+    says so in its SessionConfig (ATK does)."""
+    try:
+        from .providers.base import ProviderBase
+        return isinstance(llm, ProviderBase)
+    except Exception:                                     # noqa: BLE001
+        return False
 
 
 def _plain_cause(exc: BaseException) -> str:

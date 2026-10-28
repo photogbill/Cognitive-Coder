@@ -55,12 +55,14 @@ operator exactly what is wrong, and it is usually a two-second fix by hand.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 import dataclasses
 from dataclasses import dataclass, field
 import difflib
 import hashlib
 import re
+import textwrap
 import time
 from typing import Any
 
@@ -73,13 +75,16 @@ from . import (
     langs,
     libref,
     personas,
+    profiles,
     runner,
     specslice,
     symedit,
     textio,
+    typecheck,
 )
 from . import canvas as cv
 from . import diagnostics as dx
+from . import fim as fim_mod
 from . import repetition as _repetition
 from . import suspects as suspects_mod
 from .context import CHARS_PER_TOKEN, Piece, build_context
@@ -230,6 +235,44 @@ class LoopConfig:
     #: one short call says in words what is wrong and what to change; the
     #: repair is shown that diagnosis. One more model call per repair.
     diagnose_first: bool = False
+    #: THE VALUES AT THE FAILURE (testrun.py, 2026-10-27): Python tests run
+    #: through the harness-owned runner that prints what the variables
+    #: were in the frame that failed, and the repair prompt shows them
+    #: under the error. Off: the plain `python -m unittest` / pytest.
+    capture_values: bool = True
+    #: THE TYPE CHECKER'S GATE (typecheck.py, 2026-10-27): after a Python
+    #: file is written and verified, mypy / basedpyright / pyright reads
+    #: it in the project, and a finding with one of these codes — an
+    #: attribute that does not exist, a call with the wrong arguments, an
+    #: undefined name — fails the attempt as a located error, like the
+    #: lint gate's F821. Empty: off. The session passes () for the
+    #: scripted test doubles unless told otherwise, like the speed probe.
+    #: The LOOP's own default is off — like `resample` — so a Loop built
+    #: directly (the test doubles) never runs whatever checker the machine
+    #: has; the Session turns it on for a real model port
+    #: (`Session._resolve_type_gate`), and a host asks for it.
+    type_gate: tuple[str, ...] = ()
+    #: FIM MODE (fim.py, docs/FIM_MODE.md, 2026-10-27). "auto": when the
+    #: host fills in the middle (`ports.FimLLM`) AND the session's probe
+    #: found the loaded model fills a known hole correctly (`Loop.fim_ok`),
+    #: a repair rewrites only the hole its error is in — before a narrowed
+    #: edit, before the whole file. "off": never.
+    fim: str = "auto"
+    #: Fills tried per repair attempt, the first usable one taken: the
+    #: second is warmer with a new seed and is paid for only when the
+    #: first did not parse or came back unchanged.
+    fim_candidates: int = 2
+    #: SAMPLE AGAIN BEFORE REPAIRING (2026-10-27). When a FIRST attempt
+    #: fails, this many more samples of the same prompt are drawn at the
+    #: next rung with new seeds — the prefix is in the server's cache, so
+    #: each costs one decode — and verified the same way; the best stays
+    #: on disk as attempt 1. The definitions the samples disagree on are
+    #: the repair's doubt map. 0: off. The session sets 1 for a real model
+    #: port and 0 for the scripted doubles, like the speed probe.
+    resample: int = 0
+    #: Files longer than this are not resampled: a decode of the file
+    #: costs more than the repair it would replace.
+    resample_max_lines: int = 150
 
 
 @dataclass(frozen=True)
@@ -248,13 +291,17 @@ class Sampling:
     fresh: bool = False
     canvas: bool = False
     reason: str = ""
+    #: The profile's samplers sent with the call (profiles.py), as
+    #: `name=value` text — "" when the port takes none or there are none.
+    knobs: str = ""
 
     def describe(self) -> str:
         """The `generate` line's knobs, honestly."""
         if self.canvas:
             return (f"seed={self.seed} (temperature does not reach a canvas "
                     f"model; it anneals its own)")
-        return f"temperature={self.temperature} seed={self.seed}"
+        text = f"temperature={self.temperature} seed={self.seed}"
+        return f"{text} {self.knobs}" if self.knobs else text
 
 
 @dataclass
@@ -384,6 +431,25 @@ class Loop:
     #: far, which later attempts are shown so they do not argue it again.
     _suspects_now: dict = field(default_factory=dict, repr=False)
     _suspects_seen: dict = field(default_factory=dict, repr=False)
+    #: The type checker (typecheck.py): said absent once, then not asked.
+    _typecheck_off: bool = field(default=False, repr=False)
+    _said_typecheck: bool = field(default=False, repr=False)
+    #: THE MODEL PROFILE (profiles.py, 2026-10-27): the loaded model's
+    #: samplers, its temperature (the ladder climbs from it), its edit
+    #: format and its thinking switch. Set by the session at the model
+    #: check and after every swap; None changes nothing.
+    profile: Any = None
+    _last_sent: Any = field(default=None, repr=False)
+    #: FIM MODE: the session's probe found the loaded model fills a known
+    #: hole correctly (fim.py). False until it says so; re-decided after
+    #: every swap. `fim_why` is the probe's sentence, for the log.
+    fim_ok: bool = False
+    fim_why: str = ""
+    #: {path: the attempt whose code came from a FIM fill}.
+    _via_fim: dict = field(default_factory=dict, repr=False)
+    #: {path: the definitions attempt 1's extra samples disagreed on,
+    #: most-disagreed first} — shown to the repair (resample).
+    _disagreement: dict = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------
     # the escalation ladder
@@ -399,16 +465,17 @@ class Loop:
         start; the record says so rather than printing a temperature that
         did nothing.
         """
-        rungs = tuple(self.config.temperatures) or (persona.temperature,)
-        base = min(persona.temperature, rungs[0])
+        rungs = self._rungs(persona)
+        own = self._base_temperature(persona)
+        base = min(own, rungs[0])
         canvas = bool(caps is not None
                       and getattr(caps, "supports_canvas", False))
+        knobs = self._knobs_text()
         if not self.config.escalate or attempt <= 2:
             return Sampling(attempt=attempt,
-                            temperature=persona.temperature if attempt <= 2
-                            else base,
+                            temperature=own if attempt <= 2 else base,
                             seed=self.config.seed, rung=0, fresh=False,
-                            canvas=canvas,
+                            canvas=canvas, knobs=knobs,
                             reason="the first attempt" if attempt == 1 else
                             "a repair with the errors and the real "
                             "definitions they name")
@@ -424,7 +491,29 @@ class Loop:
             reason = (f"a whole-file repair at "
                       f"{'a new seed' if canvas else f'temperature {temperature:.2f}, seed {seed}'}")
         return Sampling(attempt=attempt, temperature=temperature, seed=seed,
-                        rung=rung, fresh=fresh, canvas=canvas, reason=reason)
+                        rung=rung, fresh=fresh, canvas=canvas, reason=reason,
+                        knobs=knobs)
+
+    def _rungs(self, persona: Persona) -> tuple[float, ...]:
+        """The ladder's rungs: the config's, or the profile's own steps up
+        from the model card's temperature (profiles.rungs_for)."""
+        rungs = tuple(self.config.temperatures) or (persona.temperature,)
+        if self.profile is not None:
+            return profiles.rungs_for(self.profile, rungs)
+        return rungs
+
+    def _base_temperature(self, persona: Persona) -> float:
+        """What attempts 1 and 2 sample at: the model card's temperature
+        when the profile names one, else the persona's."""
+        t = getattr(self.profile, "temperature", None)
+        return float(t) if t is not None else persona.temperature
+
+    def _knobs_text(self) -> str:
+        if self.profile is None or not profiles.accepts(self.host.llm,
+                                                        "sampling"):
+            return ""
+        return " ".join(f"{k}={v:g}" for k, v in
+                        self.profile.sampling().items())
 
     def _after_cut(self, s: Sampling, persona: Persona) -> Sampling:
         """The attempt after a reply was CUT: a new seed, and warmer.
@@ -438,7 +527,7 @@ class Loop:
         and a seed no rung uses. A canvas model keeps its own temperature,
         so for it this is a new seed, and the record says so.
         """
-        rungs = tuple(self.config.temperatures) or (persona.temperature,)
+        rungs = self._rungs(persona)
         warmer = [t for t in rungs if t > s.temperature + 1e-9]
         temperature = (warmer[0] if warmer
                        else round(min(1.0, s.temperature + 0.2), 2))
@@ -502,7 +591,7 @@ class Loop:
             epoch=(self.codemap.store.epoch if self.codemap else 0),
             contract=adjudicate.CONTRACT)
         verdict = adjudicate.ask(self.host.llm, prompt.messages(), request,
-                                 cancel=self.cancel)
+                                 cancel=self.cancel, profile=self.profile)
         self._judged[key] = verdict
         self._log_line("")
         self._log_line(f"  judge {test.path} vs {module}: "
@@ -643,6 +732,8 @@ class Loop:
         self._doubt_tried.pop(task.path, None)
         self._holes_tried.pop(task.path, None)
         self._via_canvas.pop(task.path, None)
+        self._via_fim.pop(task.path, None)
+        self._disagreement.pop(task.path, None)
         self._caller = caller if caller and caller != task.path else ""
         self._covers = covers if covers and covers != task.path else ""
         lang = task.lang or langs.id_for_path(task.path) or "python"
@@ -994,30 +1085,7 @@ class Loop:
                            {"phase": "verify", "task": task.path,
                             "attempt": n})
                 result = self._verify(task, lang)
-                gated = self._lint_gate(code, lang, task)
-                if gated:
-                    # 2026-10-22: the linter's certain bugs join the verdict.
-                    # A verify that passed with an undefined name in the
-                    # file passed because the tests never reached it; it is
-                    # not verified. A verify that failed gets the linter's
-                    # exact line beside the traceback's.
-                    # The traceback's own errors stay first (the prompt and
-                    # the canvas take the first one); the linter's lines
-                    # follow, and are the ONLY errors when the run passed.
-                    result = dataclasses.replace(
-                        result, ok=False,
-                        diagnostics=tuple(result.diagnostics) + tuple(gated),
-                        caveats=tuple(result.caveats) + (
-                            f"the linter found {len(gated)} certain "
-                            f"error(s) ({', '.join(sorted({d.code for d in gated}))})",))
-                    self._emit("warning",
-                               f"{task.path}: attempt {n}: the linter found "
-                               f"{len(gated)} certain error(s) — "
-                               + "; ".join(f"line {d.line} {d.code}: "
-                                           f"{d.message.split(' (found')[0]}"
-                                           for d in gated[:3]),
-                               {"task": task.path, "attempt": n,
-                                "lint_gate": [d.code for d in gated]})
+                result = self._gates(task, lang, code, result, n)
                 self._log_verify(task, n, result)
                 if contract:
                     result = self._keep_contract(task, contract, code,
@@ -1028,6 +1096,25 @@ class Loop:
                     # the caller's failure inside it is gone.
                     result = self._acceptance(task, accept, result, n)
                 diags = tuple(result.diagnostics)
+
+                # -- SAMPLE AGAIN BEFORE REPAIRING (2026-10-27) -----------
+                # A failed first attempt is not repaired yet: the same
+                # prompt is asked again at a new seed, each sample verified
+                # the same way, and the best of them is what attempt 1
+                # leaves on disk. The definitions the samples DISAGREE on
+                # are where the model was unsure — a doubt map for an
+                # ordinary model, shown to the repair and used to pick the
+                # hole when the failure names no line.
+                if (n == 1 and not result.ok and not result.blocked
+                        and accept is None
+                        and self._resample_wanted(task, lang, code, result,
+                                                  caps, is_test,
+                                                  before_module)):
+                    code, result, completion, sent, fixes = self._resample(
+                        task, lang, code, result, completion, sent, fixes,
+                        tx, contract)
+                    diags = tuple(result.diagnostics)
+                    codes[n] = code
 
                 sig = _signature(code, lang, diags)
                 record = AttemptRecord(
@@ -1598,6 +1685,19 @@ class Loop:
                 if where:
                     tail_extra.append(where)
                     tail_pieces.append(("WHERE THE ERRORS ARE", where))
+            disagreed = self._disagreement.get(task.path) or ()
+            if not fresh and disagreed:
+                # WHERE THE SAMPLES DISAGREED (resample): the definitions
+                # attempt 1's extra samples changed — the model's own
+                # uncertainty, shown as a place to look first.
+                named_defs = ", ".join(f"`{symedit.shown_name(x)}`"
+                                       for x in disagreed[:6])
+                said = (f"Attempt 1 was sampled more than once, and the "
+                        f"samples disagreed in {named_defs}. Those are the "
+                        f"definitions the model was least sure of; the "
+                        f"error is most likely in one of them.")
+                tail_extra.append(f"[WHERE THE SAMPLES DISAGREED]\n{said}")
+                tail_pieces.append(("WHERE THE SAMPLES DISAGREED", said))
             if not fresh and self.config.diagnose_first:
                 said = self._diagnose(task, persona, lang, diagnostics,
                                       arch, interfaces, tail_extra, attempt)
@@ -1714,6 +1814,20 @@ class Loop:
                 tail_pieces.append(
                     (f"THE MODULE UNDER TEST — {self._covers}",
                      f"{module_source}\n\n{rule}"))
+
+        # -- FIM MODE: the hole the error is in, filled in the middle -----
+        # (fim.py). Narrower than a narrowed edit and free of its contract:
+        # the model writes the body between the code before it and the
+        # code after it, and can touch nothing else. Only for a repair of
+        # a file that parses, never on the ladder's fresh start, and only
+        # while the probe says this model fills holes. Any reason it
+        # cannot serve falls through, said in BUILD_LOG.txt.
+        if repair and not fresh and self._fim_ready(caps):
+            via = self._fim_generate(
+                task, lang, located=located, interfaces=interfaces,
+                caps=caps, attempt=attempt, sampling=sampling)
+            if via is not None:
+                return via
 
         # -- NARROWED EDITS: only the definitions that change (symedit.py) -
         # F5. For a Python file that already has real code, when the file
@@ -1840,6 +1954,9 @@ class Loop:
         completion = self._complete(messages, tools=tools,
                                     temperature=sampling.temperature,
                                     seed=sampling.seed)
+        # the messages as sent — with the profile's text switch, when the
+        # model has one — are what the journal hashes
+        messages = list(getattr(self, "_last_sent", messages) or messages)
 
         # -- tool round-trips are ordinary complete() cycles (§6.9) -----
         rounds = 0
@@ -2196,10 +2313,12 @@ class Loop:
         return None
 
     def _journal_call(self, task: Task, attempt: int, completion: Completion,
-                      sent: Sequence[Message], what: str) -> None:
+                      sent: Sequence[Message], what: str, *,
+                      temperature: float | None = None,
+                      seed: int | None = None) -> None:
         """A `generate` event for a call that is not the attempt's own —
-        a narrowed reply that fell back, a diagnosis — so the journal holds
-        every call and every token, not one per attempt."""
+        a narrowed reply that fell back, a diagnosis, an extra sample — so
+        the journal holds every call and every token, not one per attempt."""
         if self.journal is None:
             return
         try:
@@ -2207,9 +2326,10 @@ class Loop:
                 task=task.path, attempt=attempt,
                 provider=getattr(self.host.llm, "name", "host"),
                 completion=completion, prompt=list(sent) or task.purpose,
-                temperature=getattr(self._sampling.get(task.path),
-                                    "temperature", self.config.temperature),
-                verify={"call": what})
+                temperature=(temperature if temperature is not None else
+                             getattr(self._sampling.get(task.path),
+                                     "temperature", self.config.temperature)),
+                seed=seed, verify={"call": what})
         except Exception:                                # noqa: BLE001
             pass
 
@@ -2377,7 +2497,7 @@ class Loop:
                                "not fit the model's context")
                 return ""
         completion = self._complete(messages, temperature=0.1,
-                                    max_tokens=300)
+                                    max_tokens=300, thinking=True)
         self._journal_call(task, attempt, completion, messages, "diagnosis")
         said = strip_think(completion.text or "").strip()
         said = re.sub(r"```.*?```", "", said, flags=re.S).strip()
@@ -2390,6 +2510,228 @@ class Loop:
                        "a diagnosis was written before the repair",
                        blocks=[("the diagnosis", said)])
         return said
+
+    # ------------------------------------------------------------------
+    # FIM MODE (fim.py)
+    # ------------------------------------------------------------------
+    def _fim_ready(self, caps: ModelCapabilities | None) -> bool:
+        """The host fills in the middle, the probe said this model does it
+        right, and nothing has switched it off. A canvas model has the
+        better hole already."""
+        if str(self.config.fim or "off").lower() == "off" or not self.fim_ok:
+            return False
+        if caps is not None and self._canvas_ready(caps):
+            return False
+        return callable(getattr(self.host.llm, "fim_fill", None))
+
+    def _fim_generate(self, task: Task, lang: str, *,
+                      located: Sequence[Diagnostic], interfaces: str,
+                      caps: ModelCapabilities, attempt: int,
+                      sampling: Sampling
+                      ) -> tuple[str, Completion, bool, list[Message]] | None:
+        """(the file with the hole filled, completion, False, messages) —
+        or None: another path takes this attempt.
+
+        The hole is where the diagnostics put the error (the body it is
+        in, or a window around its line); when the failure names no line
+        of this file, the body of a function the failing test calls; then
+        the body the engine doubts most (`doubt`). The same hole failing
+        with the same error twice says the fault is elsewhere, and that
+        attempt is left to the other paths.
+        """
+        if lang != "python":
+            return None            # holes are cut by Python's parser; quietly
+        code = self._read(task.path)
+        if not code.strip() or _is_our_stub(code):
+            return None
+        try:
+            ast.parse(code)
+        except SyntaxError:
+            self._fim_skip(task, attempt, "the file does not parse, so no "
+                                          "hole can be cut from it")
+            return None
+        total = int(getattr(caps, "context_tokens", 0) or 0)
+        count = self.host.llm.count_tokens
+
+        def fits(hole: Any) -> bool:
+            if total <= 0:
+                return True
+            try:
+                need = count(code) + fim_mod.MAX_TOKENS + 256
+            except Exception:                            # noqa: BLE001
+                need = len(code) // CHARS_PER_TOKEN + fim_mod.MAX_TOKENS
+            return need <= total
+
+        hole = fim_mod.hole_for_repair(code, lang, task.path, located,
+                                       _same_file, fits=fits)
+        err = cv.located_error(located, task.path, _same_file)
+        named = doubted = ""
+        if hole is None and err is None:
+            tried = self._doubt_tried.setdefault(task.path, set())
+            test_source = self._read(task.test_path) if task.test_path else ""
+            for candidate in cv.test_named_functions(code, located,
+                                                     test_source):
+                if candidate in tried:
+                    continue
+                tried.add(candidate)
+                named = candidate
+                hole = fim_mod.hole_for_function(code, task.path, candidate,
+                                                 why="test")
+                break
+            if hole is None and not named and self.doubt.get(task.path):
+                name = cv.least_sure(self.doubt[task.path], code, tried)
+                if name:
+                    tried.add(name)
+                    doubted = name
+                    hole = fim_mod.hole_for_function(code, task.path, name,
+                                                     why="doubt")
+        if hole is None:
+            if err is not None:
+                why = (f"the error at line {err.line} could not be cut out "
+                       f"as a hole that fits the model's context")
+            elif named:
+                why = (f"the failure names no line of this file; the "
+                       f"failing test calls `{named}`, which could not be "
+                       f"cut out as a hole")
+            elif doubted:
+                why = (f"the failure names no line of this file, and the "
+                       f"doubted body `{doubted}` could not be cut out")
+            else:
+                why = "the failure names no line of this file"
+            self._fim_skip(task, attempt, why)
+            return None
+        # the same FUNCTION with the same failure: keyed on the failure's
+        # words wherever it was raised, so an assertion in the TEST after
+        # a fill is the same failure as the located error before it
+        first = next((d for d in located if d.is_error), None)
+        same = err if err is not None else first
+        # blanked like `_recall_key`: an address or a number in the
+        # message would make the same failure a new one every run (the
+        # 2026-10-27 review)
+        key = ("fim", hole.name or str(hole.line),
+               _blanked(same.message) if same is not None else "doubt")
+        tried_holes = self._holes_tried.setdefault(task.path, set())
+        if key in tried_holes:
+            self._fim_skip(task, attempt,
+                           f"{hole.label} was filled already and the same "
+                           f"error came back — the fault is not in those "
+                           f"lines")
+            return None
+        hint_text = fim_mod.hint(hole, located, task.path, _same_file,
+                                 comment=_comment_for(lang))
+        extra: list[tuple[str, str]] = []
+        if interfaces.strip():
+            extra.append(("INTERFACES.py", interfaces))
+        n = max(1, int(self.config.fim_candidates or 1))
+        requests = fim_mod.requests_for(
+            code, hole, hint_text=hint_text, path=task.path, extra=extra,
+            n=n, temperature=sampling.temperature, seed=sampling.seed,
+            profile=self.profile)
+        why = ("its error is there" if hole.why == "located" else
+               "the failure names no line of this file, and the failing "
+               "test calls this function" if hole.why == "test" else
+               "the failure names no line of this file, and this is the "
+               "body the engine doubts most")
+        self._emit("status",
+                   f"{task.path}: attempt {attempt} fills {hole.label}"
+                   f"{f' (`{hole.name}`)' if hole.name else ''} in the "
+                   f"middle — {why}; up to {n} fill(s)",
+                   {"task": task.path, "attempt": attempt,
+                    "fim": {"region": hole.label, "why": hole.why,
+                            "name": hole.name}})
+        cands: list[fim_mod.Candidate] = []
+        chosen = None
+        for req in requests:
+            self._check_cancel(f"a hole in {task.path}")
+            result = self.host.llm.fim_fill(req, cancel=self.cancel)
+            if result.finish_reason == "cancelled":
+                return "", Completion(text="", finish_reason="cancelled",
+                                      model=result.model or caps.name), \
+                    False, []
+            cand = fim_mod.judge(code, hole, result, lang,
+                                 temperature=req.temperature, seed=req.seed)
+            cands.append(cand)
+            if cand.usable:
+                chosen = cand
+                break
+        self._journal_fim(task, attempt, hole, cands, chosen, why)
+        self._log_fim(task, attempt, hole, hint_text, cands, chosen)
+        if chosen is None:
+            reasons = "; ".join(sorted({c.problem for c in cands}))
+            self._emit("warning",
+                       f"{task.path}: no fill came back usable ({reasons}); "
+                       f"this attempt takes another path",
+                       {"task": task.path, "attempt": attempt, "fim": False})
+            return None
+        tried_holes.add(key)
+        self._via_fim[task.path] = attempt
+        # the attempt's record carries the sampling the KEPT fill was made
+        # at — the second candidate is warmer, with its own seed (the
+        # 2026-10-27 review)
+        used = self._sampling.get(task.path)
+        kept_req = requests[cands.index(chosen)]
+        if used is not None and (kept_req.temperature != used.temperature
+                                 or kept_req.seed != used.seed):
+            self._sampling[task.path] = dataclasses.replace(
+                used, temperature=kept_req.temperature, seed=kept_req.seed,
+                reason=f"{used.reason} — fill {cands.index(chosen) + 1} "
+                       f"of {len(cands)} was kept, at its own sampling")
+        r = chosen.result
+        completion = Completion(
+            text=chosen.fill or "", finish_reason="stop", model=r.model
+            or caps.name, tokens_in=sum(c.result.tokens_in for c in cands),
+            tokens_out=sum(c.result.tokens_out for c in cands),
+            prompt_ms=r.prompt_ms, decode_ms=r.decode_ms,
+            prompt_processed=(max(0, r.tokens_in - r.cached_tokens)
+                              if getattr(r, "cached_known", False) else 0))
+        messages = [Message(role="user", content=requests[0].prefix
+                            + "<<<HOLE>>>" + requests[0].suffix)]
+        self._emit("status",
+                   f"{task.path}: attempt {attempt} filled {hole.label} "
+                   f"({(chosen.fill or '').count(chr(10))} line(s)) — the "
+                   f"rest of the file is untouched",
+                   {"task": task.path, "attempt": attempt,
+                    "fim": {"region": hole.label, "lines":
+                            (chosen.fill or "").count("\n"),
+                            "fill": chosen.fill or ""}})
+        return chosen.code, completion, False, messages
+
+    def _fim_skip(self, task: Task, attempt: int, why: str) -> None:
+        self._decision("fim", task, attempt,
+                       f"no hole this attempt — {why}; another path takes it")
+
+    def _journal_fim(self, task: Task, attempt: int, hole: Any,
+                     cands: Sequence[Any], chosen: Any, why: str) -> None:
+        if self.journal is None:
+            return
+        try:
+            self.journal.log(
+                "fim", task=task.path, attempt=attempt, kind="repair",
+                region=hole.label, name=hole.name, hole_kind=hole.kind,
+                why=hole.why, candidates=[c.summary() for c in cands],
+                kept=(cands.index(chosen) if chosen is not None else None))
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _log_fim(self, task: Task, attempt: int, hole: Any, hint_text: str,
+                 cands: Sequence[Any], chosen: Any) -> None:
+        label = f"{hole.label}" + (f" (`{hole.name}`)" if hole.name else "")
+        details = [f"why this hole: {'its error is at line ' + str(hole.line) if hole.why == 'located' else 'the failing test calls it' if hole.why == 'test' else 'the body the engine doubts most'}"]
+        details += [f"fill {i + 1}: {c.describe()}" for i, c in
+                    enumerate(cands)]
+        blocks = [("the hint, at the end of the prefix", hint_text.rstrip())]
+        if chosen is not None:
+            blocks.append(("the hole as kept", (chosen.fill or "").rstrip()))
+        for i, c in enumerate(cands):
+            if c is not chosen and (c.result.text or "").strip():
+                blocks.append((f"fill {i + 1} (rejected)",
+                               c.result.text.rstrip()))
+        self._decision("fim", task, attempt,
+                       f"fill {label} in the middle — "
+                       + (f"kept fill {cands.index(chosen) + 1} of "
+                          f"{len(cands)}" if chosen is not None else
+                          "no fill was usable"),
+                       details=details, blocks=blocks)
 
     # ------------------------------------------------------------------
     # DIFFUSION MODE (canvas.py)
@@ -2989,12 +3331,28 @@ class Loop:
     def _complete(self, messages: Sequence[Message], *, tools=(),
                   temperature: float = 0.15,
                   seed: int | None | object = _UNSET,
-                  max_tokens: int = 0) -> Completion:
+                  max_tokens: int = 0,
+                  thinking: bool | None = False) -> Completion:
+        """Every model call the loop makes goes through here.
+
+        ``thinking`` (profiles.py, 2026-10-27): False for a call whose
+        output is parsed — code, which is every call but one — so a model
+        with a thinking switch does not reason in a file; True for the
+        diagnosis, which is prose and wants it. Both reach the port only
+        when it takes the argument and the profile has a switch; the
+        profile's text switch is appended to the prompt either way.
+        """
+        extra = profiles.call_kwargs(self.host.llm, self.profile,
+                                     thinking=thinking)
+        sent = profiles.soft_switch(messages, self.profile,
+                                    thinking=thinking)
+        #: what was actually sent, for the journal's prompt hash (C8)
+        self._last_sent = sent
         return self.host.llm.complete(
-            messages, tools=tools, temperature=temperature,
+            sent, tools=tools, temperature=temperature,
             max_tokens=max_tokens or self.config.max_tokens,
             seed=self.config.seed if seed is _UNSET else seed,
-            cancel=self.cancel)
+            cancel=self.cancel, **extra)
 
     # ------------------------------------------------------------------
     # deterministic pre-fixes (F1, M35)
@@ -3090,6 +3448,358 @@ class Loop:
                             f"file as written: a certain error at runtime, "
                             f"whether or not a test reaches it)"))
         return out
+
+    def _gates(self, task: Task, lang: str, code: str, result: RunResult,
+               n: int) -> RunResult:
+        """The deterministic gates on a verified reply: the linter's
+        certain errors (2026-10-22) and the type checker's (2026-10-27)
+        join the verdict as located errors, whether or not a test reached
+        the line. A run that passed with one is not verified; a run that
+        failed gets the exact line beside the traceback's."""
+        gated = self._lint_gate(code, lang, task)
+        if gated:
+            # The traceback's own errors stay first (the prompt and the
+            # canvas take the first one); the linter's lines follow, and
+            # are the ONLY errors when the run passed.
+            result = dataclasses.replace(
+                result, ok=False,
+                diagnostics=tuple(result.diagnostics) + tuple(gated),
+                caveats=tuple(result.caveats) + (
+                    f"the linter found {len(gated)} certain "
+                    f"error(s) ({', '.join(sorted({d.code for d in gated}))})",))
+            self._emit("warning",
+                       f"{task.path}: attempt {n}: the linter found "
+                       f"{len(gated)} certain error(s) — "
+                       + "; ".join(f"line {d.line} {d.code}: "
+                                   f"{d.message.split(' (found')[0]}"
+                                   for d in gated[:3]),
+                       {"task": task.path, "attempt": n,
+                        "lint_gate": [d.code for d in gated]})
+        typed = self._type_gate(task, lang, result, n)
+        if typed:
+            result = dataclasses.replace(
+                result, ok=False,
+                diagnostics=tuple(result.diagnostics) + tuple(typed),
+                caveats=tuple(result.caveats) + (
+                    f"the type checker found {len(typed)} certain "
+                    f"error(s) ({', '.join(sorted({str(d.code) for d in typed}))})",))
+            self._emit("warning",
+                       f"{task.path}: attempt {n}: the type checker "
+                       f"found {len(typed)} certain error(s) — "
+                       + "; ".join(f"line {d.line} {d.code}: "
+                                   f"{d.message.split(' (found')[0]}"
+                                   for d in typed[:3]),
+                       {"task": task.path, "attempt": n,
+                        "type_gate": [d.code for d in typed]})
+        return result
+
+    # ------------------------------------------------------------------
+    # SAMPLE AGAIN BEFORE REPAIRING (resample, 2026-10-27)
+    # ------------------------------------------------------------------
+    def _resample_wanted(self, task: Task, lang: str, code: str,
+                         result: RunResult, caps: ModelCapabilities | None,
+                         is_test: bool, before_module: bool) -> bool:
+        """Is a failed first attempt worth more samples of the same prompt?
+
+        Not for a test (its disagreements go to the judge), not for a
+        canvas model (its candidates are canvases), not for a file that
+        does not parse or is too long to decode again cheaply, and not
+        when the failure is a culprit elsewhere."""
+        n = int(self.config.resample or 0)
+        if n <= 0 or is_test or before_module or lang != "python":
+            return False
+        if caps is not None and self._canvas_ready(caps):
+            return False
+        if not code.strip() or self._via_fim.get(task.path) == 1 \
+                or self._via_canvas.get(task.path) == 1 \
+                or self._via_narrow.get(task.path) == 1:
+            # a narrowed first attempt's prompt asks for definitions, not
+            # a file: re-asking it would treat a fragment as the whole
+            # file (the 2026-10-27 review)
+            return False
+        try:
+            ast.parse(code)
+        except SyntaxError:
+            return False
+        lines = len(symedit.lines_of(code))
+        if lines > max(1, int(self.config.resample_max_lines or 1)):
+            return False
+        if not any(d.is_error for d in result.diagnostics):
+            return False
+        return not self._culprit_elsewhere(task, result.diagnostics)
+
+    def _resample(self, task: Task, lang: str, code: str, result: RunResult,
+                  completion: Completion, sent: Sequence[Message],
+                  fixes: Sequence[str], tx: Any, contract: str
+                  ) -> tuple[str, RunResult, Completion, list[Message],
+                             list[str]]:
+        """Up to `resample` more samples of the SAME prompt, each written
+        and verified like the first; the best of them all stays on disk.
+        Returns what attempt 1 is recorded as."""
+        n = max(1, int(self.config.resample or 1))
+        persona = PERSONAS.get(task.persona, personas.ENGINEER)
+        rungs = self._rungs(persona)
+        base = self._base_temperature(persona)
+        temperature = next((t for t in rungs if t > base + 1e-9),
+                           round(min(1.0, base + 0.3), 2))
+        seed_base = self.config.seed if self.config.seed is not None else 0
+        original = code
+        best = (code, result, completion, list(sent), list(fixes))
+        best_score = self._score(result)
+        best_k = 0
+        candidates: list[dict] = []
+        names_changed: dict[str, int] = {}
+        #: every extra reply paid for: (sample, completion, temperature,
+        #: seed) — journaled once the choice is made
+        paid: list[tuple[int, Completion, float, int]] = []
+        first_sampling = self._sampling.get(task.path)
+        self._emit("status",
+                   f"{task.path}: attempt 1 failed — sampling the same "
+                   f"prompt {n} more time(s) at temperature {temperature:g} "
+                   f"before any repair",
+                   {"task": task.path, "attempt": 1, "resample": n})
+        for k in range(1, n + 1):
+            self._check_cancel(f"resampling {task.path}")
+            seed = seed_base + 7919 + 31 * k
+            more = self._complete(list(sent), temperature=temperature,
+                                  seed=seed)
+            if more.finish_reason == "cancelled":
+                raise Cancelled(f"resampling {task.path}")
+            # journaled AFTER the choice is made (below): a sample that is
+            # kept becomes attempt 1's own `generate` event, and the first
+            # reply becomes the extra call it replaced — every reply paid
+            # for appears exactly once, under the sampling it was made at
+            paid.append((k, more, temperature, seed))
+            verdict: dict = {"sample": k, "seed": seed,
+                             "temperature": temperature}
+            text = strip_think(more.text or "")
+            if more.finish_reason in ("error", "cut") or not text.strip():
+                verdict["skipped"] = more.error or "the reply was empty"
+                candidates.append(verdict)
+                continue
+            if _is_truncated(more, text, lang):
+                verdict["skipped"] = "the reply hit the length limit"
+                candidates.append(verdict)
+                continue
+            text, _named = suspects_mod.split(text)
+            if detect_commentary(text, lang):
+                text = strip_commentary(text, lang)
+            sample = strip_stub_sentinel(_extract(text, lang, task.path))
+            if not sample.strip():
+                verdict["skipped"] = "no code in the reply"
+                candidates.append(verdict)
+                continue
+            if self.config.autofix:
+                sample, sample_fixes = self._prefix_fixes(sample, lang, task)
+            else:
+                sample_fixes = []
+            if _code_identity(sample, lang)[0] == _code_identity(
+                    original, lang)[0]:
+                # the same code (comments and spacing aside) says nothing
+                # about where the model was unsure: skipped before the
+                # disagreement map sees it (the 2026-10-27 review)
+                verdict["skipped"] = "the same code as attempt 1"
+                candidates.append(verdict)
+                continue
+            differs = _differing_definitions(original, sample)
+            for name in differs:
+                names_changed[name] = names_changed.get(name, 0) + 1
+            verdict["differs_in"] = differs
+            first = self._original.get(task.path, "")
+            if first and self.config.keep_existing:
+                finding = keep.check(
+                    first, sample, lang, path=task.path, request="",
+                    used_elsewhere=lambda name, _p=task.path:
+                        self._used_elsewhere(name, _p))
+                if finding.refused:
+                    verdict["skipped"] = f"refused: {finding.describe()}"
+                    candidates.append(verdict)
+                    continue
+            if guard.blocked(guard.scan(sample, lang,
+                                        self.config.project_mode)):
+                verdict["skipped"] = "refused by the static screen"
+                candidates.append(verdict)
+                continue
+            if not self._write(tx, task, sample):
+                verdict["skipped"] = "the write was not approved"
+                candidates.append(verdict)
+                continue
+            if self.codemap is not None:
+                self.codemap.reindex_after_write(task.path)
+            res = self._verify(task, lang)
+            res = self._gates(task, lang, sample, res, 1)
+            # the sample's verify, verbatim, like the first reply's — the
+            # log used to show the first reply's output under the kept
+            # sample's code (the 2026-10-27 review)
+            self._log_line(f"  (attempt 1, sample {k}: verified as below)")
+            self._log_verify(task, 1, res)
+            if contract:
+                res = self._keep_contract(task, contract, sample, res)
+            score = self._score(res)
+            verdict.update({"ok": res.ok, "errors": score[1] * -1,
+                            "summary": res.summary()})
+            candidates.append(verdict)
+            if score > best_score:
+                best_score = score
+                best = (sample, res, more, list(sent), list(sample_fixes))
+                for c in candidates:
+                    c.pop("best", None)       # an earlier best, beaten
+                verdict["best"] = True
+                best_k = k
+            if res.ok:
+                break
+        chosen_code = best[0]
+        on_disk = self._read(task.path)
+        if on_disk != chosen_code:
+            # the last sample verified is on disk; the best one goes back
+            self._write(tx, task, chosen_code)
+            if self.codemap is not None:
+                self.codemap.reindex_after_write(task.path)
+        # the DISAGREEMENT MAP: a definition that changed in every sample
+        # is one the model is least sure of
+        tried = [c for c in candidates if "differs_in" in c]
+        if tried:
+            doubt = self.doubt.setdefault(task.path, {})
+            idx = symedit.index(chosen_code)
+            present = (set(idx.names(("function", "method", "class")))
+                       if idx else set())
+            for name in present:
+                changed = names_changed.get(name, 0)
+                doubt[name] = round(1.0 - changed / len(tried), 3)
+            disagreed = sorted((nm for nm in names_changed if nm in present),
+                               key=lambda nm: -names_changed[nm])
+            self._disagreement[task.path] = disagreed
+        kept = best_k
+        drawn = len(paid)
+        # THE ACCOUNTING: every reply paid for is one `generate` event,
+        # under the sampling it was made at. The kept sample is attempt
+        # 1's own (so `_journal_attempt` records ITS temperature and seed,
+        # and the ladder climbs from there); the reply it replaced is the
+        # extra call, named as such; the samples not kept are extra calls.
+        if kept and first_sampling is not None:
+            kept_t, kept_seed = next(
+                (t, s) for k, _c, t, s in paid if k == kept)
+            self._sampling[task.path] = dataclasses.replace(
+                first_sampling, temperature=kept_t, seed=kept_seed,
+                reason=f"the first attempt's sample {kept}, kept over its "
+                       f"first reply ({first_sampling.reason})")
+            self._journal_call(task, 1, completion, sent,
+                               f"replaced by sample {kept}",
+                               temperature=first_sampling.temperature,
+                               seed=first_sampling.seed)
+        for k, more, t, s in paid:
+            if k == kept:
+                continue
+            self._journal_call(task, 1, more, sent,
+                               f"resample {k} of {drawn}",
+                               temperature=t, seed=s)
+        if self.journal is not None:
+            try:
+                self.journal.log("resample", task=task.path, attempt=1,
+                                 samples=drawn, asked=n, kept=kept,
+                                 candidates=candidates,
+                                 disagreed=list(
+                                     self._disagreement.get(task.path, ())))
+            except Exception:                            # noqa: BLE001
+                pass
+        headline = (f"sampled the same prompt {drawn} more time(s); kept "
+                    f"sample {kept}" if kept else
+                    f"sampled the same prompt {drawn} more time(s); attempt 1's "
+                    f"own reply was the best of them")
+        details = []
+        for c in candidates:
+            if c.get("skipped"):
+                details.append(f"sample {c['sample']} (seed {c['seed']}): "
+                               f"skipped — {c['skipped']}")
+            else:
+                details.append(f"sample {c['sample']} (seed {c['seed']}): "
+                               f"{c.get('summary', '')}; differs from "
+                               f"attempt 1 in "
+                               + (", ".join(f"`{x}`" for x in
+                                            c.get("differs_in", []))
+                                  or "nothing"))
+        if self._disagreement.get(task.path):
+            details.append("the samples disagreed in: " + ", ".join(
+                f"`{x}`" for x in self._disagreement[task.path]))
+        self._decision("resample", task, 1, headline, details=details)
+        self._emit("status",
+                   f"{task.path}: {headline}"
+                   + (" — they disagreed in " + ", ".join(
+                       f"`{x}`" for x in self._disagreement[task.path][:4])
+                      if self._disagreement.get(task.path) else ""),
+                   {"task": task.path, "attempt": 1, "resample": {
+                       "kept": kept, "samples": n,
+                       "disagreed": list(self._disagreement.get(task.path,
+                                                               ()))}})
+        return best
+
+    @staticmethod
+    def _score(result: RunResult) -> tuple[int, int]:
+        """(ok, -errors): higher is better."""
+        errs = sum(1 for d in result.diagnostics if d.is_error)
+        return (1 if result.ok else 0, -errs)
+
+    def _type_gate(self, task: Task, lang: str, result: RunResult,
+                   attempt: int) -> list[Diagnostic]:
+        """The type checker's certain errors in the file as written, or [].
+
+        Runs in the PROJECT (not on a scratch copy) so the imports of the
+        file's siblings resolve to their real signatures — that is the
+        point. Skipped when the file did not even parse or build, when no
+        checker is installed (said once, with what it costs), and for
+        every language but Python.
+        """
+        gate = tuple(self.config.type_gate or ())
+        if not gate or lang != "python" or self._typecheck_off:
+            return []
+        if result.failed_phase in ("guard", "syntax", "build"):
+            return []
+        try:
+            res = typecheck.check(self.host.exec, self.host.fs, [task.path],
+                                  root=self.host.fs.root())
+        except Exception:                                # noqa: BLE001
+            return []
+        if not res.ran:
+            if res.note and not self._said_typecheck:
+                self._said_typecheck = True
+                self._emit("warning", f"{task.path}: {res.note}",
+                           {"task": task.path, "typecheck": False})
+                self._log_line(f"  NOTE: {res.note}")
+            if res.note and ("no type checker installed" in res.note
+                             or "not in the project's environment"
+                             in res.note or "could not be run" in res.note):
+                self._typecheck_off = True
+            if getattr(res, "timed_out", False):
+                # two minutes per attempt per file for the rest of the
+                # session, said once, is not a gate: off, and said so
+                # (the 2026-10-27 review)
+                self._typecheck_off = True
+                self._emit("warning",
+                           f"{task.path}: the type checker ran out of time "
+                           f"and is off for the rest of this session",
+                           {"task": task.path, "typecheck": False})
+                self._log_line("  NOTE: the type checker ran out of time; "
+                               "off for the rest of this session")
+            return []
+        found = typecheck.gate(res.diagnostics, gate, path=task.path)
+        if self.journal is not None:
+            try:
+                self.journal.log(
+                    "typecheck", task=task.path, attempt=attempt,
+                    tool=res.tool, findings=len(res.diagnostics),
+                    gated=[{"line": d.line, "code": d.code,
+                            "message": d.message.split(" (found")[0]}
+                           for d in found])
+            except Exception:                            # noqa: BLE001
+                pass
+        if found:
+            self._decision("typecheck", task, attempt,
+                           f"{res.tool} found {len(found)} certain error(s) "
+                           f"in the file as written",
+                           details=[f"line {d.line} [{d.code}] "
+                                    f"{d.message.split(' (found')[0]}"
+                                    for d in found[:6]])
+        return found
 
     # ------------------------------------------------------------------
     # whose fault is it
@@ -3291,6 +4001,7 @@ class Loop:
             timeouts=self.config.timeouts, test_path=task.test_path,
             known_failing=self.config.known_failing,
             spec_test_path=spec_test,
+            values=self.config.capture_values,
             skip_guard=True)      # already screened above; don't pay twice
         if spec_test:
             # True: the vectors ran and passed; False: one failed; None:
@@ -3445,7 +4156,9 @@ class Loop:
                     decode_ms=getattr(completion, "decode_ms", 0),
                     text=completion.text,
                     via=("diffusion canvases (each one is logged above)"
-                         if canvas else ""))
+                         if canvas else
+                         "a FIM hole (logged above)"
+                         if self._via_fim.get(task.path) == n else ""))
             except Exception:                            # noqa: BLE001
                 pass
         self.journal.generation(
@@ -3458,7 +4171,9 @@ class Loop:
                 "escalation": used.reason} if used is not None else {}),
             **({"via": "canvas"} if canvas else {}),
             **({"via": "narrow"}
-               if self._via_narrow.get(task.path) == n else {}))
+               if self._via_narrow.get(task.path) == n else {}),
+            **({"via": "fim"}
+               if self._via_fim.get(task.path) == n else {}))
 
     def _emit(self, kind: str, message: str, data: dict | None = None) -> None:
         self.host.emit(kind, message, data)
@@ -3471,6 +4186,13 @@ class Loop:
 #: Diagnostic codes that are the ENGINE's refusals of a reply, not errors in
 #: the file: carried to the next attempt once, never accumulated.
 _REFUSALS = ("dropped-code", "narrow-unplaced")
+
+
+def _blanked(message: str) -> str:
+    """A failure's words with addresses and numbers blanked: the same
+    failure in another run, at another line, is the same failure."""
+    msg = re.sub(r"0x[0-9a-fA-F]+", "ADDR", message or "")
+    return re.sub(r"\d+", "N", msg)[:120]
 
 
 def _recall_key(diags: Sequence[Diagnostic]) -> str:
@@ -3515,6 +4237,49 @@ def _change_shape(before: str, after: str, lang: str, path: str) -> str:
     if imports:
         bits.append(f"added {imports} import{'s' * (imports != 1)}")
     return "; ".join(bits)
+
+
+def _differing_definitions(a: str, b: str) -> list[str]:
+    """The functions, methods and classes whose text differs between two
+    versions of a file (by name; a definition one of them lacks counts),
+    in the order `a` defines them."""
+    ia, ib = symedit.index(a), symedit.index(b)
+    if ia is None or ib is None:
+        return []
+    out = []
+    la, lb = symedit.lines_of(a), symedit.lines_of(b)
+
+    def shape(lines: list, span: Any) -> str:
+        # the definition's AST, unparsed: a comment, a docstring's
+        # wording, `g(x,1)` against `g(x, 1)` are not a disagreement (the
+        # 2026-10-27 review); a definition that does not parse on its own
+        # (a method cut out of its class) is compared by its words
+        text = textwrap.dedent("".join(lines[span.start:span.end]))
+        try:
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                body = getattr(node, "body", None)
+                if (isinstance(body, list) and body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(getattr(body[0], "value", None),
+                                       ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body.pop(0)          # the docstring
+            return ast.unparse(tree)
+        except (SyntaxError, ValueError, RecursionError):
+            return " ".join(text.split())
+
+    for name in ia.names(("function", "method", "class")):
+        sa, sb = ia.get(name), ib.get(name)
+        if sb is None:
+            out.append(name)
+            continue
+        if shape(la, sa) != shape(lb, sb):
+            out.append(name)
+    for name in ib.names(("function", "method", "class")):
+        if ia.get(name) is None and name not in out:
+            out.append(name)
+    return out
 
 
 def _sha(text: str) -> str:

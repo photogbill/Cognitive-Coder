@@ -35,7 +35,7 @@ from pathlib import Path
 import sys
 import urllib.parse
 
-from . import langs, resumable
+from . import langs, resumable, typecheck
 from .codemap import parse_treesitter
 from .errors import CognitiveCoderError
 from .filestorage import JsonFileStorage
@@ -268,6 +268,16 @@ def doctor(argv: Sequence[str] | None = None) -> int:
     ts = parse_treesitter.degraded_note("c")
     print(f"  [{'--' if ts else 'OK'}] tree-sitter          "
           f"{ts or 'installed — C/C++/Rust/JS outlines are parsed'}")
+    # THE TYPE CHECKER (typecheck.py, 2026-10-27): the build loop's gate
+    # for the errors a small model makes most, and the one line here that
+    # says which checker installs on a disconnected machine.
+    checker, _where = typecheck.which(ex)
+    if checker:
+        print(f"  [OK] type checker         {checker} — a wrong attribute, "
+              f"a call with the wrong arguments or an undefined name fails "
+              f"an attempt before a test has to reach it")
+    else:
+        print(f"  [--] type checker         not found — {typecheck.ABSENCE_NOTE}")
 
     # Local and remote on separate lines. They were one line headed "local
     # providers", which listed five providers that send everything they are
@@ -293,6 +303,11 @@ def doctor(argv: Sequence[str] | None = None) -> int:
     if endpoints:
         print(f"  Local model endpoints answering right now: "
               f"{', '.join(endpoints)}")
+        if any(":8080" in e for e in endpoints):
+            # docs/SPEED.md: the one speed lever the engine cannot pull
+            print("  speed: a llama-server started with `--spec-type "
+                  "ngram-simple` drafts a rewrite from the file it was "
+                  "shown (no draft model, no VRAM) — see docs/SPEED.md")
     else:
         print("  No local model endpoint is answering. Start llama.cpp "
               "server, Ollama or LM Studio, or point --url at one.")
@@ -598,7 +613,8 @@ def build(args: argparse.Namespace) -> int:
         use_skills=not args.no_skills,
         narrow=getattr(args, "narrow", "auto"),
         keep_existing=not getattr(args, "no_keep", False),
-        diagnose_first=getattr(args, "diagnose_first", False))
+        diagnose_first=getattr(args, "diagnose_first", False),
+        interview=getattr(args, "interview", False))
     # With --remote the session exists FIRST: its gate is what the provider
     # is bound to. Without it, nothing is built until a model is known to be
     # there, as before.
@@ -620,6 +636,26 @@ def build(args: argparse.Namespace) -> int:
             return 4
         print("  Nothing was written. Re-run without --preview to build.")
         return 0
+
+    if getattr(args, "interview", False):
+        # THE INTERVIEW BEFORE THE BUILD (interview.py): the decisions the
+        # request leaves open, asked on the terminal, each answer pinned
+        # into every prompt of the build as a hard requirement.
+        from . import interview as interview_mod
+        try:
+            asked = session.interview(request)
+        except CognitiveCoderError as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
+        if asked.questions:
+            print(f"Before building, {len(asked.questions)} decision(s) the "
+                  f"request leaves open. Enter keeps the model's default.")
+            interview_mod.ask_on_terminal(asked)
+            request = asked.apply(request)
+            print()
+            print(interview_mod.summary(asked))
+        else:
+            print(f"Interview: {asked.problem or 'nothing open'}; building.")
 
     stopped = _run(session, request)
     return stopped if stopped is not None else _finish(session)
@@ -934,6 +970,10 @@ def _add_build_parser(sub, common) -> Handler:
                         "raise it for a large written specification")
     b.add_argument("--no-skeleton", action="store_true",
                    help="skip the compiling-skeleton step (not advised)")
+    b.add_argument("--interview", action="store_true",
+                   help="before planning, ask on the terminal about the "
+                        "decisions the request leaves open; each answer "
+                        "is pinned into every prompt as a hard requirement")
     b.add_argument("--no-interfaces", action="store_true",
                    help="write plain stubs instead of asking the model to "
                         "pin every module's interface first (saves one "
@@ -1081,6 +1121,21 @@ def bench_cmd(args: argparse.Namespace) -> int:
     config = {"attempts": args.attempts, "narrow": args.narrow,
               "diagnose_first": args.diagnose_first}
     print(f"Suite {suite} → {out}")
+    if getattr(args, "calibrate", False):
+        # CALIBRATION (profiles.py): the suite once per edit format, the
+        # model's profile written with the one it got right most often
+        if args.replay:
+            print("--calibrate needs a live model: a replay answers one "
+                  "format's prompts only.", file=sys.stderr)
+            return 2
+        config.pop("narrow", None)
+        name = model.capabilities().name or args.model or "model"
+        report = bench.calibrate(make_llm, name, suite=suite, out=out,
+                                 only=only, config=config,
+                                 formats=tuple(args.formats or ()))
+        print()
+        print(report["text"])
+        return 0
     run = bench.run_suite(make_llm, suite=suite, out=out, only=only,
                           label=label, config=config)
     print()
@@ -1116,6 +1171,13 @@ def _add_bench_parser(sub, common) -> Handler:
     b.add_argument("--narrow", choices=("auto", "always", "off"),
                    default="auto")
     b.add_argument("--diagnose-first", action="store_true")
+    b.add_argument("--calibrate", action="store_true",
+                   help="run the suite once per edit format (whole, "
+                        "symbols, fim) and write the model's profile with "
+                        "the one it got right most often (profiles.py)")
+    b.add_argument("--formats", action="append", metavar="FORMAT",
+                   choices=("whole", "symbols", "fim"),
+                   help="with --calibrate: only these formats (repeatable)")
     return bench_cmd
 
 

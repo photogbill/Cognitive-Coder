@@ -42,7 +42,7 @@ import os
 import re
 from typing import Any
 
-from . import diagnostics, guard, langs
+from . import diagnostics, guard, langs, testrun
 from .types import Diagnostic, PhaseResult, ProcResult, RunResult, Timeouts
 
 # Environment handed to every child process. Deliberately minimal: whatever is
@@ -568,8 +568,16 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
               test_path: str = "",
               known_failing: Sequence[str] = (),
               whole_suite: bool = False,
-              check_elsewhere: bool = True) -> RunResult:
+              check_elsewhere: bool = True,
+              values: bool = True) -> RunResult:
     """Run the language's test command, honestly.
+
+    ``values`` (testrun.py, 2026-10-27): for Python, run the tests through
+    the harness-owned script that prints the VALUES at each failure — the
+    locals of the frame that failed and of the test — and attach them to
+    the diagnostics. The script runs the same runner with the same
+    arguments and prints the same output, so nothing else here changes;
+    when it cannot be written the plain command runs as before.
 
     Two honesty obligations are discharged here:
 
@@ -673,6 +681,10 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                                "environment)")
         argv = langs.render(cmd, **subs)
         run_argv = langs.render(lang.test_run_cmd, **subs)
+        if lang_id == "python" and values:
+            script = testrun.ensure_script(fs)
+            if script:
+                argv = testrun.rewrite_argv(argv, _join(root, script))
         if any("{" in str(p) or not str(p) for p in argv + run_argv):
             return RunResult(False, lang_id,
                              blocked="the test command could not be resolved "
@@ -704,6 +716,10 @@ def run_tests(lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     if not phase.ok:
         diags = tuple(diagnostics.attach_source(
             diagnostics.parse(phase.output, lang_id, root=root), fs))
+        if lang_id == "python" and values:
+            blocks = testrun.parse_values(phase.output)
+            if blocks:
+                diags = tuple(testrun.attach(diags, blocks))
     # The file-based signal only means something on a passing run: a
     # test file that failed to LOAD is also listed under its own name.
     empty = zero_tests(phase.output, files if phase.ok else ())
@@ -1122,7 +1138,8 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
            path: str = "", timeouts: Timeouts | None = None,
            test_path: str = "",
            known_failing: Sequence[str] = (),
-           spec_test_path: str = "") -> RunResult:
+           spec_test_path: str = "",
+           values: bool = True) -> RunResult:
     """The C4 definition of done: it builds AND the tests run (M4).
 
     This is the function the loop calls, and the one place where "done" is
@@ -1163,7 +1180,7 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
                                 workdir=workdir, timeout=clocks.test,
                                 path=path, test_path=spec_test_path,
                                 known_failing=known_failing,
-                                check_elsewhere=False)
+                                check_elsewhere=False, values=values)
             if not vectors.blocked and not vectors.ok:
                 failed = sum(1 for d in vectors.diagnostics if d.is_error)
                 diags = tuple(replace(d, tool="spec-vector")
@@ -1182,7 +1199,7 @@ def verify(code: str, lang_id: str, *, fs: Any, ex: Any, stem: str = "main",
     tested = run_tests(lang_id, fs=fs, ex=ex, stem=stem, workdir=workdir,
                        test_source=test_source, timeout=clocks.test,
                        path=path, test_path=test_path,
-                       known_failing=known_failing)
+                       known_failing=known_failing, values=values)
     if tested.blocked:
         # No test runner is not a pass and not a failure — it is a stated
         # weakness in the evidence. C4 requires saying so out loud.

@@ -1,6 +1,7 @@
 {"event": "epoch"}
 {"event": "session_start"}
 {"event": "model_check"}
+{"event": "profile"}
 {"event": "constraints"}
 {"event": "codemap"}
 {"event": "plan"}

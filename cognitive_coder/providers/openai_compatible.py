@@ -27,7 +27,7 @@ only way anyone notices the prefix cache breaking.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import ipaddress
 import json
 import time
@@ -38,7 +38,14 @@ import urllib.request
 
 from .. import redact
 from ..errors import BudgetExceeded, ConfigurationError
-from ..types import Completion, Message, ModelCapabilities, ToolSpec
+from ..types import (
+    Completion,
+    FimRequest,
+    FimResult,
+    Message,
+    ModelCapabilities,
+    ToolSpec,
+)
 from .base import (
     ProviderBase,
     StreamAccumulator,
@@ -307,7 +314,8 @@ class OpenAICompatible(ProviderBase):
                  tools: Sequence[ToolSpec] = (), temperature: float = 0.15,
                  max_tokens: int = 2048, stop: Sequence[str] | None = None,
                  grammar: str | None = None, seed: int | None = None,
-                 stream: bool = True) -> dict[str, Any]:
+                 stream: bool = True, sampling: Mapping[str, Any] | None = None,
+                 thinking: bool | None = None) -> dict[str, Any]:
         """The request body, identical for `complete()` and `stream()`.
 
         One builder because there were two, and the display path had
@@ -341,6 +349,23 @@ class OpenAICompatible(ProviderBase):
         if tools and self.capabilities().supports_tools:
             payload["tools"] = self.tools_payload(tools)
             payload["tool_choice"] = "auto"
+        # THE PROFILE'S SAMPLERS (profiles.py, 2026-10-27). `top_p` is the
+        # OpenAI name and every server takes it; `top_k`, `min_p` and
+        # `repeat_penalty` are llama.cpp's and go only to a server that
+        # answered `/props` (LM Studio and llama-server do; a server that
+        # refuses unknown fields with a 400 never sees them).
+        if sampling:
+            if sampling.get("top_p") is not None:
+                payload["top_p"] = float(sampling["top_p"])
+            if not self.is_remote and self.capabilities().supports_grammar:
+                for key in ("top_k", "min_p", "repeat_penalty"):
+                    if sampling.get(key) is not None:
+                        payload[key] = sampling[key]
+        # THE THINKING SWITCH: `enable_thinking` through the chat template
+        # — llama-server (--jinja), vLLM and SGLang read it from
+        # `chat_template_kwargs`. Local only, like `cache_prompt`.
+        if thinking is not None and not self.is_remote:
+            payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking)}
         # M12: a host whose model lacks tool support IGNORES `tools`. Sending
         # them anyway to a server that doesn't understand them is how a
         # perfectly good local setup starts returning 400s.
@@ -361,7 +386,8 @@ class OpenAICompatible(ProviderBase):
                  tools: Sequence[ToolSpec] = (), temperature: float = 0.15,
                  max_tokens: int = 2048, stop: Sequence[str] | None = None,
                  grammar: str | None = None, seed: int | None = None,
-                 cancel: Any = None) -> Completion:
+                 cancel: Any = None, sampling: Mapping[str, Any] | None = None,
+                 thinking: bool | None = None) -> Completion:
         """One answer, fetched as a STREAM so its timings mean something.
 
         It used to be one blocking POST, which made `prompt_ms` the whole
@@ -377,7 +403,7 @@ class OpenAICompatible(ProviderBase):
         messages = self._outbound(messages)
         opts = {"tools": tools, "temperature": temperature,
                 "max_tokens": max_tokens, "stop": stop, "grammar": grammar,
-                "seed": seed}
+                "seed": seed, "sampling": sampling, "thinking": thinking}
         if self._stream_ok is not False:
             out = self._exchange(self._payload(messages, **opts), cancel)
             if out is not None:
@@ -528,7 +554,8 @@ class OpenAICompatible(ProviderBase):
         cancel = kw.pop("cancel", None)
         messages = self._outbound(messages)
         opts = {k: kw[k] for k in ("tools", "temperature", "max_tokens",
-                                   "stop", "grammar", "seed") if k in kw}
+                                   "stop", "grammar", "seed", "sampling",
+                                   "thinking") if k in kw}
         payload = self._payload(messages, **opts)
         acc = StreamAccumulator(time.monotonic(), self.model)
         try:
@@ -566,6 +593,120 @@ class OpenAICompatible(ProviderBase):
     #: the session having to know about it — and within a burst of calls
     #: it costs nothing.
     probe_ttl: float = 15.0
+
+    # -- FIM (fim.py, 2026-10-27) -----------------------------------------
+    def fim_fill(self, request: FimRequest, *,
+                 cancel: Any = None) -> FimResult:
+        """Fill in the middle: llama-server's `/infill` (it knows the
+        model's own FIM tokens and refuses a model without them), else the
+        OpenAI-style `/v1/completions` with a `suffix` (vLLM, Ollama).
+
+        Local only: a hole carries whole files, and the remote path's
+        redaction and approval are built around `complete()`. Never
+        raises; every failure is a FimResult with a sentence.
+        """
+        if cancel is not None and cancel.is_set():
+            return FimResult(finish_reason="cancelled", model=self.model)
+        if self.is_remote:
+            return FimResult(finish_reason="error", model=self.model,
+                             error="FIM holes are not sent to a remote "
+                                   "endpoint; repairs go by narrowed edits "
+                                   "there")
+        t0 = time.monotonic()
+        llamacpp = bool(self.capabilities().supports_grammar)
+        try:
+            if llamacpp:
+                payload: dict[str, Any] = {
+                    "input_prefix": request.prefix,
+                    "input_suffix": request.suffix,
+                    "input_extra": [{"filename": p, "text": t}
+                                    for p, t in request.extra],
+                    "prompt": "", "n_predict": int(request.max_tokens),
+                    "temperature": float(request.temperature),
+                    "cache_prompt": True, "stream": False}
+                if request.seed is not None:
+                    payload["seed"] = int(request.seed)
+                if request.stop:
+                    payload["stop"] = list(request.stop)
+                data = self._post("/infill", payload)
+            else:
+                payload = {"model": self.model or "local",
+                           "prompt": request.prefix,
+                           "suffix": request.suffix,
+                           "max_tokens": int(request.max_tokens),
+                           "temperature": float(request.temperature),
+                           "stream": False}
+                if request.seed is not None:
+                    payload["seed"] = int(request.seed)
+                if request.stop:
+                    payload["stop"] = list(request.stop)
+                data = self._post("/v1/completions", payload)
+        except urllib.error.HTTPError as exc:
+            return FimResult(finish_reason="error", model=self.model,
+                             error=self._fim_refusal(exc))
+        except Exception as exc:                             # noqa: BLE001
+            # URLError, OSError, a timeout, bad JSON — and http.client's
+            # own IncompleteRead / BadStatusLine, which derive from
+            # Exception only and used to escape (the 2026-10-27 review).
+            # The contract is "never raises", so nothing does.
+            return FimResult(finish_reason="error", model=self.model,
+                             error=f"the model server at {self.base_url} "
+                                   f"could not fill the hole: "
+                                   f"{str(exc).strip() or type(exc).__name__}")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        if llamacpp:
+            timings = data.get("timings") or {}
+            stop_type = str(data.get("stop_type") or "")
+            limit = (stop_type == "limit" or bool(data.get("stopped_limit"))
+                     or bool(data.get("truncated")))
+            prompt_ms = int(timings.get("prompt_ms") or 0)
+            decode_ms = int(timings.get("predicted_ms") or 0)
+            return FimResult(
+                text=str(data.get("content") or ""),
+                finish_reason="length" if limit else "stop",
+                model=str(data.get("model") or self.model),
+                # `tokens_evaluated` is the WHOLE prompt (n_prompt_tokens);
+                # `cache_n` is the part of it the server had cached — a
+                # subset, never an addition (the 2026-10-27 review)
+                tokens_in=_as_int(data.get("tokens_evaluated")),
+                tokens_out=_as_int(data.get("tokens_predicted")),
+                prompt_ms=prompt_ms,
+                decode_ms=decode_ms or max(0, elapsed_ms - prompt_ms),
+                cached_tokens=_as_int(timings.get("cache_n")),
+                cached_known="cache_n" in timings)
+        choice = (data.get("choices") or [{}])[0] or {}
+        usage = data.get("usage") or {}
+        return FimResult(
+            text=str(choice.get("text") or ""),
+            finish_reason=("length" if choice.get("finish_reason") == "length"
+                           else "stop"),
+            model=str(data.get("model") or self.model),
+            tokens_in=_as_int(usage.get("prompt_tokens")),
+            tokens_out=_as_int(usage.get("completion_tokens")),
+            decode_ms=elapsed_ms)
+
+    def _fim_refusal(self, exc: Any) -> str:
+        """The server's own reason, in a sentence: a 400 from `/infill`
+        is almost always "this model has no FIM tokens"."""
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:                                # noqa: BLE001
+            pass
+        message = ""
+        try:
+            data = json.loads(body or "{}")
+            err = data.get("error")
+            message = (err.get("message") if isinstance(err, dict)
+                       else str(err or ""))
+        except ValueError:
+            message = body.strip()[:200]
+        code = getattr(exc, "code", "")
+        if code == 404:
+            return (f"the model server at {self.base_url} has no infill "
+                    f"endpoint (HTTP 404)")
+        return (f"the model server at {self.base_url} refused the hole "
+                f"(HTTP {code}){': ' + message[:200] if message else ''}")
 
     def capabilities(self) -> ModelCapabilities:
         """From `/v1/models` (and llama.cpp's `/props`), at most `probe_ttl`

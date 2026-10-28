@@ -111,6 +111,18 @@ _EDIT_BLOCK_ATK = re.compile(
     r"(?P<old>.*?)\n===+\n(?P<new>.*?)\n>>>+\s*ATK-END", re.S)
 
 
+def _is_contract_example(edit: Edit) -> bool:
+    """CONTRACT_EDIT's worked example, repeated verbatim by the model: not
+    an edit of this project (the 2026-10-27 review)."""
+    from . import personas
+
+    def norm(s: str) -> str:
+        return " ".join((s or "").split())
+    return (edit.path.strip() == personas.EDIT_EXAMPLE_PATH
+            and norm(edit.old) == norm(personas.EDIT_EXAMPLE_OLD)
+            and norm(edit.new) == norm(personas.EDIT_EXAMPLE_NEW))
+
+
 def parse_edits(text: str, default_path: str = "") -> list[Edit]:
     """Pull edits out of a model reply, in whichever format it used.
 
@@ -123,8 +135,11 @@ def parse_edits(text: str, default_path: str = "") -> list[Edit]:
     edits: list[Edit] = []
     for pattern in (_EDIT_BLOCK, _EDIT_BLOCK_ATK):
         for m in pattern.finditer(text or ""):
-            edits.append(Edit(path=m.group("path").strip(), kind="replace",
-                              old=m.group("old"), new=m.group("new")))
+            edit = Edit(path=m.group("path").strip(), kind="replace",
+                        old=m.group("old"), new=m.group("new"))
+            if _is_contract_example(edit):
+                continue        # the contract's own example, echoed back
+            edits.append(edit)
     for m in _FENCE.finditer(text or ""):
         attrs = m.group("attrs") or ""
         body = m.group("body")

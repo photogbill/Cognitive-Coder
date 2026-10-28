@@ -726,6 +726,10 @@ def feedback(diags: Sequence[Diagnostic], max_errors: int = MAX_FEEDBACK,
         block = f"{i}. {d.one_line()}"
         if d.source_excerpt:
             block += f"\n{d.source_excerpt}"
+        if d.values:
+            # the debugger's one useful screen (testrun.py): what the
+            # variables were, under the line that failed
+            block += f"\n{d.values}"
         parts.append(block)
     more = len(real) - len(shown)
     if more > 0:

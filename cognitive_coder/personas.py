@@ -311,10 +311,12 @@ TESTER = Persona(
 
 PLANNER = Persona(
     id="planner", label="Planner",
-    self_model=("You break a request into the smallest set of files that "
-                "actually delivers it. You do not invent structure the "
-                "request does not need, and you pair every implementation "
-                "file with its test file."),
+    self_model=("You break a request into files a small model can write "
+                "and repair one at a time: each file one concern, each "
+                "sized for a few hundred lines at most — a part that needs "
+                "more is two files. You do not invent structure the request "
+                "does not need, and you pair every implementation file "
+                "with its test file."),
     directive=("List the files needed, one line each, as `path — purpose`. "
                "Nothing else."),
     temperature=0.35)
@@ -576,13 +578,29 @@ TEACHER = Persona(
     temperature=0.5)
 
 
+#: Asks the decisions a request leaves open, before the plan
+#: (interview.py, 2026-10-27). Low temperature: the questions want the
+#: likeliest gaps, not inventive ones; the answers are the operator's.
+INTERVIEWER = Persona(
+    id="interviewer", label="Interviewer",
+    self_model=("You read a request for software the way a careful "
+                "engineer does before starting: looking for the decisions "
+                "it leaves open that would change the code — a convention, "
+                "a unit, a format, what happens on bad input — and you ask "
+                "about those and nothing the request already settles. You "
+                "ask in plain words a person who does not program can "
+                "answer, and you always say which answer you would assume."),
+    directive=("List the open decisions as questions with short options "
+               "and your default. JSON only."),
+    temperature=0.2)
+
 PERSONAS = {p.id: p for p in (ENGINEER, TESTER, PLANNER, REVIEWER, REPAIRER,
                               ARCHITECT, JUDGE, EDITOR, CONSULTANT, EXPERT,
                               MAD_SCIENTIST, STRUCTURER, ATTACKER,
                               SECURITY_REVIEWER, PERFORMANCE_ENGINEER,
                               API_DESIGNER, REFACTORER, TEST_STRATEGIST,
                               CONCURRENCY_EXPERT, DATA_MODELER, TEACHER,
-                              SYSTEMS_ARCHITECT)}
+                              SYSTEMS_ARCHITECT, INTERVIEWER)}
 
 
 # --------------------------------------------------------------------------
@@ -600,6 +618,13 @@ CONTRACT_FILE = (
     "first line of the file and stop at the last. No prose before it, no "
     "prose after it, no headings, no summary of what you did.")
 
+#: WORKED EXAMPLES IN THE CONTRACTS (2026-10-27). A small model follows
+#: one correct example of the shape better than a paragraph of rules
+#: about it — Aider's edit-format leaderboard rests on that — and the two
+#: contracts whose shape the engine has to PARSE (a CC-EDIT block, a
+#: narrowed reply) were paragraphs. Each now ends with one short example,
+#: labelled as the shape and not as this file, in names no project file
+#: is likely to have. The bench's well-formed rate is what measures it.
 CONTRACT_EDIT = (
     "OUTPUT CONTRACT\n"
     "Return only the changed block, in this exact form:\n"
@@ -609,7 +634,34 @@ CONTRACT_EDIT = (
     "the replacement text\n"
     ">>>CC-END\n"
     "The text to replace must appear EXACTLY ONCE in the file — include "
-    "enough surrounding lines to make it unique. Nothing outside the block.")
+    "enough surrounding lines to make it unique. Nothing outside the block.\n"
+    "An example of the shape (not of this file) — a reply that fixes one "
+    "comparison reads, in full:\n"
+    "<<<CC-EDIT src/tally.py\n"
+    "    if count > limit:\n"
+    "        return True\n"
+    "===\n"
+    "    if count >= limit:\n"
+    "        return True\n"
+    ">>>CC-END")
+
+#: THE EXAMPLES, AS DATA. A model that copies the example before its own
+#: edit — the copying the example exists to encourage — must not have the
+#: example placed into a real file: `symedit.reply_code` and
+#: `patcher.parse_edits` drop a block that is one of these verbatim (the
+#: 2026-10-27 review: in a project with a `Beacon.bearing_to`, the old
+#: example REPLACED the real method). The names are invented so no real
+#: project of the engine's operator is likely to hold them.
+EDIT_EXAMPLE_PATH = "src/tally.py"
+EDIT_EXAMPLE_OLD = "    if count > limit:\n        return True\n"
+EDIT_EXAMPLE_NEW = "    if count >= limit:\n        return True\n"
+SYMBOLS_EXAMPLE = (
+    "import math\n"
+    "\n"
+    "class ExampleLedger:\n"
+    "    def rounded_total(self, entries):\n"
+    "        total = sum(entry.amount for entry in entries)\n"
+    "        return math.floor(total * 100) / 100\n")
 
 #: For a narrowed edit (symedit.py): definitions, put back by name.
 CONTRACT_SYMBOLS = (
@@ -619,7 +671,17 @@ CONTRACT_SYMBOLS = (
     "and its `def` or `class` line to its last line, plus any import lines "
     "you add, at the top. To change a method, write its `class` line and "
     "then only that method. Everything you do not return stays exactly as "
-    "it is. No prose before or after the block.")
+    "it is. No prose before or after the block.\n"
+    "An example of the shape (not of this file) — a reply that adds one "
+    "import and changes one method reads, in full:\n"
+    "```python\n"
+    "import math\n"
+    "\n"
+    "class ExampleLedger:\n"
+    "    def rounded_total(self, entries):\n"
+    "        total = sum(entry.amount for entry in entries)\n"
+    "        return math.floor(total * 100) / 100\n"
+    "```")
 
 #: For the opt-in describe-first pass before a repair.
 CONTRACT_DIAGNOSIS = (

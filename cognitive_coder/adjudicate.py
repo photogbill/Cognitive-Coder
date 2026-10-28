@@ -250,12 +250,19 @@ def check(verdict: Verdict, request: str) -> Verdict:
 
 
 def ask(llm: Any, messages: Sequence[Message], request: str, *,
-        cancel: Any = None, max_tokens: int = MAX_TOKENS) -> Verdict:
+        cancel: Any = None, max_tokens: int = MAX_TOKENS,
+        profile: Any = None) -> Verdict:
     """One completion, parsed and checked. Never raises on the model's
-    account: an error or an empty reply is `unclear`."""
+    account: an error or an empty reply is `unclear`.
+
+    ``profile`` (profiles.py): the judge answers in JSON, so a model with
+    a thinking switch has it turned off for the question."""
+    from . import profiles
     try:
-        completion = llm.complete(messages, temperature=0.0,
-                                  max_tokens=max_tokens, cancel=cancel)
+        completion = llm.complete(
+            profiles.soft_switch(messages, profile, thinking=False),
+            temperature=0.0, max_tokens=max_tokens, cancel=cancel,
+            **profiles.call_kwargs(llm, profile, thinking=False))
     except Exception as exc:                              # noqa: BLE001
         return Verdict(verdict="unclear", why=f"the judge could not be "
                                               f"asked ({exc})")

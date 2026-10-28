@@ -80,7 +80,15 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   "blueprint", "blueprint_plan", "blueprint_module",
                   # Continue (resumable.py): a stopped build picked up again,
                   # the files re-checked first, or one set aside for good
-                  "continue", "reverify", "abandoned")
+                  "continue", "reverify", "abandoned",
+                  # 2026-10-27: a verified file over the size rule
+                  # (sizing.py); the type checker's gate in the build loop
+                  # (typecheck.py); the model profile a session runs on
+                  # (profiles.py); a FIM hole (fim.py); the extra samples
+                  # of a failed first attempt (resample); the interview
+                  # before the build (interview.py); a bench calibration
+                  "size", "typecheck", "profile", "fim", "resample",
+                  "interview", "calibrate")
 
 
 # --------------------------------------------------------------------------
@@ -333,6 +341,66 @@ class CanvasResult:
         return sum(c) / len(c) if c else 0.0
 
 
+@dataclass(frozen=True)
+class FimRequest:
+    """One fill-in-the-middle hole (fim.py, 2026-10-27).
+
+    The model is given the code BEFORE the hole (``prefix``) and AFTER it
+    (``suffix``) in its own FIM format and writes only what goes between:
+    it structurally cannot touch code outside the hole. ``extra`` is
+    repo-level context — (path, text) chunks a model trained for it reads
+    before the file (Qwen's `<|repo_name|>` / `<|file_sep|>`); a host
+    without that format shows nothing of it. ``order`` and ``tokens`` are
+    the loaded model's profile (profiles.py): the token order ("psm":
+    prefix, suffix, middle; "spm": suffix first) and the token texts, for
+    a host that builds the raw prompt itself; a server that knows its
+    model's tokens (llama-server's `/infill`) ignores both.
+    """
+    prefix: str
+    suffix: str
+    path: str = ""
+    extra: tuple[tuple[str, str], ...] = ()
+    max_tokens: int = 512
+    temperature: float = 0.15
+    seed: int | None = None
+    stop: tuple[str, ...] = ()
+    order: str = "psm"
+    tokens: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FimResult:
+    """What ``fim_fill`` returns. Like `Completion`, never an exception.
+
+    ``text`` is the middle only. ``finish_reason`` "error" with an
+    ``error`` sentence for a model that has no FIM tokens, a server that
+    refused, or anything else that was not an answer.
+    """
+    text: str = ""
+    finish_reason: str = "stop"      # stop | length | cancelled | error
+    error: str = ""
+    model: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    prompt_ms: int = 0
+    decode_ms: int = 0
+    cached_tokens: int = 0
+    #: whether the host REPORTED a cache count at all: ``cached_tokens`` is
+    #: 0 both for "nothing was cached" and for "the host does not say", and
+    #: only the first may be journaled as a measured count (the
+    #: 2026-10-27 review: a host that said nothing was journaled as having
+    #: processed every prompt token from scratch, and the report then
+    #: diagnosed a broken prefix cache)
+    cached_known: bool = False
+    #: per line of ``text``, how sure the model was (exp of the least
+    #: token log-probability on the line), when the host reads it out
+    line_confidence: tuple[float, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.finish_reason == "stop" and not self.error
+
+
 # --------------------------------------------------------------------------
 # execution and diagnosis
 # --------------------------------------------------------------------------
@@ -373,6 +441,11 @@ class Diagnostic:
     code: str | None = None      # e.g. "E0602", "CS1002"
     source_excerpt: str = ""     # the offending lines, quoted
     tool: str = ""               # which parser produced it: "rustc", "pytest"…
+    #: THE VALUES AT THE FAILURE (testrun.py, 2026-10-27): what the
+    #: variables were in the frame that failed, and in the test's frame,
+    #: as the harness-owned test runner printed them. Shown under the
+    #: excerpt by `diagnostics.feedback`. Defaulted: a minor version.
+    values: str = ""
 
     # Ranking, not sorting order for humans: real errors first, style last.
     _RANK = {"error": 0, "fatal": 0, "exception": 0, "failure": 1,

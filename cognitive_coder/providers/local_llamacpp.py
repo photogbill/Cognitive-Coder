@@ -30,13 +30,20 @@ Two behaviours worth knowing about:
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 import time
 from typing import Any
 
 from ..errors import ConfigurationError
-from ..types import Completion, Message, ModelCapabilities, ToolSpec
+from ..types import (
+    Completion,
+    FimRequest,
+    FimResult,
+    Message,
+    ModelCapabilities,
+    ToolSpec,
+)
 from .base import (
     ProviderBase,
     StreamAccumulator,
@@ -104,7 +111,8 @@ class LocalLlamaCpp(ProviderBase):
                  tools: Sequence[ToolSpec] = (), temperature: float = 0.15,
                  max_tokens: int = 2048, stop: Sequence[str] | None = None,
                  grammar: str | None = None, seed: int | None = None,
-                 cancel: Any = None) -> Completion:
+                 cancel: Any = None, sampling: Mapping[str, Any] | None = None,
+                 thinking: bool | None = None) -> Completion:
         if cancel is not None and cancel.is_set():
             return self.cancelled(self._name)
 
@@ -113,6 +121,12 @@ class LocalLlamaCpp(ProviderBase):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        # the profile's samplers (profiles.py), in the binding's own names;
+        # `thinking` has no template switch in this binding — the core's
+        # text switch on the prompt is what reaches a Qwen3 here
+        for key in ("top_p", "top_k", "min_p", "repeat_penalty"):
+            if sampling and sampling.get(key) is not None:
+                kwargs[key] = sampling[key]
         if stop:
             kwargs["stop"] = list(stop)
         if seed is not None:
@@ -225,6 +239,65 @@ class LocalLlamaCpp(ProviderBase):
         except Exception:                                # noqa: BLE001
             return
 
+    # -- FIM (fim.py, 2026-10-27) -----------------------------------------
+    def fim_fill(self, request: FimRequest, *,
+                 cancel: Any = None) -> FimResult:
+        """Fill in the middle through the raw completion call.
+
+        The prompt is built from TOKEN IDS: the model's own FIM tokens —
+        read from its vocabulary where this binding exposes them, else
+        from the profile's token texts tokenized as specials — around the
+        prefix and suffix tokenized as plain text, in the profile's order
+        (psm: prefix, suffix, middle; spm: suffix first). Repo-level
+        context goes in with the repo/file-separator tokens when the
+        vocabulary has them. A model with no FIM tokens is a sentence,
+        never an exception.
+        """
+        if cancel is not None and cancel.is_set():
+            return FimResult(finish_reason="cancelled", model=self._name)
+        ids, problem = fim_prompt_ids(self.llama, request)
+        if problem:
+            return FimResult(finish_reason="error", model=self._name,
+                             error=problem)
+        kwargs: dict[str, Any] = {"prompt": ids,
+                                  "max_tokens": int(request.max_tokens),
+                                  "temperature": float(request.temperature),
+                                  "stream": False}
+        if request.seed is not None:
+            kwargs["seed"] = int(request.seed)
+        if request.stop:
+            kwargs["stop"] = list(request.stop)
+        t0 = time.monotonic()
+        try:
+            out = self.llama.create_completion(**kwargs)
+        except TypeError:
+            kwargs.pop("seed", None)
+            try:
+                out = self.llama.create_completion(**kwargs)
+            except Exception as exc:                     # noqa: BLE001
+                return FimResult(finish_reason="error", model=self._name,
+                                 error=f"the model could not fill the hole: "
+                                       f"{str(exc).strip() or type(exc).__name__}")
+        except Exception as exc:                         # noqa: BLE001
+            return FimResult(finish_reason="error", model=self._name,
+                             error=f"the model could not fill the hole: "
+                                   f"{str(exc).strip() or type(exc).__name__}")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            choice = (out.get("choices") or [{}])[0] or {}
+            usage = out.get("usage") or {}
+        except AttributeError:
+            return FimResult(finish_reason="error", model=self._name,
+                             error="the model returned something other than "
+                                   "a completion for the hole")
+        return FimResult(
+            text=str(choice.get("text") or ""),
+            finish_reason=("length" if choice.get("finish_reason") == "length"
+                           else "stop"),
+            model=self._name, tokens_in=int(usage.get("prompt_tokens") or 0),
+            tokens_out=int(usage.get("completion_tokens") or 0),
+            decode_ms=elapsed_ms)
+
     def capabilities(self) -> ModelCapabilities:
         ctx = self._ctx
         try:
@@ -268,3 +341,91 @@ class LocalLlamaCpp(ProviderBase):
             return True
         except Exception:                                # noqa: BLE001
             return False
+
+
+# ---------------------------------------------------------------------------
+# FIM prompts from token ids, for any llama-cpp-python `Llama`
+# ---------------------------------------------------------------------------
+
+def fim_prompt_ids(llama: Any, request: FimRequest) -> tuple[list[int], str]:
+    """(token ids, "") or ([], why not) — for any llama-cpp-python
+    `Llama`; ATK's host shares it (fim.py, 2026-10-27)."""
+    special = fim_tokens(llama, request)
+    if isinstance(special, str):
+        return [], special
+    pre, suf, mid, rep, sep = special
+
+    def plain(text: str) -> list[int]:
+        return list(llama.tokenize(text.encode("utf-8"),
+                                        add_bos=False, special=False))
+    ids: list[int] = []
+    try:
+        if request.extra and rep is not None and sep is not None:
+            ids += [rep] + plain("project")
+            for path, text in request.extra:
+                ids += [sep] + plain(f"{path}\n{text.rstrip()}\n")
+            ids += [sep] + plain(f"{request.path}\n")
+        if request.order == "spm":
+            ids += [suf] + plain(request.suffix) + [pre] + plain(request.prefix)
+            if mid is not None:
+                ids.append(mid)
+        else:
+            ids += [pre] + plain(request.prefix) + [suf] + plain(request.suffix)
+            if mid is not None:
+                ids.append(mid)
+    except Exception as exc:                         # noqa: BLE001
+        return [], f"the hole could not be tokenized: {exc}"
+    return ids, ""
+
+def fim_tokens(llama: Any, request: FimRequest):
+    """(pre, suf, mid, rep, sep) token ids — mid/rep/sep may be None —
+    or a sentence saying the model has none."""
+    pre = suf = mid = rep = sep = None
+    try:
+        import llama_cpp  # noqa: PLC0415
+        vocab = None
+        model = getattr(llama, "_model", None)
+        handle = getattr(model, "model", None)
+        if handle is not None and hasattr(llama_cpp, "llama_model_get_vocab"):
+            vocab = llama_cpp.llama_model_get_vocab(handle)
+        if vocab is not None:
+            def tok(name: str):
+                fn = getattr(llama_cpp, name, None)
+                if fn is None:
+                    return None
+                value = int(fn(vocab))
+                return value if value >= 0 else None
+            pre, suf, mid = (tok("llama_vocab_fim_pre"),
+                             tok("llama_vocab_fim_suf"),
+                             tok("llama_vocab_fim_mid"))
+            rep, sep = tok("llama_vocab_fim_rep"), tok("llama_vocab_fim_sep")
+    except Exception:                                # noqa: BLE001
+        pre = suf = None
+    if pre is None or suf is None:
+        # the profile's token texts, each of which must be ONE token
+        texts = tuple(request.tokens or ())
+        if len(texts) < 2 or not texts[0] or not texts[1]:
+            return ("the model's vocabulary has no FIM tokens and its "
+                    "profile names none, so it cannot fill a hole")
+        found = []
+        for text in texts[:3]:
+            if not text:
+                found.append(None)
+                continue
+            try:
+                ids = list(llama.tokenize(text.encode("utf-8"),
+                                               add_bos=False,
+                                               special=True))
+            except Exception as exc:                 # noqa: BLE001
+                return f"the FIM tokens could not be looked up: {exc}"
+            if len(ids) != 1:
+                return (f"`{text}` is not a single token of this model, "
+                        f"so it has no FIM token by that name")
+            found.append(ids[0])
+        while len(found) < 3:
+            found.append(None)
+        pre, suf, mid = found[0], found[1], found[2]
+        if pre is None or suf is None:
+            return "the model has no FIM prefix/suffix tokens"
+    return pre, suf, mid, rep, sep
+

@@ -127,7 +127,11 @@ class RemoteProvider(ProviderBase):
                  tools: Sequence[ToolSpec] = (), temperature: float = 0.15,
                  max_tokens: int = 2048, stop: Sequence[str] | None = None,
                  grammar: str | None = None, seed: int | None = None,
-                 cancel: Any = None) -> Completion:
+                 cancel: Any = None, sampling: Any = None,
+                 thinking: bool | None = None) -> Completion:
+        # `sampling` and `thinking` are a LOCAL model's knobs (profiles.py);
+        # a remote API has its own defaults and rejects names it does not
+        # know, so both are accepted here and deliberately not sent.
         if cancel is not None and cancel.is_set():
             return self.cancelled(self.model)
 
