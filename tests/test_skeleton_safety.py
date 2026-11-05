@@ -50,9 +50,12 @@ def _host(tmp_path, replies, approval=None):
 
 
 def _project_files(host):
-    """Everything in the project that is not the engine's own record."""
+    """Everything in the project that is not the engine's own record —
+    the journal, the state, and (2026-11-05) the plan files the engine
+    renders FROM the journal under .ccoder/plan/, which are a record too."""
     return sorted(p for p in host.fs.list("**/*")
-                  if not p.startswith((".cc_journal/", ".state/")))
+                  if not p.startswith((".cc_journal/", ".state/",
+                                       ".ccoder/plan/")))
 
 
 def _seed(tmp_path):

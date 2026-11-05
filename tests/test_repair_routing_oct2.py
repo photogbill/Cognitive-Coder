@@ -44,8 +44,11 @@ def _writes(host):
     """The prompts that asked the model to WRITE something (not review)."""
     def last_user(p):
         return [m for m in p if m.role == "user"][-1].content
+
+    # the review's [TASK] is no longer the FIRST block of the tail: the
+    # plan header ([WHERE YOU ARE], planfile.py, 2026-11-05) opens it
     return [p for p in host.llm.prompts
-            if not last_user(p).startswith("[TASK]\nReview ")]
+            if "[TASK]\nReview " not in last_user(p)]
 
 
 def _warnings(host):

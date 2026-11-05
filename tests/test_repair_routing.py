@@ -140,8 +140,11 @@ def test_a_run_that_dies_in_another_file_repairs_that_file(tmp_path):
     # review stage's questions come after and are not generations)
     def last_user(p):
         return [m for m in p if m.role == "user"][-1].content
+
+    # the review's [TASK] is no longer the FIRST block of the tail: the
+    # plan header ([WHERE YOU ARE], planfile.py, 2026-11-05) opens it
     writes = [p for p in host.llm.prompts
-              if not last_user(p).startswith("[TASK]\nReview ")]
+              if "[TASK]\nReview " not in last_user(p)]
     assert len(writes) == 5, [last_user(p)[:60] for p in host.llm.prompts]
 
     # and the repair prompt showed the caller, as a caller, not as a test
