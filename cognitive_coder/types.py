@@ -88,7 +88,15 @@ JOURNAL_EVENTS = ("session_start", "session_end", "plan", "skeleton",
                   # of a failed first attempt (resample); the interview
                   # before the build (interview.py); a bench calibration
                   "size", "typecheck", "profile", "fim", "resample",
-                  "interview", "calibrate")
+                  "interview", "calibrate",
+                  # 2026-11-05 (docs/NEXT_PLAN_20261105.md): a finding
+                  # about THIS codebase, mirrored into findings.md (§1);
+                  # the reasoning the model wrote before an answer, kept
+                  # only here (§2c); a hunk refused because it carried a
+                  # thinking delimiter (§2c wall 2); the operator's retry
+                  # of one file (§3); a skill proposed from a module that
+                  # built and passed (§8 H3)
+                  "note", "reasoning", "bleed", "retry", "skill_proposed")
 
 
 # --------------------------------------------------------------------------
@@ -199,6 +207,13 @@ class Completion:
     #: same register ("it was repeating itself: the same 3 lines, 12 times
     #: over").
     error: str = ""
+    #: THE MODEL'S REASONING, when the host separated it from the answer
+    #: (NEXT_PLAN §2c wall 1, 2026-11-05). ``text`` then holds the answer
+    #: ONLY. A host that does not split leaves this "" and the core splits
+    #: `text` itself on the delimiters it knows; either way the reasoning
+    #: reaches the journal (sized, hashed, one line summarised) and never
+    #: anything downstream of it. Defaulted: a minor version.
+    reasoning: str = ""
 
     def __post_init__(self) -> None:
         if self.finish_reason not in FINISH_REASONS:
@@ -240,6 +255,34 @@ class ModelCapabilities:
     #: files (`canvas.py`, docs/DIFFUSION_MODE.md). Defaulted: a minor
     #: version, and every existing host keeps today's path.
     supports_canvas: bool = False
+    #: THE MODEL CARD'S context length, when the host knows it — the
+    #: GGUF header's trained length, NOT what the engine loaded. 0 when
+    #: unknown. `context_tokens` above is always the engine's LOADED
+    #: `n_ctx`; the budget (context.py) is the SMALLER of the two and the
+    #: journal says which won. Added 2026-11-05 (NEXT_PLAN §8 H1): a
+    #: harness that budgeted against a 1M-token model card while the
+    #: engine was loaded at 256K never compacted and ran out of memory.
+    #: Defaulted: a minor version.
+    trained_context_tokens: int = 0
+    #: HOW THIS MODEL THINKS, as the host reads it off the loaded model
+    #: (NEXT_PLAN §2a, 2026-11-05): the levels it takes and the
+    #: delimiters its reasoning arrives in. The core never imports a host's
+    #: template reader (C1); it asks here. `ReasoningSupport()` — no
+    #: levels, no delimiters — is the honest answer for a host that has
+    #: not looked, and leaves every existing path exactly as it was.
+    reasoning: ReasoningSupport = field(
+        default_factory=lambda: ReasoningSupport())
+    #: PARALLEL SLOTS (2026-11-05, Bill on Strata's batching): how many
+    #: requests the SERVER behind this port decodes at once — llama-server's
+    #: `--parallel N` (continuous batching: the weights read once per
+    #: step, one KV slot per request). 1 for an in-process binding, which
+    #: serves one request at a time whatever the model. A host that says
+    #: more than 1 ALSO promises `complete()` may be called from several
+    #: threads at once on this instance — the 1.0 "never concurrently"
+    #: rule is relaxed exactly that far, and only for a host that says so.
+    #: The core uses it for independent calls (extra samples, candidates)
+    #: and a GUI for several builds at once; it never assumes it.
+    parallel_slots: int = 1
 
     @property
     def loaded(self) -> bool:
@@ -249,6 +292,45 @@ class ModelCapabilities:
         than by raising, so the core can say so plainly instead of catching.
         """
         return bool(self.name)
+
+    @property
+    def budget_context_tokens(self) -> int:
+        """The context the core may budget against: the engine's loaded
+        size, or the model card's when that is smaller and known. Never
+        the larger of the two (H1)."""
+        loaded = int(self.context_tokens or 0)
+        trained = int(self.trained_context_tokens or 0)
+        if loaded > 0 and trained > 0:
+            return min(loaded, trained)
+        return loaded or trained
+
+
+@dataclass(frozen=True)
+class ReasoningSupport:
+    """What the loaded model offers for thinking, from the host (§2a).
+
+    ``kind``: "none" (cannot think, or the host does not know), "switch"
+    (on/off only), "levels" (takes a depth — ``levels`` lists them, lowest
+    first, in the operator's vocabulary low/medium/high/xhigh), "always"
+    (thinks and cannot be stopped; the reasoning still arrives delimited).
+    ``delimiters``: (opener, closer) as the model writes them — ``<think>``
+    and ``</think>``, ``[THINK]`` and ``[/THINK]`` … — so the bleed guard
+    (patcher.py) can refuse a hunk carrying either, whatever the model.
+    """
+    kind: str = "none"
+    levels: tuple[str, ...] = ()
+    delimiters: tuple[str, ...] = ()
+    #: What the host would do with a level it cannot honour: "" (it is
+    #: dropped silently) or one operator-facing sentence.
+    note: str = ""
+
+    @property
+    def can_think(self) -> bool:
+        return self.kind in ("switch", "levels", "always")
+
+    @property
+    def takes_levels(self) -> bool:
+        return self.kind == "levels" and bool(self.levels)
 
 
 @dataclass(frozen=True)

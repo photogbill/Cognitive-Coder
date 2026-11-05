@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+import threading
 import time
 from typing import Any
 import uuid
@@ -44,12 +45,14 @@ from . import (
     langs,
     models,
     personas,
+    planfile,
     profiles,
     resumable,
     runner,
     sizing,
     speclint,
 )
+from . import reasoning as reasoning_mod
 from . import skills as skills_mod
 from .codemap import CodeMap
 from .errors import (
@@ -61,6 +64,7 @@ from .errors import (
 )
 from .journal import Journal, SessionLog
 from .loop import Loop, LoopConfig
+from .models import _short
 from .patcher import Patcher
 from .planner import Planner, _looks_like_test
 from .planner import is_entry_point as _is_entry_point
@@ -284,6 +288,34 @@ class SessionConfig:
     #: is checked instead of thrown away. Nothing changed (the last run
     #: ended cleanly and every file hashes the same) costs nothing.
     reverify_on_continue: bool = True
+    #: REASONING LEVELS (reasoning.py, docs/NEXT_PLAN_20261105.md §2,
+    #: 2026-11-05). "off" (default): the 1.0 rule — thinking is switched
+    #: OFF for every call whose reply is parsed and on for the diagnosis.
+    #: "auto": a level per phase — plan and the interface skeleton high,
+    #: a file low (medium when retried), diagnosis / Debug & Repair high,
+    #: the review medium. Or one level for every phase: "on", "low",
+    #: "medium", "high", "xhigh". How a level reaches the model is the
+    #: host's business (`ModelCapabilities.reasoning`); the reasoning
+    #: never reaches a file (the two walls of §2c).
+    reasoning: str = "off"
+    #: Operator overrides, phase → level, e.g. {"generate": "off",
+    #: "diagnose": "xhigh"}. An override wins over `reasoning`.
+    reasoning_phases: dict | None = None
+    #: WORKING MEMORY ON DISK (planfile.py, §1, 2026-11-05): the engine
+    #: renders `<project>/.ccoder/plan/{task_plan,findings,progress}.md`
+    #: from the journal and puts a bounded header — goal · next step ·
+    #: phase · the last findings — at the top of every generation, repair
+    #: and review prompt, so a small model whose context just filled
+    #: still knows where it is. Off: nothing is rendered or injected.
+    plan_files: bool = True
+    #: The header's budget in tokens (sizing: it is paid for by the
+    #: context like everything else).
+    plan_header_tokens: int = 600
+    #: SKILLS LEARNED FROM A BUILD (skills.py, §8 H3): after a module
+    #: builds and its tests pass, a skill is PROPOSED to
+    #: `.ccoder/skills/proposed/` for the operator to keep or discard —
+    #: never loaded until kept. Off: nothing is proposed.
+    propose_skills: bool = True
 
 
 class Session:
@@ -382,6 +414,27 @@ class Session:
         #: The readable log is the Loop's too — it is where the verify
         #: phases happen, and their output is the whole point of the file.
         self.loop.log = self.log
+        #: REASONING LEVELS (§2): one policy, read by the loop, the
+        #: planner and the tabs. Off by default — nothing changes.
+        self.reasoning_policy = reasoning_mod.Policy.from_config(self.config)
+        self.loop.reasoning_policy = self.reasoning_policy
+        self.planner.reasoning_policy = self.reasoning_policy
+        #: RETRY THIS FILE (§3): the operator's queue, drained at task
+        #: boundaries on the worker thread; `retry()` is the third
+        #: thread-safe call a host may make, beside cancel() and
+        #: stop_after_current().
+        self._retries: list[dict] = []
+        self._retry_lock = threading.Lock()
+        #: {path: the model a retry asked for} (loaded at its boundary) and
+        #: {path: the reasoning level a retry pinned} ("" = the policy's).
+        self._retry_models: dict[str, str] = {}
+        self._retry_levels: dict[str, str] = {}
+        #: WORKING MEMORY ON DISK (§1): the renderer of the three plan
+        #: files; the session is their ONE owner (§1e).
+        self.planfiles = (planfile.PlanFiles(host.fs, self.journal,
+                                             directory=self.config.journal_dir)
+                          if self.config.plan_files else None)
+        self.loop.planfiles = self.planfiles
 
         self.plan: Plan | None = None
         self.outcomes: list[TaskOutcome] = []
@@ -853,6 +906,300 @@ class Session:
                        + (" (continued)" if self._resumed is not None
                           and not revised else ""),
                        data)
+        self._render_plan_files()
+
+    # ------------------------------------------------------------------
+    # working memory on disk (planfile.py, §1)
+    # ------------------------------------------------------------------
+    def _render_plan_files(self, *, where: str = "") -> None:
+        """task_plan.md from the live plan; the prompt header from it.
+        Never fails a build."""
+        if self.planfiles is None or self.plan is None:
+            return
+        try:
+            self.planfiles.render(self.plan, outcomes=self.outcomes,
+                                  where=where, goal=self.plan.request)
+            llm = self.host.llm
+
+            def count(text: str, _llm: Any = llm) -> int:
+                return int(_llm.count_tokens(text))
+            self.prompts.header = self.planfiles.header(
+                budget_tokens=int(self.config.plan_header_tokens or 600),
+                count_tokens=count)
+            self.host.emit("status", "plan files updated",
+                           {"phase": "planfiles",
+                            "goal": self.planfiles.goal,
+                            "next_step": self.planfiles.next_step,
+                            "current_phase": self.planfiles.current_phase,
+                            "phases": [
+                                {"number": p.number, "label": p.label,
+                                 "status": p.status,
+                                 "files": [list(f) for f in p.files]}
+                                for p in self.planfiles.phases],
+                            "findings": [
+                                {"t": w, "source": s, "task": t, "text": x}
+                                for w, s, t, x in self.planfiles.findings],
+                            "progress": [
+                                {"t": w, "text": x}
+                                for w, x in self.planfiles.progress[-50:]]})
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _journal_refusals(self, task: Task) -> None:
+        """Wall 2's refusals (patcher.bled) become `bleed` journal events
+        and a finding — the patcher has no journal of its own."""
+        bled = list(getattr(self.patcher, "bled", ()) or ())
+        if not bled:
+            return
+        self.patcher.bled = []
+        for row in bled:
+            self.journal.log("bleed", task=row.get("path", task.path),
+                             marker=row.get("marker", ""),
+                             seq=row.get("seq"),
+                             sentence=(f"a reply for {row.get('path')} "
+                                       f"carried the thinking delimiter "
+                                       f"{row.get('marker')!r} on a line of "
+                                       f"its own and was not written"))
+        if self.planfiles is not None:
+            self.planfiles.note(
+                f"the model's reasoning leaked into {len(bled)} reply(ies) "
+                f"for {task.path} and was refused at the write; its "
+                f"thinking delimiters are not being split off cleanly",
+                task=task.path, source="engine")
+
+    def _progress_line(self, task: Task, outcome: TaskOutcome,
+                       caps: ModelCapabilities) -> None:
+        """One line of progress.md per task, and a finding when a repair
+        worked (what the diagnosis said is what the next file should
+        know)."""
+        if self.planfiles is None:
+            return
+        n = len(outcome.attempts)
+        verdict = ("verified" if outcome.verified else
+                   "ok" if outcome.ok else "failed")
+        reasoning = getattr(self.loop, "_last_reasoning", "") or ""
+        self.planfiles.step(
+            f"{task.path}: {verdict} after {n} attempt(s) · "
+            f"{_short(caps.name)}"
+            + (f" — {outcome.stopped_because}" if outcome.stopped_because
+               else "")
+            + (f" · reasoning: {reasoning}" if reasoning else ""))
+        self.loop._last_reasoning = ""
+        if outcome.ok and n > 1:
+            last = outcome.attempts[-2] if len(outcome.attempts) >= 2 \
+                else None
+            why = ""
+            if last is not None and last.diagnostics:
+                first = last.diagnostics[0]
+                why = (getattr(first, "message", "") or str(first))[:160]
+            diag = (self.loop._diagnosis.get(task.path, "") or "")[:200]
+            text = (f"{task.path} needed {n} attempts; the fix: "
+                    + (diag or why or "see the journal"))
+            self.planfiles.note(text, task=task.path, source="engine")
+        self._propose_skill(task, outcome)
+
+    def _propose_skill(self, task: Task, outcome: TaskOutcome) -> None:
+        """§8 H3: a module that built and whose tests passed is worth a
+        skill — proposed, never loaded until the operator keeps it."""
+        if not self.config.propose_skills or not outcome.verified:
+            return
+        if _looks_like_test(task.path):
+            return
+        try:
+            path = skills_mod.propose_learned(
+                self.host.fs, task=task, outcome=outcome,
+                findings=[t for _, _, p, t in
+                          (self.planfiles.findings if self.planfiles else ())
+                          if p in ("", task.path)],
+                lang=self.config.lang,
+                directory=self.config.skills_dir)
+        except Exception:                                # noqa: BLE001
+            return
+        if not path:
+            return
+        self.journal.log("skill_proposed", task=task.path, path=path)
+        self.host.emit("status",
+                       f"{task.path}: a skill was drafted from this build — "
+                       f"keep, edit or discard it in {path}",
+                       {"phase": "skill_proposed", "task": task.path,
+                        "path": path})
+
+    def note(self, text: str, *, task: str = "",
+             source: str = "operator") -> None:
+        """A finding for findings.md — the operator's correction, a tab's
+        discovery, a helper model's observation (§1e: helpers write only
+        through here; the session owns the files)."""
+        if self.planfiles is None:
+            return
+        self.planfiles.note(text, task=task, source=source)
+        self._render_plan_files()
+
+    # ------------------------------------------------------------------
+    # retry this file (§3)
+    # ------------------------------------------------------------------
+    def retry(self, path: str, *, model: str = "",
+              reasoning: str = "", undo_first: bool = True,
+              include_diagnostics: bool = True,
+              reason: str = "operator retry") -> str:
+        """Queue one file to be written again. Thread-safe (§5.2): the
+        third call a host may make from another thread, beside `cancel()`
+        and `stop_after_current()`.
+
+        Bill, 2026-11-05: *"manually order the file to be retried, this way,
+        i can go switch models, and try a few if i want. Just a simple right
+        click, retry."* What happens, at the next task boundary (or when
+        `run("")` is called on a finished session):
+
+          * the file's task goes back to pending, journaled as a `retry`
+            with the reason; the loop takes it next;
+          * ``undo_first`` (the default) rolls the file back to how it stood
+            before its last apply, so the retry starts from the
+            pre-attempt state; ``False`` keeps the current file (a file
+            that is half right) and the attempt repairs it;
+          * ``include_diagnostics`` seeds the first attempt with the last
+            failure's diagnostics, so the retry knows why the last one
+            failed;
+          * ``model`` names a roster entry (ports.ModelRoster) to load at
+            the boundary — one model at a time, through the host, exactly
+            as hybrid mode swaps; "" keeps whatever is loaded;
+          * ``reasoning`` pins a level for this retry ("" = the policy's).
+
+        Several files may be queued with different models; the queue
+        drains in board order, the swap happening at each boundary.
+        Returns "" when queued, else one sentence saying why not.
+        """
+        path = str(path or "").strip().replace("\\", "/")
+        if not path:
+            return "no file was named"
+        if self.plan is None:
+            return "there is no plan yet — nothing to retry"
+        if self.plan is not None and self._task_at(path) is None:
+            return f"{path} is not in this build's plan"
+        item = {"path": path, "model": str(model or ""),
+                "reasoning": reasoning_mod.normalise(reasoning)
+                if reasoning else "", "undo_first": bool(undo_first),
+                "include_diagnostics": bool(include_diagnostics),
+                "reason": str(reason or "operator retry")}
+        with self._retry_lock:
+            self._retries = [r for r in self._retries if r["path"] != path]
+            self._retries.append(item)
+        self.host.emit("status", f"{path}: queued to be written again"
+                       + (f" with {model}" if model else "")
+                       + (f", reasoning {item['reasoning']}"
+                          if item["reasoning"] else ""),
+                       {"phase": "retry", "task": path, "queued": True,
+                        **{k: v for k, v in item.items() if k != "path"}})
+        return ""
+
+    def pending_retries(self) -> list[dict]:
+        with self._retry_lock:
+            return [dict(r) for r in self._retries]
+
+    def _take_retries(self) -> None:
+        """At a task boundary, on the worker thread: apply every queued
+        retry to the plan — undo, seed, status — in board order. The
+        model swap for the FIRST queued file happens here too; later ones
+        swap at their own boundary (`_retry_swap`)."""
+        with self._retry_lock:
+            queued = list(self._retries)
+            self._retries = []
+        if not queued or self.plan is None:
+            return
+        order = {t.path: i for i, t in enumerate(self.plan.tasks)}
+        queued.sort(key=lambda r: order.get(r["path"], 10**6))
+        final = {o.path: o for o in self.outcomes}
+        for item in queued:
+            path = item["path"]
+            task = self._task_at(path)
+            if task is None:
+                continue
+            rolled = ""
+            if item["undo_first"]:
+                rolled = self._undo_file(path)
+            diags: tuple = ()
+            if item["include_diagnostics"]:
+                last = final.get(path)
+                if last is not None and last.attempts:
+                    diags = tuple(last.attempts[-1].diagnostics)
+            if diags:
+                self._seeds[path] = diags
+            else:
+                self._seeds.pop(path, None)
+            self._repaired.discard(path)
+            self._verified_paths.discard(path)
+            self.loop.blamed.pop(path, None)
+            self.plan = self.plan.replace(task.with_status("pending",
+                                                           attempts=0))
+            self._retry_levels[path] = item["reasoning"]
+            if item["model"]:
+                self._retry_models[path] = item["model"]
+            self.journal.log("retry", task=path, reason=item["reason"],
+                             model=item["model"], reasoning=item["reasoning"],
+                             undo_first=item["undo_first"], rolled_back=rolled,
+                             seeded=bool(diags))
+            self.log.event(f"RETRY {path}",
+                           item["reason"]
+                           + (f"; {rolled}" if rolled else "")
+                           + (f"; with {item['model']}" if item["model"]
+                              else "")
+                           + (f"; reasoning {item['reasoning']}"
+                              if item["reasoning"] else ""))
+            if self.planfiles is not None:
+                self.planfiles.note(
+                    f"the operator asked for {path} to be written again"
+                    + (f" with {item['model']}" if item["model"] else "")
+                    + (f" ({rolled})" if rolled else ""),
+                    task=path, source="operator")
+            self.host.emit("status", f"{path}: back to pending — {item['reason']}",
+                           {"phase": "retry", "task": path, "queued": False,
+                            "rolled_back": rolled, "model": item["model"],
+                            "reasoning": item["reasoning"]})
+        self._emit_plan(revised=False)
+
+    def _undo_file(self, path: str) -> str:
+        """Roll ONE file back to how it stood before its last apply, from
+        the patcher's snapshots. Returns a sentence for the log, or ""."""
+        try:
+            history = self.patcher.history()
+        except Exception:                                # noqa: BLE001
+            return ""
+        rel = path.replace("\\", "/")
+        for rec in reversed(history):
+            files = [str(f).replace("\\", "/") for f in rec.files]
+            if rel in files and rec.state == "committed":
+                try:
+                    before = self.patcher.snapshot_of(rec.seq, rel)
+                except Exception:                        # noqa: BLE001
+                    before = None
+                if before is None:
+                    try:
+                        if self.host.fs.exists(rel):
+                            self.host.fs.delete(rel)
+                        return ("rolled back: the file did not exist before "
+                                "its last apply, so it was removed")
+                    except Exception:                    # noqa: BLE001
+                        return ""
+                try:
+                    self.host.fs.write_bytes(rel, before)
+                    return (f"rolled back to how it stood before "
+                            f"transaction {rec.seq}")
+                except Exception:                        # noqa: BLE001
+                    return ""
+        return ""
+
+    def _retry_swap(self, task: Task) -> None:
+        """Before a retried task runs: load the model its retry asked for,
+        through the host, once; said in the log either way."""
+        name = self._retry_models.pop(task.path, "")
+        if not name:
+            return
+        if not self._swap_to(name, why=f"the retry of {task.path} asked "
+                                       f"for it"):
+            self.host.emit("warning",
+                           f"{task.path}: the retry asked for {name}, which "
+                           f"could not be loaded; it is written with the "
+                           f"model that is loaded",
+                           {"task": task.path, "model": name})
 
     def preview(self, request: str, profile: dict | None = None) -> dict:
         """Plan, and stop. What would be built, before anything is built.
@@ -927,6 +1274,9 @@ class Session:
         if self.plan is None:
             raise RuntimeError("start() before step()")
         self._check_budget()
+        # RETRY THIS FILE (§3): the operator's queue is applied here, at
+        # the boundary, on this thread — never from the GUI's.
+        self._take_retries()
         if self._test_repairs:
             return self._repair_test_step()
         if self._repairs:
@@ -935,6 +1285,7 @@ class Session:
         if task is None:
             return None
 
+        self._retry_swap(task)
         caps = self._capabilities(boundary=f"task {task.path}")
         if not caps.loaded:
             raise NoModelLoadedError(
@@ -942,12 +1293,18 @@ class Session:
 
         self.plan = self.plan.replace(task.with_status("active"))
         self._where = task.path
+        # the model's "where am I" (§1b), rendered before the prompt is built
+        self._render_plan_files()
         covers = self._covered_module(task)
         seed = self._seeds.pop(task.path, ())
-        outcome = self.loop.run_task(task, request=self.plan.request,
-                                     covers=covers.path if covers else "",
-                                     planned=self._planned_paths(task),
-                                     seed=seed)
+        self.loop.pinned_reasoning = self._retry_levels.pop(task.path, "")
+        try:
+            outcome = self.loop.run_task(task, request=self.plan.request,
+                                         covers=covers.path if covers else "",
+                                         planned=self._planned_paths(task),
+                                         seed=seed)
+        finally:
+            self.loop.pinned_reasoning = ""
         self.outcomes.append(outcome)
         self._credit_module(covers, outcome)
         self._credit_test_written_first(task, outcome)
@@ -974,6 +1331,10 @@ class Session:
                                  "attempts": len(outcome.attempts),
                                  "caveats": list(outcome.caveats)},
                          stopped_because=outcome.stopped_because)
+        # the plan files (§1) and the bleed guard's record (§2c), after
+        # the verdict they describe
+        self._journal_refusals(task)
+        self._progress_line(task, outcome, caps)
         # THE SIZE RULE is measured on every verified outcome, whichever
         # path verified it. It used to be measured in `_record` only —
         # the repair steps and Continue — so a normal build never measured
@@ -1378,6 +1739,35 @@ class Session:
             self.log.line(f"  {prof.describe()}")
         except Exception:                                 # noqa: BLE001
             pass
+        # REASONING LEVELS (§2): the policy in force, and what THIS model
+        # can do with it, said once per model in the log and the journal
+        support = getattr(caps, "reasoning", None)
+        try:
+            self.patcher.bleed_delimiters = tuple(
+                getattr(support, "delimiters", ()) or ())
+        except Exception:                                 # noqa: BLE001
+            pass
+        if self.reasoning_policy.enabled:
+            sample = self.reasoning_policy.level("generate")
+            resolved = reasoning_mod.resolve(sample or "off", support)
+            takes = profiles.accepts(self.host.llm, "reasoning")
+            self.journal.log("profile", what="reasoning",
+                             policy=self.reasoning_policy.mode,
+                             phases=dict(self.reasoning_policy.phases),
+                             model_kind=getattr(support, "kind", "none"),
+                             model_levels=list(getattr(support, "levels",
+                                                       ()) or ()),
+                             port_takes_levels=takes, note=resolved.note)
+            try:
+                self.log.line(f"  {self.reasoning_policy.describe()}")
+                if resolved.note:
+                    self.log.line(f"  reasoning: {resolved.note}")
+                elif not takes and not prof.has_switch:
+                    self.log.line("  reasoning: this host's model port "
+                                  "takes neither a level nor a switch — "
+                                  "the levels are recorded, not sent")
+            except Exception:                             # noqa: BLE001
+                pass
         if prof.sampling() and not profiles.accepts(self.host.llm,
                                                     "sampling"):
             self.host.emit("status",
@@ -2024,6 +2414,10 @@ class Session:
             self.host.emit("status", str(exc),
                            {"phase": "stopped", "after": after,
                             "graceful": bool(after)})
+            # §1d: the Status lines on disk say where it stopped — which
+            # is exactly what Continue reads
+            self._render_plan_files(
+                where=f"stopped after {after}" if after else "stopped")
         except BudgetExceeded as exc:
             self.journal.log("budget", sentence=str(exc), exhausted=True)
             self.host.emit("budget", str(exc))
@@ -2392,6 +2786,7 @@ class Session:
         if self._finished:
             return self.report()
         self._finished = True
+        self._render_plan_files(where="finished")
         stats = self.codemap.stats()
         final = self._final_outcomes()
         unverified = self._unverified(final)
@@ -2704,6 +3099,14 @@ class Session:
         caps = self._plan_hybrid(caps)
         self._pin_constraints(request, source="the request")
         self._restore_spec_vectors(request)
+        # WORKING MEMORY ON DISK (§1c): the findings and progress of the
+        # earlier runs come back from the journal — the record — so the
+        # plan files are regenerated, never trusted as found on disk.
+        if self.planfiles is not None:
+            try:
+                self.planfiles.restore(self.journal.events())
+            except Exception:                             # noqa: BLE001
+                pass
         # The board first, then the check: every row appears at once with
         # the state the journal proves, and the re-check updates them live.
         self._emit_plan(revised=False)
@@ -2814,6 +3217,20 @@ class Session:
                           "on disk is checked")
         else:
             self.log.line(f"  changed since the last run: {', '.join(changed)}")
+        # §1c: a file changed by hand between the stop and now is re-read
+        # by the codemap before anything is prompted against it, and said
+        # in findings.md so the model knows the edit was not its own.
+        if changed:
+            for path in changed:
+                try:
+                    self.codemap.reindex_after_write(path)
+                except Exception:                         # noqa: BLE001
+                    pass
+            if self.planfiles is not None:
+                self.planfiles.note(
+                    "changed since the build stopped (by hand, or by "
+                    "another run): " + ", ".join(changed),
+                    source="operator")
         self.host.emit(
             "status",
             f"checking the {len(targets)} file(s) already on disk before "
@@ -3007,6 +3424,29 @@ class Session:
                              is_remote=caps.is_remote)
             self._model = caps.name
             self._context = caps.context_tokens
+            # H1 (NEXT_PLAN §8, 2026-11-05): the budget is the ENGINE'S
+            # loaded context, never the model card's — and when the card's
+            # is the smaller, it is the card's. Said once per epoch, in
+            # the journal, with both numbers, so a crash in the field can
+            # be read back to the number that was actually budgeted.
+            trained = int(getattr(caps, "trained_context_tokens", 0) or 0)
+            budget = int(getattr(caps, "budget_context_tokens",
+                                 caps.context_tokens) or 0)
+            if trained and budget != caps.context_tokens:
+                self.journal.log(
+                    "budget", what="context_rule", loaded=caps.context_tokens,
+                    trained=trained, budgeted=budget,
+                    sentence=(f"the prompt budget is {budget:,} tokens: the "
+                              f"model card's trained length, which is "
+                              f"smaller than the {caps.context_tokens:,} the "
+                              f"engine loaded"))
+            elif trained and trained > caps.context_tokens:
+                self.journal.log(
+                    "budget", what="context_rule", loaded=caps.context_tokens,
+                    trained=trained, budgeted=budget,
+                    sentence=(f"the prompt budget is {budget:,} tokens: the "
+                              f"engine's loaded context, not the model "
+                              f"card's {trained:,}"))
         if caps.is_remote:
             self.host.emit("remote",
                            "REMOTE MODE — data leaves this machine.",

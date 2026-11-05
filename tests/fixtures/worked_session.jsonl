@@ -13,6 +13,7 @@
 {"attempt": 2, "event": "generate", "task": "src/readings.py"}
 {"attempt": 2, "event": "patch", "task": "src/readings.py"}
 {"event": "verify", "task": "src/readings.py"}
+{"event": "note", "task": "src/readings.py"}
 {"event": "plan"}
 {"event": "autofix", "task": "src/stats.py"}
 {"attempt": 1, "event": "generate", "task": "src/stats.py"}

@@ -62,6 +62,17 @@ RESERVED_OUTPUT_TOKENS = 2048
 # (D13). Budgeting as if they don't is how a prompt overflows on Magistral
 # after working fine on Devstral.
 REASONING_TAX_TOKENS = 1024
+# ...and a model asked to think HARDER spends more (NEXT_PLAN §2b,
+# 2026-11-05). The tax per level, in tokens; "on" is the model's own
+# default depth, taxed like low. Capped at a quarter of the context in
+# `measure_budget`, so a 4k-context model asked for xhigh still has a
+# prompt — the level is clamped where the budget is, said in the note.
+REASONING_TAX_BY_LEVEL = {"off": 0, "on": REASONING_TAX_TOKENS,
+                          "low": REASONING_TAX_TOKENS,
+                          "medium": 2 * REASONING_TAX_TOKENS,
+                          "high": 4 * REASONING_TAX_TOKENS,
+                          "xhigh": 8 * REASONING_TAX_TOKENS}
+REASONING_TAX_MAX_FRACTION = 0.25
 # Nothing is exact — chat templates add tokens, and an estimated count can be
 # wrong by a few percent. 5% back beats a hard failure at the boundary.
 SAFETY_FRACTION = 0.05
@@ -92,13 +103,36 @@ class Budget:
                 "context may be slightly larger or smaller than it appears.")
 
 
+def reasoning_tax(level: Any, total: int) -> int:
+    """Tokens held back for the model's thinking at this level, within a
+    quarter of the context. ``level`` is a bool (the 1.0 switch) or one of
+    the levels; anything unknown is taxed as "on"."""
+    if level is None or level is False or str(level).lower() in ("", "off"):
+        return 0
+    name = "on" if level is True else str(level).lower()
+    tax = REASONING_TAX_BY_LEVEL.get(name, REASONING_TAX_TOKENS)
+    cap = int(max(0, total) * REASONING_TAX_MAX_FRACTION)
+    return min(tax, cap) if total > 0 else tax
+
+
 def measure_budget(llm: Any, *, reserved_output: int = RESERVED_OUTPUT_TOKENS,
-                   reasoning: bool = False) -> Budget:
+                   reasoning: Any = False) -> Budget:
     """Ask the port what fits. Never take this from config (G.3).
 
     A "no model loaded" port reports `context_tokens` anyway (its configured
     default), which is the right behaviour: the budget question has an answer
     even when the model question does not.
+
+    THE CONTEXT IS THE ENGINE'S, NEVER THE MODEL CARD'S (NEXT_PLAN §8 H1,
+    2026-11-05). `context_tokens` is what the engine LOADED; a host that
+    also knows the card's trained length reports it as
+    `trained_context_tokens`, and the smaller of the two is budgeted. A
+    harness that took the card's 1M while its engine sat at 256K never
+    compacted and ran out of memory in the field; the note here names
+    which number won so the journal can show it.
+
+    ``reasoning`` is the 1.0 bool, or a level (NEXT_PLAN §2b): the tax
+    grows with the level and is capped at a quarter of the context.
     """
     try:
         caps = llm.capabilities()
@@ -109,19 +143,34 @@ def measure_budget(llm: Any, *, reserved_output: int = RESERVED_OUTPUT_TOKENS,
                       note="the model port could not be asked how much "
                            "context it has, so a conservative default is in "
                            "use")
-    total = int(getattr(caps, "context_tokens", 0) or 0)
+    loaded = int(getattr(caps, "context_tokens", 0) or 0)
+    trained = int(getattr(caps, "trained_context_tokens", 0) or 0)
+    which = ""
+    if loaded > 0 and trained > 0 and trained < loaded:
+        total = trained
+        which = (f" (the model card's {trained:,}, which is smaller than "
+                 f"the engine's loaded {loaded:,})")
+    elif loaded > 0 and trained > 0:
+        total = loaded
+        which = (f" (the engine's loaded size; the model card says "
+                 f"{trained:,}, which is not budgeted)")
+    else:
+        total = loaded or trained
     if total <= 0:
         total = 8192
-    tax = REASONING_TAX_TOKENS if reasoning else 0
+    tax = reasoning_tax(reasoning, total)
     usable = total - reserved_output - tax
     usable -= int(usable * SAFETY_FRACTION)
+    level = ("on" if reasoning is True else str(reasoning).lower()
+             ) if tax else ""
     return Budget(prompt_tokens=max(512, usable), context_tokens=total,
                   reserved_output=reserved_output,
                   is_estimate=bool(getattr(caps, "token_count_is_estimate",
                                            True)),
                   note=(f"measured from the loaded model: {total} tokens of "
-                        f"context, {reserved_output} reserved for the answer"
-                        + (f", {tax} for reasoning" if tax else "")))
+                        f"context{which}, {reserved_output} reserved for the "
+                        f"answer"
+                        + (f", {tax} for reasoning ({level})" if tax else "")))
 
 
 # ---------------------------------------------------------------------------

@@ -602,7 +602,8 @@ def _model_pass(host: Any, codemap: CodeMap,
         architecture = ""
     # Room for the file: the context, less the reply, less a generous
     # allowance for the instructions, findings and contract around it.
-    context = int(caps.context_tokens or 8192)
+    context = int(getattr(caps, "budget_context_tokens", 0)
+                  or caps.context_tokens or 8192)      # H1: never the card's
     room_tokens = max(512, context - config.reply_tokens - 2500)
     max_chars = room_tokens * 3
 

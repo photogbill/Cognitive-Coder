@@ -182,3 +182,41 @@ def test_the_session_resamples_the_engines_own_providers_only():
                 events=RecordingEvents(), approval=AutoApprove())
     assert Session(host).loop.config.resample == 1
     assert Session(host).loop.config.type_gate, "the type gate too"
+
+
+def test_a_multi_slot_server_is_asked_for_every_sample_at_once(tmp_path):
+    """PARALLEL SLOTS (2026-11-05): a port whose server decodes several
+    requests at once gets the extra samples together, in threads; the
+    verdict is the same as the serial path's."""
+    import dataclasses
+    import threading
+
+    class _Slots(ScriptedLLM):
+        def __init__(self, replies, **kw):
+            super().__init__(replies, **kw)
+            self.threads: set = set()
+            self.lock = threading.Lock()
+
+        def complete(self, messages, **kw):
+            with self.lock:
+                self.threads.add(threading.get_ident())
+                return super().complete(messages, **kw)
+
+        def capabilities(self):
+            return dataclasses.replace(super().capabilities(),
+                                       parallel_slots=4)
+
+    _project(tmp_path)
+    host = _host(tmp_path, [WRONG_BOTH, WRONG_ONE, RIGHT])
+    host.llm = _Slots([WRONG_BOTH, WRONG_ONE, RIGHT], supports_tools=False)
+    loop = _loop(host, attempts=2, resample=2, narrow="off")
+    loop.journal = Journal(host.fs, "t")
+    out = loop.run_task(_task(), request="double and triple")
+    assert out.ok, out.stopped_because
+    assert "x * 3" in (tmp_path / "calc.py").read_text()
+    # the two samples were asked for on worker threads, not the loop's
+    assert len(host.llm.threads) >= 2
+    ev = [e for e in loop.journal.events() if e.get("event") == "resample"
+          and e.get("data", {}).get("parallel")]
+    assert ev and ev[0]["data"]["parallel"] == 2
+    assert sorted(ev[0]["data"]["got"]) == [1, 2]

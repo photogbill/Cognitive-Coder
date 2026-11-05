@@ -683,6 +683,48 @@ def unified(before: str, after: str, path: str, context: int = 2) -> str:
         fromfile=f"a/{path}", tofile=f"b/{path}", n=context))
 
 
+# ---------------------------------------------------------------------------
+# the bleed guard, wall 2 (NEXT_PLAN §2c): a thinking delimiter in a hunk
+# ---------------------------------------------------------------------------
+
+#: A line that IS a thinking delimiter, whatever the model: the XML-ish
+#: family (`<think>`, `</ think >`, `<reasoning>` …), Mistral's bracket
+#: family (`[THINK]`, `[/THINK]`), and the harmony channel markers gpt-oss
+#: writes (`<|channel|>analysis…`, `<|thinking|>`). Case-blind; spaces
+#: inside the brackets allowed; the line may carry trailing text after the
+#: opener (`<think>Let me see…`), because that is how a leak looks.
+_BLEED_LINE = re.compile(
+    r"^\s*(?:"
+    r"<\s*/?\s*(?:think|thinking|reasoning|thought|reflection)\s*>"
+    r"|\[\s*/?\s*(?:think|thinking|reasoning)\s*\]"
+    r"|<\|(?:thinking|/?channel)\|>"
+    r"|<\|(?:start|end)_of_thought\|>"
+    r")", re.I)
+
+
+def bleed_marker(text: str, *, extra: Sequence[str] = ()) -> str:
+    """The first thinking delimiter found on a line of its own in `text`,
+    or "". ``extra`` is the loaded model's own delimiters, as the host
+    reports them, judged the same way (the whole line, case-blind)."""
+    if not text:
+        return ""
+    extras = tuple(str(e).strip().lower() for e in (extra or ()) if
+                   str(e).strip())
+    for line in text.splitlines():
+        m = _BLEED_LINE.match(line)
+        if m:
+            return m.group(0).strip()
+        if extras:
+            lowered = line.strip().lower()
+            for marker in extras:
+                if lowered == marker or lowered.startswith(marker + " ") \
+                        or (lowered.startswith(marker)
+                            and not lowered[len(marker):len(marker) + 1]
+                            .isalnum()):
+                    return line.strip()[:len(marker)]
+    return ""
+
+
 def safe_relpath(fs: Any, rel: str) -> str:
     """A root-relative path, or a refusal (M24).
 
@@ -818,6 +860,32 @@ class Transaction:
         if after == before and existed:
             return EditResult(edit.path, False,
                               "no change — the edit was already applied")
+
+        # -- THE BLEED GUARD, wall 2 (NEXT_PLAN §2c, 2026-11-05) ----------
+        # Wall 1 (loop._complete) splits the model's reasoning off every
+        # reply before anything downstream sees it — but wall 1 depends on
+        # knowing the model's delimiters, and a new model can lie about
+        # them. This wall does not care which model it was: a hunk that
+        # carries a thinking delimiter ON A LINE OF ITS OWN is refused,
+        # in any case and spacing, and the refusal is a sentence the
+        # journal keeps. Only the NEW text is judged (a file that already
+        # held one is not this edit's fault), and only whole-line markers,
+        # so code that MENTIONS `<think>` inside a string stays writable.
+        leaked = bleed_marker(after if edit.kind in ("whole", "create")
+                              else (edit.new or ""),
+                              extra=self._p.bleed_delimiters)
+        if leaked and not (existed and bleed_marker(
+                before, extra=self._p.bleed_delimiters)):
+            sentence = (f"refused: the new text for {rel} carries the "
+                        f"model's thinking delimiter {leaked!r} on a line of "
+                        f"its own — reasoning that leaked into a file. "
+                        f"Nothing was written.")
+            self._p.events("warning", sentence,
+                           {"seq": self.seq, "files": [rel],
+                            "task": self.task_id, "bleed": leaked})
+            self._p.bled.append({"path": rel, "marker": leaked,
+                                 "task": self.task_id, "seq": self.seq})
+            return EditResult(edit.path, False, sentence)
 
         diff = unified(before, after, rel)
 
@@ -982,6 +1050,13 @@ class Patcher:
         self.approval = approval
         self._events = events
         self._open: Transaction | None = None
+        #: The loaded model's own reasoning delimiters, as the host reports
+        #: them (`ModelCapabilities.reasoning.delimiters`), judged by wall 2
+        #: beside the generic ones. The session sets it at every epoch.
+        self.bleed_delimiters: tuple[str, ...] = ()
+        #: Every refusal wall 2 made, for the loop to journal as a `bleed`
+        #: event (the patcher has no journal of its own, by design).
+        self.bled: list[dict] = []
 
     # -- events -----------------------------------------------------------
     def events(self, kind: str, message: str, data: dict | None = None):
@@ -1060,6 +1135,31 @@ class Patcher:
         # NNNN-<task_id>/ with a monotonic counter (M25 rule 2).
         safe = re.sub(r"[^\w.-]+", "-", task_id or "task")[:40]
         return f"{SNAPSHOT_DIR}/{seq:04d}-{safe}"
+
+    def snapshot_of(self, seq: int, rel: str) -> bytes | None:
+        """The bytes of ONE file as they stood before transaction ``seq``
+        touched it, or None when the file did not exist then (the
+        manifest says NEW). Raises when the transaction is unknown or its
+        snapshot was pruned — a retry that cannot be undone honestly is
+        said, never guessed (NEXT_PLAN §3b, 2026-11-05)."""
+        rec = next((r for r in self.history() if r.seq == seq), None)
+        if rec is None:
+            raise TransactionError(f"transaction {seq} is not in the log")
+        base = rec.snapshot_dir or self._snapshot_dir(rec.seq, rec.task_id)
+        rel = rel.replace("\\", "/")
+        manifest = ""
+        try:
+            manifest = self.fs.read(f"{base}/MANIFEST.txt")
+        except Exception:                                # noqa: BLE001
+            manifest = ""
+        if f"NEW {rel}" in manifest.splitlines():
+            return None
+        snap = f"{base}/files/{rel}"
+        if not self.fs.exists(snap):
+            raise TransactionError(
+                f"the snapshot of {rel} from transaction {seq} is gone "
+                f"(pruned — only the last {MAX_SNAPSHOTS} are kept)")
+        return self.fs.read_bytes(snap)
 
     def _persist_snapshots(self, tx: Transaction) -> None:
         """Write the transaction's snapshot bytes into the project.

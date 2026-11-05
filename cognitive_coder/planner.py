@@ -52,7 +52,8 @@ import posixpath
 import re
 from typing import Any
 
-from . import interfaces, langs, profiles, sizing
+from . import interfaces, langs, sizing
+from . import reasoning as reasoning_mod
 from .codemap import parse_python, parse_regex
 from .errors import Cancelled
 from .personas import (
@@ -164,6 +165,9 @@ class Planner:
     #: the interface calls, and its thinking switch is thrown off for
     #: both — a file list and a skeleton are parsed, not read.
     profile: Any = None
+    #: REASONING LEVELS (reasoning.py, 2026-11-05): the session's policy;
+    #: None or an "off" policy leaves both calls exactly as they were.
+    reasoning_policy: Any = None
 
     # ------------------------------------------------------------------
     def plan(self, request: str, profile: dict | None = None) -> Plan:
@@ -178,12 +182,15 @@ class Planner:
         prompt = self.prompts.build(persona, task_text,
                                     architecture=self._architecture(),
                                     contract=CONTRACT_LIST)
+        # REASONING (reasoning.py, 2026-11-05): the plan is the phase that
+        # decides what everything after it pays for — "high" under the
+        # auto policy; nothing changes with the policy off.
+        sent, extra, budget = reasoning_mod.prepare(
+            self.host.llm, self.profile, self.reasoning_policy, "plan",
+            prompt.messages(), max_tokens=700)
         completion = self.host.llm.complete(
-            profiles.soft_switch(prompt.messages(), self.profile,
-                                 thinking=False),
-            temperature=persona.temperature, max_tokens=700,
-            **profiles.call_kwargs(self.host.llm, self.profile,
-                                   thinking=False))
+            sent, temperature=persona.temperature, max_tokens=budget,
+            **extra)
         rows, not_code = _parse_file_list_with_skipped(
             strip_think(completion.text))
 
@@ -648,11 +655,12 @@ class Planner:
         budget = max(1024, int(self.max_tokens or 0),
                      min(400 * len(modules), 8192))
         try:
+            sent, extra, budget = reasoning_mod.prepare(
+                self.host.llm, self.profile, self.reasoning_policy,
+                "interfaces", messages, max_tokens=budget)
             completion = self.host.llm.complete(
-                profiles.soft_switch(messages, self.profile, thinking=False),
-                temperature=persona.temperature, max_tokens=budget,
-                **profiles.call_kwargs(self.host.llm, self.profile,
-                                       thinking=False))
+                sent, temperature=persona.temperature, max_tokens=budget,
+                **extra)
         except (AssertionError, Cancelled):
             raise           # a cancel, or a scripted model out of replies
         except Exception as exc:                         # noqa: BLE001

@@ -378,24 +378,55 @@ def call_kwargs(port: Any, profile: ModelProfile | None, *,
                 sampling: Mapping[str, Any] | None = None) -> dict:
     """The extra keyword arguments for one `complete()` call: the
     profile's samplers (overridden by ``sampling``) and the thinking
-    switch — each only when the port takes it."""
+    switch — each only when the port takes it.
+
+    ``thinking`` may also be a LEVEL (NEXT_PLAN §2a, reasoning.py: "on",
+    "low", "medium", "high", "xhigh"). A port whose `complete` takes
+    ``reasoning`` is sent the level as ``reasoning=<level>`` — the host
+    decides how its loaded model is told, so the level goes regardless
+    of the profile table; a port written to the 1.0 signature gets the
+    bool switch (``thinking=True``) under the same rule as before, and a
+    port that takes neither sees nothing. "off" as a string is False.
+    """
     out: dict[str, Any] = {}
     knobs = dict(profile.sampling()) if profile is not None else {}
     if sampling:
         knobs.update({k: v for k, v in sampling.items() if v is not None})
     if knobs and accepts(port, "sampling"):
         out["sampling"] = knobs
+    level = _as_level(thinking)
+    if isinstance(thinking, str) and level is None:
+        thinking = False
+    if level is not None:
+        if accepts(port, "reasoning"):
+            out["reasoning"] = level
+        if profile is not None and profile.has_switch and \
+                accepts(port, "thinking"):
+            out["thinking"] = True
+        return out
     if (thinking is not None and profile is not None and profile.has_switch
             and accepts(port, "thinking")):
         out["thinking"] = bool(thinking)
     return out
 
 
+def _as_level(thinking: Any) -> str | None:
+    """A LEVEL name when ``thinking`` is one (reasoning.py, 2026-11-05),
+    else None: the bool contract of 2026-10-27 is untouched."""
+    if isinstance(thinking, str):
+        value = thinking.strip().lower()
+        return value if value and value != "off" else None
+    return None
+
+
 def soft_switch(messages: Sequence[Any], profile: ModelProfile | None, *,
-                thinking: bool | None) -> list:
+                thinking: bool | str | None) -> list:
     """The messages with the profile's TEXT switch on the last user turn,
     when thinking is being turned off and the profile has one. The
-    template switch is the port's business; this one is the prompt's."""
+    template switch is the port's business; this one is the prompt's.
+    A level (a string other than "off") never appends the off-switch."""
+    if isinstance(thinking, str):
+        thinking = _as_level(thinking) is not None
     if thinking is not False or profile is None or not profile.text_switch:
         return list(messages)
     switch = profile.text_switch

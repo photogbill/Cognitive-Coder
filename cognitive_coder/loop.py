@@ -85,9 +85,10 @@ from . import (
 from . import canvas as cv
 from . import diagnostics as dx
 from . import fim as fim_mod
+from . import reasoning as reasoning_mod
 from . import repetition as _repetition
 from . import suspects as suspects_mod
-from .context import CHARS_PER_TOKEN, Piece, build_context
+from .context import CHARS_PER_TOKEN, Piece, build_context, reasoning_tax
 from .errors import Cancelled
 from .interfaces import broken_contract as _broken_contract
 from .interfaces import is_pinned as _is_pinned
@@ -97,6 +98,7 @@ from .personas import (
     Persona,
     PromptBuilder,
     detect_commentary,
+    split_think,
     strip_commentary,
     strip_think,
 )
@@ -440,6 +442,19 @@ class Loop:
     #: check and after every swap; None changes nothing.
     profile: Any = None
     _last_sent: Any = field(default=None, repr=False)
+    #: REASONING LEVELS (reasoning.py, 2026-11-05): the session's policy —
+    #: which level each phase gets. None or an "off" policy changes nothing.
+    reasoning_policy: Any = None
+    #: A level the operator pinned for the task in hand (the retry menu,
+    #: §3a): "" means the policy decides. Set per task by the session.
+    pinned_reasoning: str = ""
+    #: WORKING MEMORY ON DISK (planfile.py, §1): where the loop files a
+    #: finding; None when the session turned the plan files off.
+    planfiles: Any = None
+    #: The current task's path, for the `reasoning` journal event.
+    _task_path: str = field(default="", repr=False)
+    #: One line of the model's last reasoning, for progress.md (§1).
+    _last_reasoning: str = field(default="", repr=False)
     #: FIM MODE: the session's probe found the loaded model fills a known
     #: hole correctly (fim.py). False until it says so; re-decided after
     #: every swap. `fim_why` is the probe's sentence, for the log.
@@ -736,6 +751,7 @@ class Loop:
         self._disagreement.pop(task.path, None)
         self._caller = caller if caller and caller != task.path else ""
         self._covers = covers if covers and covers != task.path else ""
+        self._task_path = task.path
         lang = task.lang or langs.id_for_path(task.path) or "python"
         persona = PERSONAS.get(task.persona, personas.ENGINEER)
         is_test = task.persona == "tester" or _looks_like_test(task.path)
@@ -1953,7 +1969,8 @@ class Loop:
 
         completion = self._complete(messages, tools=tools,
                                     temperature=sampling.temperature,
-                                    seed=sampling.seed)
+                                    seed=sampling.seed,
+                                    phase="generate", attempt=attempt)
         # the messages as sent — with the profile's text switch, when the
         # model has one — are what the journal hashes
         messages = list(getattr(self, "_last_sent", messages) or messages)
@@ -1973,7 +1990,8 @@ class Loop:
                                         tool_call_id=call.id))
             completion = self._complete(messages, tools=tools,
                                         temperature=sampling.temperature,
-                                        seed=sampling.seed)
+                                        seed=sampling.seed,
+                                        attempt=attempt)
 
         text = strip_think(completion.text)       # D13, M37 — before ANY use
 
@@ -1989,7 +2007,8 @@ class Loop:
                     Message(role="user", content=answer)]
                 completion = self._complete(messages,
                                             temperature=sampling.temperature,
-                                            seed=sampling.seed)
+                                            seed=sampling.seed,
+                                            attempt=attempt)
                 text = strip_think(completion.text)
 
         # -- truncation: CONTINUE, do not regenerate (D1, M32) ----------
@@ -2015,6 +2034,7 @@ class Loop:
                     Message(role="assistant", content=text),
                     Message(role="user", content=personas.continuation_task(
                         tail, len(text.splitlines())))],
+                phase="continue", attempt=attempt,
                 temperature=persona.temperature)
             addition = strip_think(more.text)
             if not addition.strip():
@@ -2497,7 +2517,8 @@ class Loop:
                                "not fit the model's context")
                 return ""
         completion = self._complete(messages, temperature=0.1,
-                                    max_tokens=300, thinking=True)
+                                    max_tokens=300, thinking=True,
+                                    phase="diagnose", attempt=attempt)
         self._journal_call(task, attempt, completion, messages, "diagnosis")
         said = strip_think(completion.text or "").strip()
         said = re.sub(r"```.*?```", "", said, flags=re.S).strip()
@@ -3332,7 +3353,9 @@ class Loop:
                   temperature: float = 0.15,
                   seed: int | None | object = _UNSET,
                   max_tokens: int = 0,
-                  thinking: bool | None = False) -> Completion:
+                  thinking: bool | None = False,
+                  phase: str = "generate",
+                  attempt: int = 1) -> Completion:
         """Every model call the loop makes goes through here.
 
         ``thinking`` (profiles.py, 2026-10-27): False for a call whose
@@ -3341,18 +3364,87 @@ class Loop:
         diagnosis, which is prose and wants it. Both reach the port only
         when it takes the argument and the profile has a switch; the
         profile's text switch is appended to the prompt either way.
+
+        REASONING LEVELS (NEXT_PLAN §2, 2026-11-05). When the session's
+        policy is on (`SessionConfig.reasoning`), ``phase`` and ``attempt``
+        pick a level — plan high, a file low (medium on a retry), a
+        diagnosis or repair high — and the level replaces the bool: it
+        goes to the port as ``reasoning=<level>`` where the port takes it
+        (profiles.call_kwargs). With the policy off (the default) nothing
+        here changes. The reply then passes WALL 1 of the bleed guard:
+        whatever the model wrote as reasoning is split off, recorded in
+        the journal (size, hash, one line) and never returned.
         """
+        asked = thinking
+        level = self._reasoning_level(thinking, phase=phase, attempt=attempt)
         extra = profiles.call_kwargs(self.host.llm, self.profile,
-                                     thinking=thinking)
+                                     thinking=level)
         sent = profiles.soft_switch(messages, self.profile,
-                                    thinking=thinking)
+                                    thinking=level)
         #: what was actually sent, for the journal's prompt hash (C8)
         self._last_sent = sent
-        return self.host.llm.complete(
+        budget = max_tokens or self.config.max_tokens
+        if isinstance(level, str):
+            # the thinking is paid for out of the reply budget, so the
+            # reply gets the room the level costs (context.reasoning_tax),
+            # within what the context can hold
+            caps = self._capabilities()
+            total = int(getattr(caps, "context_tokens", 0) or 0)
+            budget += reasoning_tax(level, total)
+        completion = self.host.llm.complete(
             sent, tools=tools, temperature=temperature,
-            max_tokens=max_tokens or self.config.max_tokens,
+            max_tokens=budget,
             seed=self.config.seed if seed is _UNSET else seed,
             cancel=self.cancel, **extra)
+        return self._wall_one(completion, phase=phase, attempt=attempt,
+                              asked=asked, level=level)
+
+    def _reasoning_level(self, thinking: bool | str | None, *, phase: str,
+                         attempt: int) -> bool | str | None:
+        """The policy's level for this call, or the bool the caller gave
+        when the policy is off. A caller that passes a LEVEL itself (the
+        retry menu's choice, §3a) is obeyed as given."""
+        if isinstance(thinking, str):
+            return thinking
+        pinned = getattr(self, "pinned_reasoning", "") or ""
+        if pinned and phase not in ("structured", "adjudicate"):
+            return pinned if pinned != "off" else False
+        policy = getattr(self, "reasoning_policy", None)
+        if policy is None or not policy.enabled:
+            return thinking
+        chosen = policy.level(phase, attempt=attempt)
+        if chosen is False:
+            # the policy says off for this phase: the 1.0 behaviour, which
+            # is the caller's bool (False for code, True for a diagnosis)
+            return thinking
+        return chosen
+
+    def _wall_one(self, completion: Completion, *, phase: str, attempt: int,
+                  asked: Any, level: Any) -> Completion:
+        """Bleed guard, wall 1 (§2c): the reasoning leaves the reply here
+        and lives in the journal only — sized, hashed, one line kept."""
+        reasoning = getattr(completion, "reasoning", "") or ""
+        text = completion.text or ""
+        if not reasoning:
+            reasoning, text = split_think(text)
+        if not reasoning:
+            return completion
+        try:
+            summary = reasoning_mod.summarise(reasoning)
+            if self.journal is not None:
+                self.journal.log(
+                    "reasoning", phase=phase, attempt=attempt,
+                    task=getattr(self, "_task_path", ""),
+                    level=(level if isinstance(level, str) else
+                           ("on" if level is True else "off")),
+                    chars=len(reasoning),
+                    sha256=hashlib.sha256(
+                        reasoning.encode("utf-8", "replace")).hexdigest(),
+                    summary=summary, model=completion.model)
+            self._last_reasoning = summary
+        except Exception:                                # noqa: BLE001
+            pass
+        return dataclasses.replace(completion, text=text, reasoning="")
 
     # ------------------------------------------------------------------
     # deterministic pre-fixes (F1, M35)
@@ -3528,6 +3620,42 @@ class Loop:
             return False
         return not self._culprit_elsewhere(task, result.diagnostics)
 
+    def _prefetch_samples(self, task: Task, sent: list, temperature: float,
+                          seeds: Sequence[int]) -> dict | None:
+        """All the extra samples at once, on a port whose server has the
+        slots for it — None (ask one at a time) otherwise. A sample whose
+        thread failed is simply asked for again in the serial path."""
+        caps = self._capabilities()
+        slots = int(getattr(caps, "parallel_slots", 1) or 1)
+        if slots <= 1 or len(seeds) <= 1:
+            return None
+        import concurrent.futures as _fut
+        out: dict[int, Completion] = {}
+        workers = max(1, min(slots, len(seeds)))
+        self._emit("status",
+                   f"{task.path}: {len(seeds)} samples asked for together — "
+                   f"the server decodes {slots} requests at once",
+                   {"task": task.path, "parallel": workers})
+        with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = {pool.submit(self._complete, list(sent),
+                                temperature=temperature, seed=seed): k
+                    for k, seed in enumerate(seeds, start=1)}
+            for job in _fut.as_completed(jobs):
+                k = jobs[job]
+                try:
+                    out[k] = job.result()
+                except Cancelled:
+                    raise
+                except Exception:                        # noqa: BLE001
+                    pass                                 # serial path asks
+        if self.journal is not None:
+            try:
+                self.journal.log("resample", task=task.path, attempt=1,
+                                 parallel=workers, got=sorted(out))
+            except Exception:                            # noqa: BLE001
+                pass
+        return out
+
     def _resample(self, task: Task, lang: str, code: str, result: RunResult,
                   completion: Completion, sent: Sequence[Message],
                   fixes: Sequence[str], tx: Any, contract: str
@@ -3558,11 +3686,22 @@ class Loop:
                    f"prompt {n} more time(s) at temperature {temperature:g} "
                    f"before any repair",
                    {"task": task.path, "attempt": 1, "resample": n})
+        # PARALLEL SLOTS (2026-11-05): a server that decodes several
+        # requests at once (`capabilities().parallel_slots`) is asked for
+        # every sample together — the weights are read once per step for
+        # all of them, so n samples cost about one. A one-slot port is
+        # asked one at a time, exactly as before.
+        prefetched = self._prefetch_samples(
+            task, list(sent), temperature,
+            [seed_base + 7919 + 31 * k for k in range(1, n + 1)])
         for k in range(1, n + 1):
             self._check_cancel(f"resampling {task.path}")
             seed = seed_base + 7919 + 31 * k
-            more = self._complete(list(sent), temperature=temperature,
-                                  seed=seed)
+            if prefetched is not None and k in prefetched:
+                more = prefetched[k]
+            else:
+                more = self._complete(list(sent), temperature=temperature,
+                                      seed=seed)
             if more.finish_reason == "cancelled":
                 raise Cancelled(f"resampling {task.path}")
             # journaled AFTER the choice is made (below): a sample that is
@@ -4041,10 +4180,22 @@ class Loop:
             return ""
 
     def _capabilities(self) -> ModelCapabilities | None:
+        """What is loaded — with `context_tokens` already the BUDGETABLE
+        size (the engine's loaded n_ctx, or the model card's when that is
+        smaller and known: types.ModelCapabilities.budget_context_tokens,
+        NEXT_PLAN §8 H1). Every `caps.context_tokens` read in this loop is
+        a budget question, and this is the one place the answer is made."""
         try:
-            return self.host.llm.capabilities()
+            caps = self.host.llm.capabilities()
         except Exception:                                # noqa: BLE001
             return None
+        try:
+            budget = int(caps.budget_context_tokens)
+            if budget and budget != int(caps.context_tokens or 0):
+                return dataclasses.replace(caps, context_tokens=budget)
+        except Exception:                                # noqa: BLE001
+            pass
+        return caps
 
     def _log_line(self, text: str) -> None:
         """One line in BUILD_LOG.txt. Never fails a build."""

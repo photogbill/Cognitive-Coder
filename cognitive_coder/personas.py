@@ -758,6 +758,11 @@ class PromptBuilder:
     #: set once at session start, before the first prompt, and fixed for
     #: the session like the conventions, so the prefix cache holds.
     constraints: str = ""
+    #: WHERE THE MODEL IS (planfile.py, NEXT_PLAN §1b, 2026-11-05): goal ·
+    #: next step · current phase · the last findings, bounded. The session
+    #: sets it at every task boundary; it opens the VOLATILE tail, never
+    #: the cached prefix, because it changes per task. "" adds nothing.
+    header: str = ""
 
     # -- the stable half --------------------------------------------------
     def prefix_for(self, persona: Persona, *, architecture: str = "",
@@ -806,6 +811,8 @@ class PromptBuilder:
         costs little, and put the diagnostics immediately before it.
         """
         parts: list[str] = []
+        if self.header:
+            parts.append(self.header)
         if interfaces:
             parts.append(interfaces)
         if examples:

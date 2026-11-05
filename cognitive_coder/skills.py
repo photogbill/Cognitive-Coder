@@ -47,9 +47,11 @@ THE RULES, AND WHY EACH ONE EXISTS:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
 import posixpath
+from typing import Any
 
 from .ports import EventPort, FileSystemPort
 
@@ -350,3 +352,159 @@ Never delete or weaken a failing test to make a build pass. The test is
 the specification.
 """,
 }
+
+
+# --------------------------------------------------------------------------
+# skills LEARNED from a build (docs/NEXT_PLAN_20261105.md §8 H3, 2026-11-05)
+# --------------------------------------------------------------------------
+#
+# Hermes Agent "accumulates skills" as it iterates, and its users found that
+# useful for branching an adjacent idea off something already built. The
+# engine already has deployed skills — this folder, into the cached prefix,
+# loaded once per session. The addition: when a module builds and its tests
+# pass, the engine PROPOSES a skill — the libraries that worked, the
+# build/run/test commands, the structure it settled on, the gotchas promoted
+# from findings.md — into `proposed/` under the skills folder, where nothing
+# is loaded from. The operator keeps it (it moves up, numbered 90+ so
+# hand-written skills win the budget), edits it, or discards it. A skill the
+# operator never saw is never in a prompt.
+
+PROPOSED_DIR = "proposed"
+LEARNED_PREFIX = "90-learned-"
+
+
+def _module_stem(path: str) -> str:
+    stem = posixpath.basename(path.replace("\\", "/"))
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    import re
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-") or "module"
+
+
+def _imports_of(text: str, lang: str) -> list[str]:
+    """Third-party-looking imports a file makes — by rule, Python only;
+    other languages get their `#include` / `require` lines verbatim."""
+    out: list[str] = []
+    if (lang or "python") == "python":
+        try:
+            import ast
+            tree = ast.parse(text)
+        except Exception:                                # noqa: BLE001
+            return out
+        import sys
+        std = set(getattr(sys, "stdlib_module_names", ()))
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module \
+                    and not node.level:
+                names = [node.module.split(".")[0]]
+            for n in names:
+                if n and n not in std and n not in out:
+                    out.append(n)
+        return out
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith(("#include", "require(", "use ", "import ")):
+            out.append(s[:80])
+    return out[:20]
+
+
+def propose_learned(fs: FileSystemPort, *, task: Any, outcome: Any,
+                    findings: Sequence[str] = (), lang: str = "python",
+                    directory: str = SKILLS_DIR) -> str:
+    """Draft `proposed/90-learned-<module>.md` from a module that built
+    and passed. Returns the path written, or "" when there was nothing
+    worth proposing or the write failed. Never raises."""
+    try:
+        path = str(getattr(task, "path", "") or "")
+        if not path or not fs.exists(path):
+            return ""
+        text = fs.read(path)
+    except Exception:                                    # noqa: BLE001
+        return ""
+    libs = _imports_of(text, lang)
+    commands: list[str] = []
+    result = getattr(outcome, "result", None)
+    for phase in (getattr(result, "phases", ()) or ()):
+        argv = tuple(getattr(phase, "argv", ()) or ())
+        name = getattr(phase, "name", "")
+        if argv and name in ("build", "run", "test") and getattr(
+                phase, "ok", False):
+            commands.append(f"{name}: `{' '.join(str(a) for a in argv)}`")
+    try:
+        from .interfaces import declared_names
+        names = declared_names(text)[:12]
+    except Exception:                                    # noqa: BLE001
+        names = []
+    gotchas = [g for g in findings if g][-6:]
+    if not (libs or commands or names or gotchas):
+        return ""
+    stem = _module_stem(path)
+    lines = ["---",
+             f"name: learned-{stem}",
+             f"description: what building {path} taught this project "
+             f"(proposed by the engine; keep, edit or discard)",
+             f"lang: {lang or 'python'}",
+             f"triggers: {stem}",
+             "---",
+             f"# Learned from {path}",
+             "",
+             "This file was DRAFTED BY THE ENGINE from a module that built "
+             "and whose tests passed. Nothing in it is loaded into a prompt "
+             "until it is moved out of `proposed/`. Edit freely; delete "
+             "what is not true in general.",
+             ""]
+    if libs:
+        lines += ["## Libraries that worked here",
+                  *(f"- {lib}" for lib in libs), ""]
+    if commands:
+        lines += ["## Commands that built, ran and tested it",
+                  *(f"- {c}" for c in commands), ""]
+    if names:
+        lines += ["## The structure it settled on",
+                  f"- {path} defines: " + ", ".join(f"`{n}`" for n in names),
+                  ""]
+    if gotchas:
+        lines += ["## Gotchas (from findings.md)",
+                  *(f"- {g}" for g in gotchas), ""]
+    body = "\n".join(lines)
+    if len(body) > MAX_SKILL_CHARS:
+        body = body[:MAX_SKILL_CHARS - 40].rstrip() + "\n\n(cut to the skill size limit)\n"
+    out = f"{directory}/{PROPOSED_DIR}/{LEARNED_PREFIX}{stem}.md"
+    try:
+        fs.write(out, body)
+    except Exception:                                    # noqa: BLE001
+        return ""
+    return out
+
+
+def proposed(fs: FileSystemPort, directory: str = SKILLS_DIR) -> list[str]:
+    """The proposed skills waiting for the operator, sorted."""
+    try:
+        return sorted(fs.list(f"{directory}/{PROPOSED_DIR}/*.md"))
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def keep_proposed(fs: FileSystemPort, path: str,
+                  directory: str = SKILLS_DIR) -> str:
+    """Move a proposed skill up into the skills folder, where it is loaded
+    next session. Returns the new path, or "" when it could not be."""
+    try:
+        text = fs.read(path)
+        name = posixpath.basename(path.replace("\\", "/"))
+        dest = f"{directory}/{name}"
+        fs.write(dest, text)
+        fs.delete(path)
+        return dest
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def discard_proposed(fs: FileSystemPort, path: str) -> bool:
+    try:
+        fs.delete(path)
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
