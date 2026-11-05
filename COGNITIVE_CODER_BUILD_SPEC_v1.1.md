@@ -1612,6 +1612,7 @@ v1.0 ordering asked phase 4 to demonstrate a phase-5 feature.*
 | **7** | `review` (deterministic + single structured model pass) + Recommendation Document | Finds a planted secret and a planted O(n²) |
 | **8** | Remote providers + `redact` + budgets | No-network test still passes with providers present but disabled; redaction fixture asserts clean payloads |
 | **9** | ATK adapter + migration of the six modules | ATK's full suite green before and after |
+| **10** | Working memory on disk (the plan the model re-reads), reasoning + the bleed guard, retry-by-file with a model swap, task-profiled expert residency, one local endpoint — **see `docs/NEXT_PLAN_20261105.md`** | Plan file validator green; a planted `<think>` never reaches disk; kill-at-file-3 resume survives a hand edit in between; a queued retry on a second model completes |
 
 Phases 0–5 are the minimum viable engine. If time runs out, that is the
 shippable subset.
