@@ -10,6 +10,82 @@ is a major version.
 
 ## [Unreleased]
 
+### Added — working memory, reasoning levels, retry-by-file, the context rule (2026-11-05)
+
+From `docs/NEXT_PLAN_20261105.md` (Bill's `Notes_20260211.txt`, the reviews
+of planning-with-files and Strata, and the Hermes-harness lessons). Every
+addition is optional and additive; a host written to the 1.0 Ports sees
+nothing new unless it asks, and `SessionConfig`'s defaults keep an existing
+build byte-for-byte what it was.
+
+**1. The context budget is the engine's, never the model card's**
+(`ModelCapabilities.trained_context_tokens`, `context.measure_budget`, §8
+H1). A harness that budgeted against a 1M-token model card while its engine
+was loaded at 256K never compacted and ran out of memory. `context_tokens`
+is now always the engine's *loaded* `n_ctx`; `trained_context_tokens` is
+the card's length when the host knows it; the budget is the smaller of the
+two, and the journal's `budget`/`context_rule` event says which won.
+
+**2. Reasoning levels per phase** (`reasoning.py`; `SessionConfig.reasoning`
+= `off` | `auto` | a level, and `reasoning_phases` to override one phase).
+`off` is the 1.0 behaviour. `auto` thinks where it pays: the plan and the
+interface skeleton high, each file low (medium when retried), a diagnosis
+or Debug & Repair high, the review medium. A grammar-constrained ask never
+thinks. The level reaches the model as `reasoning=<level>` on a port that
+takes it (`ModelCapabilities.reasoning`, read off the model's own template
+by the host — the core imports no template reader), else the 1.0 bool
+switch. The reply budget grows with the level, capped at a quarter of the
+context.
+
+**3. The bleed guard — two walls** (§2c). Wall 1 (`loop._complete`) splits
+the model's reasoning off every reply and records it in the journal
+(`reasoning` event: size, sha256, one-line summary) — the only place it
+ever lives. Wall 2 (`patcher`) refuses any hunk whose new text carries a
+thinking delimiter on a line of its own, in any case or spacing, for the
+XML, bracket and harmony families plus the loaded model's own markers;
+the refusal is a `bleed` journal event. Code that merely *mentions* a tag
+inside a string is still written.
+
+**4. Working memory on disk** (`planfile.py`, §1). The engine renders three
+files beside the project under `.ccoder/plan/` — `task_plan.md` (goal, next
+step, current phase, one `### Phase N` per dependency level with a computed
+`**Status:**`), `findings.md` (what the build learned about this codebase),
+`progress.md` (per step). The engine writes them *from the journal*; the
+model only reads them, as a bounded header (`SessionConfig.
+plan_header_tokens`, default 600) at the top of every generation, repair and
+review prompt. On Continue they are regenerated from the record, files
+changed by hand since the stop are listed and re-indexed, and a gated stop
+writes the Status line first so Continue reads where it stopped.
+`planfile.validate()` names what is wrong with a hand-edited plan file.
+
+**5. Retry this file** (`Session.retry`, §3). The third thread-safe call a
+host may make, beside `cancel()` and `stop_after_current()`. A file is
+queued to be written again — same model or a swap through `ModelRoster`, a
+pinned reasoning level, the last failure's diagnostics as the seed, and
+undo-first by default (the patcher rolls the file back to before its last
+apply via the new `Patcher.snapshot_of`). The queue drains at task
+boundaries, in board order; it works mid-build and after a finished build
+(`run("")` drains it). Journaled as `retry`.
+
+**6. Skills learned from a build** (`skills.propose_learned`, §8 H3). When a
+module builds and its tests pass, the engine drafts a skill under
+`.ccoder/skills/proposed/` — the libraries and commands that worked, the
+structure it settled on, the gotchas from `findings.md`. Nothing under
+`proposed/` is loaded into a prompt; `keep_proposed` moves one up (numbered
+90+ so hand-written skills win the budget), `discard_proposed` removes it.
+
+**7. Parallel slots** (`ModelCapabilities.parallel_slots`). A port whose
+server does continuous batching (llama-server `--parallel N`) reports its
+slot count; the extra samples of a failed first attempt are then asked for
+together on worker threads instead of back to back. 1 (the in-process
+binding) keeps the serial path. A host that reports more than 1 also
+promises `complete()` may be called concurrently on one instance.
+
+New journal events: `note`, `reasoning`, `bleed`, `retry`, `skill_proposed`.
+New `Completion.reasoning` and `ReasoningSupport`. All defaulted, so the
+Ports and types stay backward-compatible (a minor version).
+
+
 ### Added — ten changes for working code per hour on a small model (2026-10-27)
 
 Bill: "see if you can come up with any additional features, capabilities,

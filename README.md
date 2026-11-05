@@ -160,7 +160,7 @@ The most common case and the cheapest: your application has a model loaded
 and `LLMPort` is a shim over it.
 
 ```python
-from cognitive_coder import Completion, ModelCapabilities
+from cognitive_coder import Completion, ModelCapabilities, ReasoningSupport
 
 class MyLLMPort:
     def __init__(self, engine):
@@ -186,11 +186,44 @@ class MyLLMPort:
                                  family="mistral", context_tokens=self.engine.n_ctx,
                                  supports_tools=self.engine.has_tools,
                                  supports_grammar=True,
-                                 token_count_is_estimate=False)
+                                 token_count_is_estimate=False,
+                                 # OPTIONAL, all defaulted (2026-11-05): leave
+                                 # them out and nothing changes.
+                                 trained_context_tokens=self.engine.n_ctx_train,
+                                 reasoning=ReasoningSupport(
+                                     kind="levels",            # or switch/always/none
+                                     levels=("low", "medium", "high"),
+                                     delimiters=("<think>", "</think>")),
+                                 parallel_slots=self.engine.n_parallel)
 
     def count_tokens(self, text):
         return len(self.engine.tokenize(text))
 ```
+
+### Optional, added 2026-11-05 — a host that wants them says so
+
+Four fields and one `complete()` keyword, each defaulted so a 1.0 host is
+untouched:
+
+- **`trained_context_tokens`** — the model card's trained length. The engine
+  budgets the *smaller* of this and the loaded `context_tokens`, so a card
+  that claims 1M while the server loaded 32K cannot overflow the prompt.
+- **`reasoning`** (a `ReasoningSupport`) — how the loaded model thinks, read
+  off its own template by *you* (the core imports no template reader):
+  `kind` in `none`/`switch`/`levels`/`always`, the `levels` it takes in the
+  words `low`/`medium`/`high`/`xhigh`, and the `delimiters` its reasoning
+  arrives in. With it, `complete()` may be called with
+  `reasoning="high"` — send that to your model however its template wants
+  it. Without it, the engine falls back to the 1.0 `thinking=True/False`
+  switch. Either way the engine splits the reasoning off every reply
+  (`Completion.reasoning`, or the delimiters) and keeps it out of every
+  file.
+- **`parallel_slots`** — how many requests your server decodes at once
+  (llama-server `--parallel N`). More than 1 lets the engine ask for
+  independent calls (extra samples of a failed attempt) together, and
+  promises nothing else; it also means you accept `complete()` being called
+  from several threads on one instance. 1 (an in-process binding) is the
+  safe default.
 
 The guarantees a host must keep (the full list is in `docs/PORTS.md`):
 
